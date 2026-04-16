@@ -74,7 +74,9 @@ describe('feishu installer session source', () => {
     expect(source).toContain('guardrail: activeSession.guardrail')
     expect(source).toContain('managedOperationLease: operationLease')
     expect(source).toContain('releaseSessionManagedOperationLease(session)')
-    expect(source).toContain("lock: {\n        state: 'running',\n        key: FEISHU_MANAGED_CHANNEL_LOCK_KEY")
+    expect(source).toMatch(
+      /lock: \{\r?\n\s+state: 'running',\r?\n\s+key: FEISHU_MANAGED_CHANNEL_LOCK_KEY/
+    )
     expect(source).toContain('gateway: {')
     expect(source).toContain('finalSync: {')
   })

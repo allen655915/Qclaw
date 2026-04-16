@@ -75,7 +75,9 @@ describe('weixin installer session', () => {
     expect(source).toContain('guardrail: activeSession.guardrail')
     expect(source).toContain('managedOperationLease: operationLease')
     expect(source).toContain('session.managedOperationLease.release()')
-    expect(source).toContain("lock: {\n        state: 'running',\n        key: WEIXIN_MANAGED_CHANNEL_LOCK_KEY")
+    expect(source).toMatch(
+      /lock: \{\r?\n\s+state: 'running',\r?\n\s+key: WEIXIN_MANAGED_CHANNEL_LOCK_KEY/
+    )
     expect(source).toContain('key: WEIXIN_MANAGED_CHANNEL_LOCK_KEY')
   })
 })
