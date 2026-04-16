@@ -36,6 +36,10 @@ import type {
   ModelUiSnapshotRequest,
   ModelUiSnapshotResult,
 } from '../shared/model-ui-snapshot'
+import type {
+  WindowsNodeInstallExecutionOutcome,
+  WindowsNodeInstallExecutionPlanView,
+} from '../shared/windows-node-install-plan'
 
 interface CliResult {
   ok: boolean
@@ -43,6 +47,7 @@ interface CliResult {
   stderr: string
   code: number | null
   canceled?: boolean
+  nodeInstallExecutionOutcome?: WindowsNodeInstallExecutionOutcome | null
   npmRegistryAttempts?: Array<{
     mirrorId: string
     label: string
@@ -796,6 +801,7 @@ interface NodeCheckResult {
   requiredVersion: string
   targetVersion: string
   installStrategy: 'nvm' | 'installer'
+  executionPlan?: WindowsNodeInstallExecutionPlanView | null
 }
 
 interface NodeInstallPlan {
@@ -1649,9 +1655,16 @@ interface ElectronApi {
   prepareMacGitTools: () => Promise<MacGitToolsPrepareResult>
   installNode: () => Promise<CliResultExtended>
   resolveNodeInstallPlan: () => Promise<NodeInstallPlan>
+  resolveWindowsNodeInstallExecutionPlan: () => Promise<WindowsNodeInstallExecutionPlanView | null>
   downloadNodeInstaller: (plan?: NodeInstallPlan) => Promise<{ ok: boolean; path: string; error?: string; plan?: NodeInstallPlan }>
   inspectNodeInstaller: (installerPath: string) => Promise<NodeInstallerReadinessResult>
-  installEnv: (opts: { needNode: boolean; needOpenClaw: boolean; nodeInstallerPath?: string; nodeInstallPlan?: NodeInstallPlan }) => Promise<CliResultExtended>
+  installEnv: (opts: {
+    needNode: boolean
+    needOpenClaw: boolean
+    nodeInstallerPath?: string
+    nodeInstallPlan?: NodeInstallPlan
+    windowsNodeInstallExecutionPlan?: WindowsNodeInstallExecutionPlanView | null
+  }) => Promise<CliResultExtended>
   discoverOpenClaw: () => Promise<OpenClawDiscoveryResult>
   discoverOpenClawForEnvCheck: () => Promise<OpenClawDiscoveryResult>
   appendEnvCheckDiagnostic: (event: string, fields?: Record<string, unknown>) => Promise<void>

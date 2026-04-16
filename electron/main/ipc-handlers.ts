@@ -14,6 +14,7 @@ import {
   installNode,
   downloadNodeInstaller,
   resolveNodeInstallPlan,
+  resolveWindowsNodeInstallExecutionPlan,
   inspectNodeInstaller,
   installEnv,
   uninstallAll,
@@ -559,6 +560,7 @@ export function registerIpcHandlers() {
   ipcMain.handle('env:prepareMacGitTools', () => prepareMacGitTools())
   ipcMain.handle('env:installNode', () => installNode())
   ipcMain.handle('env:resolveNodeInstallPlan', () => resolveNodeInstallPlan())
+  ipcMain.handle('env:resolveWindowsNodeInstallExecutionPlan', () => resolveWindowsNodeInstallExecutionPlan())
   ipcMain.handle('env:downloadNodeInstaller', (_e, plan) => downloadNodeInstaller(plan))
   ipcMain.handle('env:inspectNodeInstaller', (_e, installerPath: string) => inspectNodeInstaller(installerPath))
   ipcMain.handle('env:installEnv', (_e, opts) =>

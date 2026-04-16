@@ -42,9 +42,16 @@ export const api = {
   prepareMacGitTools: () => ipcRenderer.invoke('env:prepareMacGitTools'),
   installNode: () => ipcRenderer.invoke('env:installNode'),
   resolveNodeInstallPlan: () => ipcRenderer.invoke('env:resolveNodeInstallPlan'),
+  resolveWindowsNodeInstallExecutionPlan: () => ipcRenderer.invoke('env:resolveWindowsNodeInstallExecutionPlan'),
   downloadNodeInstaller: (plan?: Record<string, any>) => ipcRenderer.invoke('env:downloadNodeInstaller', plan),
   inspectNodeInstaller: (installerPath: string) => ipcRenderer.invoke('env:inspectNodeInstaller', installerPath),
-  installEnv: (opts: { needNode: boolean; needOpenClaw: boolean; nodeInstallerPath?: string; nodeInstallPlan?: Record<string, any> }) =>
+  installEnv: (opts: {
+    needNode: boolean
+    needOpenClaw: boolean
+    nodeInstallerPath?: string
+    nodeInstallPlan?: Record<string, any>
+    windowsNodeInstallExecutionPlan?: Record<string, any> | null
+  }) =>
     ipcRenderer.invoke('env:installEnv', opts),
 
   // Environment refresh

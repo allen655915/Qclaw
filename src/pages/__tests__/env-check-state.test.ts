@@ -12,9 +12,11 @@ import {
   createEnvCheckRestartState,
   formatPluginRepairErrorSummaryForEnvCheck,
   formatTakeoverFailureManualBackupWarning,
+  resolveEffectiveNodeInstallStrategy,
   resolveTakeoverBackupRootDirectory,
   resolveEnvInstallProgressStep,
   resolveActiveTakeoverFailure,
+  resolveWindowsNodeExecutionPlanPresentation,
   retryOpenClawLatestVersionCheck,
   shouldDownloadNodeInstallerBeforeInstall,
   shouldOfferManualNodeUpgrade,
@@ -162,6 +164,16 @@ describe('createEnvCheckRestartState', () => {
     expect(source).toContain('window.api.checkOpenClawUpgrade()')
   })
 
+  it('threads the Windows execution plan from detection into renderer copy and install submission', () => {
+    const source = normalizedEnvCheckSource
+    expect(source).toContain('setWindowsNodeInstallExecutionPlan(nodeResult.executionPlan || null)')
+    expect(source).toContain('resolveWindowsNodeExecutionPlanPresentation({')
+    expect(source).toContain('windowsNodeInstallExecutionPlan: manualNodeExecutionPlan || undefined')
+    expect(source).toContain('windowsNodeInstallExecutionPlan: nodeResult.executionPlan || undefined')
+    expect(source).toContain("manualNodeInstallPlanPresentation?.effectiveNeedOpenClaw === true")
+    expect(source).toContain("windowsNodeInstallPlanPresentation?.actionLabel || '手动升级'")
+  })
+
   it('shows a non-blocking gateway owner warning when Windows owner artifacts are missing', () => {
     expect(buildDeferredGatewayStepState('service-missing').description).toContain('后台启动器缺失')
     expect(buildDeferredGatewayStepState('service-missing').description).toContain('不会自动安装')
@@ -234,6 +246,117 @@ describe('createEnvCheckRestartState', () => {
     expect(shouldOfferManualNodeUpgrade('v22.15.0')).toBe(true)
     expect(shouldOfferManualNodeUpgrade('v22.19.0')).toBe(false)
     expect(shouldOfferManualNodeUpgrade('v24.14.0')).toBe(false)
+  })
+
+  it('derives the effective install strategy from the Windows execution plan before deciding UI/install behavior', () => {
+    expect(
+      resolveEffectiveNodeInstallStrategy({
+        executionPlan: {
+          planId: 'plan-nvm',
+          platform: 'win32',
+          family: 'nvm-global',
+          targetVersion: 'v22.17.0',
+          detectedNodePath: 'C:\\Program Files\\nodejs\\node.exe',
+          detectedInstallStrategy: 'installer',
+          requiresBindingRepair: false,
+          fallbackPolicy: 'allow-private-runtime-fallback-after-rollback',
+          nvmDir: 'C:\\nvm',
+          nvmExecutable: 'C:\\nvm\\nvm.exe',
+          nvmExecutableAvailable: true,
+          nvmProbeOk: true,
+          nvmSymlinkDir: 'C:\\Program Files\\nodejs',
+          hasSelectedRuntimeSnapshot: true,
+          hasAuthoritativeSnapshot: true,
+          hasDetectedRuntimeCandidate: true,
+        },
+        installStrategy: 'installer',
+      })
+    ).toBe('nvm')
+
+    expect(
+      resolveEffectiveNodeInstallStrategy({
+        executionPlan: {
+          planId: 'plan-private',
+          platform: 'win32',
+          family: 'private-runtime',
+          targetVersion: 'v24.14.1',
+          detectedNodePath: null,
+          detectedInstallStrategy: 'nvm',
+          requiresBindingRepair: false,
+          fallbackPolicy: 'not-applicable',
+          nvmDir: null,
+          nvmExecutable: null,
+          nvmExecutableAvailable: false,
+          nvmProbeOk: false,
+          nvmSymlinkDir: null,
+          hasSelectedRuntimeSnapshot: false,
+          hasAuthoritativeSnapshot: false,
+          hasDetectedRuntimeCandidate: false,
+        },
+        installStrategy: 'nvm',
+      })
+    ).toBe('installer')
+  })
+
+  it('maps Windows execution plans into user-facing button and progress copy', () => {
+    expect(
+      resolveWindowsNodeExecutionPlanPresentation({
+        executionPlan: {
+          planId: 'plan-repair',
+          platform: 'win32',
+          family: 'nvm-global',
+          targetVersion: 'v22.17.0',
+          detectedNodePath: 'C:\\Program Files\\nodejs\\node.exe',
+          detectedInstallStrategy: 'nvm',
+          requiresBindingRepair: true,
+          fallbackPolicy: 'allow-private-runtime-fallback-after-rollback',
+          nvmDir: 'C:\\nvm',
+          nvmExecutable: 'C:\\nvm\\nvm.exe',
+          nvmExecutableAvailable: true,
+          nvmProbeOk: true,
+          nvmSymlinkDir: 'C:\\Program Files\\nodejs',
+          hasSelectedRuntimeSnapshot: true,
+          hasAuthoritativeSnapshot: true,
+          hasDetectedRuntimeCandidate: true,
+        },
+        installStrategy: 'nvm',
+        requiredVersion: '22.19.0',
+        targetVersion: 'v22.17.0',
+      })
+    ).toMatchObject({
+      actionLabel: '升级并修复运行时',
+      effectiveNeedOpenClaw: true,
+    })
+
+    expect(
+      resolveWindowsNodeExecutionPlanPresentation({
+        executionPlan: {
+          planId: 'plan-private',
+          platform: 'win32',
+          family: 'private-runtime',
+          targetVersion: 'v24.14.1',
+          detectedNodePath: null,
+          detectedInstallStrategy: 'installer',
+          requiresBindingRepair: false,
+          fallbackPolicy: 'not-applicable',
+          nvmDir: null,
+          nvmExecutable: null,
+          nvmExecutableAvailable: false,
+          nvmProbeOk: false,
+          nvmSymlinkDir: null,
+          hasSelectedRuntimeSnapshot: false,
+          hasAuthoritativeSnapshot: false,
+          hasDetectedRuntimeCandidate: false,
+        },
+        installStrategy: 'installer',
+        requiredVersion: '22.19.0',
+        targetVersion: 'v24.14.1',
+      })
+    ).toMatchObject({
+      actionLabel: '安装托管 runtime',
+      effectiveNeedOpenClaw: false,
+      planSummaryLabel: '执行策略：安装托管 runtime',
+    })
   })
 
   it('tracks the active takeover failure and clears it once manual backup is acknowledged', () => {

@@ -4,8 +4,8 @@ const { readFile } = process.getBuiltinModule('node:fs/promises') as typeof impo
 const path = process.getBuiltinModule('node:path') as typeof import('node:path')
 
 function extractCheckNodeSource(cliSource: string): string {
-  const start = cliSource.indexOf('export async function checkNode(): Promise<NodeCheckResult> {')
-  const end = cliSource.indexOf('async function detectNvmDir():', start)
+  const start = cliSource.indexOf('async function checkNodeInternal(options:')
+  const end = cliSource.indexOf('export async function checkNode(): Promise<NodeCheckResult> {', start)
   if (start < 0 || end < 0) {
     throw new Error('checkNode source block not found')
   }

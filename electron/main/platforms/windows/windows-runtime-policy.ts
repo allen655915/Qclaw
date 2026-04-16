@@ -91,6 +91,37 @@ export interface PrepareWindowsManagedOpenClawRuntimeCandidateOptions {
   userDataDir?: string
 }
 
+export interface WindowsExternalOpenClawRuntimePaths {
+  hostPackageRoot: string
+  npmPrefix: string
+  openclawExecutable: string
+  packageJsonPath: string
+}
+
+export interface ResolveWindowsExternalOpenClawRuntimePathsOptions {
+  hostPackageRoot?: string | null
+  npmPrefix: string
+  openclawExecutable?: string | null
+}
+
+export interface PrepareWindowsExternalOpenClawRuntimeCandidateOptions {
+  configPath: string
+  extensionsDir?: string
+  hostPackageRoot?: string | null
+  nodeExecutable: string
+  npmPrefix: string
+  openclawExecutable?: string | null
+  stateDir: string
+  userDataDir?: string
+}
+
+export interface PrepareWindowsExternalOpenClawRuntimeCandidateResult {
+  errors: string[]
+  ok: boolean
+  paths: WindowsExternalOpenClawRuntimePaths | null
+  snapshot: WindowsActiveRuntimeSnapshot | null
+}
+
 export interface PrepareWindowsManagedOpenClawRuntimeCandidateResult {
   errors: string[]
   marker: WindowsManagedOpenClawRuntimeMarker | null
@@ -202,6 +233,24 @@ export function resolveWindowsPrivateOpenClawRuntimePaths(
   }
 }
 
+export function resolveWindowsExternalOpenClawRuntimePaths(
+  options: ResolveWindowsExternalOpenClawRuntimePathsOptions
+): WindowsExternalOpenClawRuntimePaths {
+  const npmPrefix = trimWindowsPath(options.npmPrefix)
+  const hostPackageRoot =
+    trimWindowsPath(options.hostPackageRoot || '') ||
+    path.win32.join(npmPrefix, 'node_modules', 'openclaw')
+  const openclawExecutable =
+    trimWindowsPath(options.openclawExecutable || '') || path.win32.join(npmPrefix, 'openclaw.cmd')
+
+  return {
+    hostPackageRoot,
+    npmPrefix,
+    openclawExecutable,
+    packageJsonPath: path.win32.join(hostPackageRoot, 'package.json'),
+  }
+}
+
 export function resolveRequiredWindowsOpenClawRuntimePathsForNodeExecutable(
   nodeExecutable: string,
   options: ResolveWindowsPrivateNodeRuntimePathsOptions = {}
@@ -279,6 +328,52 @@ export async function healMissingManagedRuntimeMarker(
 
   const result = await writeWindowsManagedOpenClawRuntimeMarker(options)
   return { healed: result.ok, markerPath }
+}
+
+export function prepareWindowsExternalOpenClawRuntimeCandidate(
+  options: PrepareWindowsExternalOpenClawRuntimeCandidateOptions
+): PrepareWindowsExternalOpenClawRuntimeCandidateResult {
+  const configPath = trimWindowsPath(options.configPath)
+  const stateDir = trimWindowsPath(options.stateDir)
+  const nodeExecutable = trimWindowsPath(options.nodeExecutable)
+  const npmPrefix = trimWindowsPath(options.npmPrefix)
+  const errors: string[] = []
+
+  if (!configPath) errors.push('missing configPath')
+  if (!stateDir) errors.push('missing stateDir')
+  if (!nodeExecutable) errors.push('missing nodeExecutable')
+  if (!npmPrefix) errors.push('missing npmPrefix')
+
+  if (errors.length > 0) {
+    return {
+      errors,
+      ok: false,
+      paths: null,
+      snapshot: null,
+    }
+  }
+
+  const paths = resolveWindowsExternalOpenClawRuntimePaths({
+    hostPackageRoot: options.hostPackageRoot,
+    npmPrefix,
+    openclawExecutable: options.openclawExecutable,
+  })
+
+  return {
+    errors: [],
+    ok: true,
+    paths,
+    snapshot: buildWindowsActiveRuntimeSnapshot({
+      configPath,
+      extensionsDir: trimWindowsPath(options.extensionsDir || '') || path.win32.join(stateDir, 'extensions'),
+      hostPackageRoot: paths.hostPackageRoot,
+      nodeExecutable,
+      npmPrefix: paths.npmPrefix,
+      openclawExecutable: paths.openclawExecutable,
+      stateDir,
+      userDataDir: trimWindowsPath(options.userDataDir || '') || undefined,
+    }),
+  }
 }
 
 function normalizeOpenClawVersionProbe(value: string | null | undefined): string | null {

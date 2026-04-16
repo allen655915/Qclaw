@@ -23,7 +23,7 @@ function extractDiscoverWindowsActiveRuntimeSnapshotSource(cliSource: string): s
 
 function extractInspectSelectedRuntimeCompletenessSource(cliSource: string): string {
   const start = cliSource.indexOf('async function inspectSelectedWindowsOpenClawRuntimeCompleteness(): Promise<boolean> {')
-  const end = cliSource.indexOf('async function resolveSelectedWindowsNodeExecutablePath(): Promise<string> {', start)
+  const end = cliSource.indexOf('async function resolveSelectedWindowsNodeExecutablePath(', start)
   if (start < 0 || end < 0) {
     throw new Error('inspectSelectedWindowsOpenClawRuntimeCompleteness source block not found')
   }

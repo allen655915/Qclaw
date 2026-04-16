@@ -34,6 +34,7 @@ import {
   MIN_SUPPORTED_OPENCLAW_VERSION,
   PINNED_OPENCLAW_VERSION,
 } from '../shared/openclaw-version-policy'
+import type { WindowsNodeInstallExecutionPlanView } from '../shared/windows-node-install-plan'
 import logoSrc from '@/assets/logo.png'
 import tooltips from '@/constants/tooltips.json'
 
@@ -188,6 +189,92 @@ export async function retryOpenClawLatestVersionCheck(
 type StepStatus = 'pending' | 'checking' | 'ok' | 'installing' | 'pending-install' | 'error' | 'canceled'
 
 type NodeInstallStrategy = 'nvm' | 'installer'
+
+interface WindowsNodeExecutionPlanPresentation {
+  actionLabel: string
+  effectiveNeedOpenClaw: boolean
+  installDescription: string
+  openClawRepairDescription: string
+  pendingDescriptionWhenMissingNode: string
+  pendingDescriptionWhenUpgradeNeeded: string
+  planSummaryLabel: string
+  prepareDescription: string
+}
+
+export function resolveEffectiveNodeInstallStrategy(options: {
+  executionPlan?: WindowsNodeInstallExecutionPlanView | null
+  installStrategy: NodeInstallStrategy
+}): NodeInstallStrategy {
+  if (options.executionPlan?.family === 'nvm-global') return 'nvm'
+  if (options.executionPlan?.family === 'private-runtime') return 'installer'
+  return options.installStrategy
+}
+
+export function resolveWindowsNodeExecutionPlanPresentation(options: {
+  executionPlan?: WindowsNodeInstallExecutionPlanView | null
+  installStrategy: NodeInstallStrategy
+  requiredVersion: string
+  targetVersion?: string | null
+}): WindowsNodeExecutionPlanPresentation {
+  const targetVersion = String(options.targetVersion || '').trim()
+  const plan = options.executionPlan || null
+  const effectiveFamily =
+    plan?.family || (options.installStrategy === 'nvm' ? 'nvm-global' : 'private-runtime')
+  const effectiveNeedOpenClaw = plan?.requiresBindingRepair === true
+  const targetVersionLabel = targetVersion || '目标版本'
+
+  if (effectiveNeedOpenClaw) {
+    return {
+      actionLabel: '升级并修复运行时',
+      effectiveNeedOpenClaw: true,
+      installDescription:
+        effectiveFamily === 'nvm-global'
+          ? '正在通过 nvm 升级 Node.js，并修复运行时...'
+          : '正在安装托管 runtime，并修复运行时...',
+      openClawRepairDescription: '正在修复 OpenClaw 运行时...',
+      pendingDescriptionWhenMissingNode:
+        effectiveFamily === 'nvm-global'
+          ? `未检测到可用 Node.js，系统将通过 nvm 准备 ${targetVersionLabel}，并修复运行时。`
+          : '未检测到 Node.js，系统将安装托管 runtime，并修复运行时。',
+      pendingDescriptionWhenUpgradeNeeded:
+        `OpenClaw 需要 Node.js ${options.requiredVersion} 或更高版本。当前版本过低，需升级并修复运行时后再继续。`,
+      planSummaryLabel:
+        effectiveFamily === 'nvm-global'
+          ? `执行策略：通过 nvm 升级到 ${targetVersionLabel}，并修复运行时`
+          : `执行策略：安装托管 runtime，并修复运行时`,
+      prepareDescription:
+        effectiveFamily === 'nvm-global'
+          ? `正在通过 nvm 准备 Node.js ${targetVersionLabel}，并修复运行时...`
+          : '正在准备托管 runtime，并修复运行时...',
+    }
+  }
+
+  if (effectiveFamily === 'nvm-global') {
+    return {
+      actionLabel: '通过 nvm 升级',
+      effectiveNeedOpenClaw: false,
+      installDescription: '正在通过 nvm 安装 Node.js...',
+      openClawRepairDescription: '',
+      pendingDescriptionWhenMissingNode: `未检测到可用 Node.js，系统将通过 nvm 准备 ${targetVersionLabel}。`,
+      pendingDescriptionWhenUpgradeNeeded:
+        `OpenClaw 需要 Node.js ${options.requiredVersion} 或更高版本。当前版本过低，请通过 nvm 升级后再继续。`,
+      planSummaryLabel: `执行策略：通过 nvm 升级到 ${targetVersionLabel}`,
+      prepareDescription: `正在通过 nvm 准备 Node.js ${targetVersionLabel}...`,
+    }
+  }
+
+  return {
+    actionLabel: '安装托管 runtime',
+    effectiveNeedOpenClaw: false,
+    installDescription: '正在安装托管 runtime...',
+    openClawRepairDescription: '',
+    pendingDescriptionWhenMissingNode: '未检测到 Node.js，系统将安装托管 runtime。',
+    pendingDescriptionWhenUpgradeNeeded:
+      `OpenClaw 需要 Node.js ${options.requiredVersion} 或更高版本。当前版本过低，请安装托管 runtime 后再继续。`,
+    planSummaryLabel: '执行策略：安装托管 runtime',
+    prepareDescription: '正在准备托管 runtime...',
+  }
+}
 
 export function shouldDownloadNodeInstallerBeforeInstall(options: {
   needNode: boolean
@@ -809,6 +896,8 @@ export default function EnvCheck({
   const [latestNodeVersion, setLatestNodeVersion] = useState('')
   const [nodeRequiredVersion, setNodeRequiredVersion] = useState(MIN_NODE_VERSION)
   const [nodeInstallStrategy, setNodeInstallStrategy] = useState<NodeInstallStrategy>('installer')
+  const [windowsNodeInstallExecutionPlan, setWindowsNodeInstallExecutionPlan] =
+    useState<WindowsNodeInstallExecutionPlanView | null>(null)
   const [openClawGateState, setOpenClawGateState] = useState<OpenClawVersionGateState | null>(null)
   const [isRefreshingOpenClawVersion, setIsRefreshingOpenClawVersion] = useState(false)
   const [isUpgradingOpenClaw, setIsUpgradingOpenClaw] = useState(false)
@@ -836,6 +925,19 @@ export default function EnvCheck({
     pluginRepairResult,
     nodeStepStatus,
   })
+  const effectiveNodeInstallStrategy = resolveEffectiveNodeInstallStrategy({
+    executionPlan: windowsNodeInstallExecutionPlan,
+    installStrategy: nodeInstallStrategy,
+  })
+  const windowsNodeInstallPlanPresentation =
+    window.api.platform === 'win32'
+      ? resolveWindowsNodeExecutionPlanPresentation({
+          executionPlan: windowsNodeInstallExecutionPlan,
+          installStrategy: effectiveNodeInstallStrategy,
+          requiredVersion: nodeRequiredVersion,
+          targetVersion: latestNodeVersion,
+        })
+      : null
   const [pluginRepairNoticeVisible, setPluginRepairNoticeVisible] = useState(Boolean(pluginRepairResult?.repaired))
   const [pluginRepairErrorVisible, setPluginRepairErrorVisible] = useState(Boolean(pluginRepairErrorSummary))
 
@@ -855,6 +957,7 @@ export default function EnvCheck({
     setLatestNodeVersion('')
     setNodeRequiredVersion(MIN_NODE_VERSION)
     setNodeInstallStrategy('installer')
+    setWindowsNodeInstallExecutionPlan(null)
     setOpenClawGateState(null)
     setIsRefreshingOpenClawVersion(false)
     setIsUpgradingOpenClaw(false)
@@ -1440,23 +1543,62 @@ export default function EnvCheck({
   // 手动升级 Node.js
   const handleNodeUpgrade = async () => {
     setIsRunning(true)
-    updateStep('node', { status: 'installing', description: '正在准备升级...', progress: 0 })
+    const previousOpenClawStep = steps.find((step) => step.id === 'openclaw') || null
 
     try {
       // 1. 获取安装计划（会自动选官方最新稳定版）
       const plan = await window.api.resolveNodeInstallPlan()
-      const shouldUseNvmInstall = nodeInstallStrategy === 'nvm'
+      const manualNodeExecutionPlan =
+        window.api.platform === 'win32'
+          ? (
+              windowsNodeInstallExecutionPlan
+              || await window.api.resolveWindowsNodeInstallExecutionPlan().catch(() => null)
+            )
+          : null
+      const manualNodeInstallStrategy = resolveEffectiveNodeInstallStrategy({
+        executionPlan: manualNodeExecutionPlan,
+        installStrategy: nodeInstallStrategy,
+      })
+      const manualNodeInstallPlanPresentation =
+        window.api.platform === 'win32'
+          ? resolveWindowsNodeExecutionPlanPresentation({
+              executionPlan: manualNodeExecutionPlan,
+              installStrategy: manualNodeInstallStrategy,
+              requiredVersion: nodeRequiredVersion,
+              targetVersion: plan.version,
+            })
+          : null
+      const shouldUseNvmInstall = manualNodeInstallStrategy === 'nvm'
       setLatestNodeVersion(plan.version)
+      setWindowsNodeInstallExecutionPlan(manualNodeExecutionPlan)
+      updateStep('node', {
+        status: 'installing',
+        description: manualNodeInstallPlanPresentation?.prepareDescription || '正在准备升级...',
+        progress: 0,
+      })
+      if (manualNodeInstallPlanPresentation?.effectiveNeedOpenClaw) {
+        updateStep('openclaw', {
+          status: 'installing',
+          description: manualNodeInstallPlanPresentation.openClawRepairDescription,
+          error: undefined,
+          progress: 35,
+        })
+      }
 
       let installerPath: string | undefined
       const shouldDownloadInstaller = shouldDownloadNodeInstallerBeforeInstall({
         needNode: true,
-        installStrategy: nodeInstallStrategy,
+        installStrategy: manualNodeInstallStrategy,
         platform: window.api.platform,
         nodeInstallPlan: plan,
       })
       if (shouldUseNvmInstall) {
-        updateStep('node', { description: `正在通过 nvm 准备 Node.js ${plan.version}...`, progress: 15 })
+        updateStep('node', {
+          description:
+            manualNodeInstallPlanPresentation?.prepareDescription
+            || `正在通过 nvm 准备 Node.js ${plan.version}...`,
+          progress: 15,
+        })
       } else if (shouldDownloadInstaller) {
         // 2. 下载安装包
         updateStep('node', { description: `正在下载 Node.js ${plan.version}...`, progress: 10 })
@@ -1477,16 +1619,34 @@ export default function EnvCheck({
           }
         }
       } else {
-        updateStep('node', { description: `正在准备 Node.js ${plan.version}...`, progress: 15 })
+        updateStep('node', {
+          description:
+            manualNodeInstallPlanPresentation?.prepareDescription
+            || `正在准备 Node.js ${plan.version}...`,
+          progress: 15,
+        })
       }
 
       // 4. 执行安装
-      updateStep('node', { description: shouldUseNvmInstall ? '正在通过 nvm 安装 Node.js...' : '正在安装 Node.js...', progress: 50 })
+      updateStep('node', {
+        description:
+          manualNodeInstallPlanPresentation?.installDescription
+          || (shouldUseNvmInstall ? '正在通过 nvm 安装 Node.js...' : '正在安装 Node.js...'),
+        progress: 50,
+      })
+      if (manualNodeInstallPlanPresentation?.effectiveNeedOpenClaw) {
+        updateStep('openclaw', {
+          status: 'installing',
+          description: manualNodeInstallPlanPresentation.openClawRepairDescription,
+          progress: 55,
+        })
+      }
       const installResult = await window.api.installEnv({
         needNode: true,
-        needOpenClaw: false,
+        needOpenClaw: manualNodeInstallPlanPresentation?.effectiveNeedOpenClaw === true,
         nodeInstallerPath: installerPath,
         nodeInstallPlan: plan,
+        windowsNodeInstallExecutionPlan: manualNodeExecutionPlan || undefined,
       })
 
       if (!installResult.ok) {
@@ -1516,6 +1676,15 @@ export default function EnvCheck({
         status: 'pending-install',
         error: '升级失败，请稍后重试。'
       })
+      if (previousOpenClawStep) {
+        updateStep('openclaw', {
+          status: previousOpenClawStep.status,
+          description: previousOpenClawStep.description,
+          error: previousOpenClawStep.error,
+          progress: previousOpenClawStep.progress,
+          version: previousOpenClawStep.version,
+        })
+      }
       setIsRunning(false)
     }
   }
@@ -1549,6 +1718,7 @@ export default function EnvCheck({
     setFatalIssue(null)
     setStartupIssuePrompt(null)
     setLatestNodeVersion('')
+    setWindowsNodeInstallExecutionPlan(null)
     setOpenClawGateState(null)
     setOpenClawUpgradeError('')
     setReadyPayload(null)
@@ -1601,10 +1771,14 @@ export default function EnvCheck({
       needsUpgrade: nodeResult.needsUpgrade,
       version: nodeResult.version ?? null,
       installStrategy: nodeResult.installStrategy ?? null,
+      executionPlanId: nodeResult.executionPlan?.planId ?? null,
+      executionPlanFamily: nodeResult.executionPlan?.family ?? null,
+      executionPlanRequiresBindingRepair: nodeResult.executionPlan?.requiresBindingRepair ?? null,
     })
     const requiredNodeVersion = nodeResult.requiredVersion || MIN_NODE_VERSION
     setNodeRequiredVersion(requiredNodeVersion)
     setNodeInstallStrategy(nodeResult.installStrategy)
+    setWindowsNodeInstallExecutionPlan(nodeResult.executionPlan || null)
     const nodeNeedsUpgrade = nodeResult.installed && nodeResult.needsUpgrade
     let needNode = !nodeResult.installed
     let nodeInstallPlan = null
@@ -1620,13 +1794,27 @@ export default function EnvCheck({
       }
     }
     const targetNodeVersion = nodeInstallPlan?.version || nodeResult.targetVersion
+    const nodeExecutionPlanPresentation =
+      window.api.platform === 'win32'
+        ? resolveWindowsNodeExecutionPlanPresentation({
+            executionPlan: nodeResult.executionPlan || null,
+            installStrategy: resolveEffectiveNodeInstallStrategy({
+              executionPlan: nodeResult.executionPlan || null,
+              installStrategy: nodeResult.installStrategy,
+            }),
+            requiredVersion: requiredNodeVersion,
+            targetVersion: targetNodeVersion,
+          })
+        : null
 
     // 显示检测结果（无论是否安装，都先显示检测结果）
     if (!nodeResult.installed) {
       setLatestNodeVersion(targetNodeVersion || '')
       updateStep('node', {
         status: 'pending-install',
-        description: '未检测到 Node.js，系统将自动安装官方最新稳定版',
+        description:
+          nodeExecutionPlanPresentation?.pendingDescriptionWhenMissingNode
+          || '未检测到 Node.js，系统将自动安装官方最新稳定版',
         progress: 20,
       })
     } else if (nodeNeedsUpgrade) {
@@ -1634,7 +1822,9 @@ export default function EnvCheck({
       updateStep('node', {
         status: 'pending-install',
         version: nodeResult.version,
-        description: `OpenClaw 需要 Node.js ${requiredNodeVersion} 或更高版本。 当前版本过低，请手动升级后再继续。`,
+        description:
+          nodeExecutionPlanPresentation?.pendingDescriptionWhenUpgradeNeeded
+          || `OpenClaw 需要 Node.js ${requiredNodeVersion} 或更高版本。 当前版本过低，请手动升级后再继续。`,
         progress: 20,
       })
       setIsRunning(false)
@@ -1654,14 +1844,19 @@ export default function EnvCheck({
     if (
       shouldBootstrapNodeBeforeOpenClawCheck({
         needNode,
-        installStrategy: nodeResult.installStrategy,
+        installStrategy: resolveEffectiveNodeInstallStrategy({
+          executionPlan: nodeResult.executionPlan || null,
+          installStrategy: nodeResult.installStrategy,
+        }),
         platform: window.api.platform,
         nodeInstallPlan,
       })
     ) {
       updateStep('node', {
         status: 'installing',
-        description: `正在安装 Node.js ${targetNodeVersion}...`,
+        description:
+          nodeExecutionPlanPresentation?.installDescription
+          || `正在安装 Node.js ${targetNodeVersion}...`,
         progress: 45,
       })
 
@@ -1669,6 +1864,7 @@ export default function EnvCheck({
         needNode: true,
         needOpenClaw: false,
         nodeInstallPlan: nodeInstallPlan || undefined,
+        windowsNodeInstallExecutionPlan: nodeResult.executionPlan || undefined,
       })
 
       if (!nodeBootstrapResult.ok) {
@@ -1703,6 +1899,7 @@ export default function EnvCheck({
       nodeInstallPlan = null
       setLatestNodeVersion('')
       setNodeInstallStrategy(nodeResult.installStrategy)
+      setWindowsNodeInstallExecutionPlan(nodeResult.executionPlan || null)
       updateStep('node', { status: 'ok', version: nodeResult.version, description: '已安装', progress: 100 })
       setCurrentStep(1)
     }
@@ -1826,7 +2023,10 @@ export default function EnvCheck({
     let nodeInstallerPath: string | undefined
     const shouldDownloadNodeInstaller = shouldDownloadNodeInstallerBeforeInstall({
       needNode,
-      installStrategy: nodeResult.installStrategy,
+      installStrategy: resolveEffectiveNodeInstallStrategy({
+        executionPlan: nodeResult.executionPlan || null,
+        installStrategy: nodeResult.installStrategy,
+      }),
       platform: window.api.platform,
       nodeInstallPlan,
     })
@@ -1864,7 +2064,9 @@ export default function EnvCheck({
       } else {
         updateStep('node', {
           status: 'installing',
-          description: `正在通过 nvm 准备 Node.js ${targetNodeVersion}...`,
+          description:
+            nodeExecutionPlanPresentation?.prepareDescription
+            || `正在通过 nvm 准备 Node.js ${targetNodeVersion}...`,
           progress: 45,
         })
       }
@@ -1880,7 +2082,11 @@ export default function EnvCheck({
 
     // 一次性安装所有需要的组件（只弹一次权限弹窗）
     if (installProgressStepId === 'node') {
-      updateStep('node', { status: 'installing', description: '正在安装组件...', progress: 60 })
+      updateStep('node', {
+        status: 'installing',
+        description: nodeExecutionPlanPresentation?.installDescription || '正在安装组件...',
+        progress: 60,
+      })
     } else if (installProgressStepId === 'openclaw') {
       updateStep('openclaw', {
         status: 'installing',
@@ -1894,6 +2100,7 @@ export default function EnvCheck({
       needOpenClaw: shouldInstallOpenClawRuntime,
       nodeInstallerPath,
       nodeInstallPlan: nodeInstallPlan || undefined,
+      windowsNodeInstallExecutionPlan: nodeResult.executionPlan || undefined,
     })
 
     if (!installResult.ok) {
@@ -2227,6 +2434,11 @@ export default function EnvCheck({
                   {step.progress}%
                 </div>
               )}
+              {step.id === 'node' && step.status === 'pending-install' && windowsNodeInstallPlanPresentation?.planSummaryLabel && (
+                <div className="text-xs app-text-muted">
+                  {windowsNodeInstallPlanPresentation.planSummaryLabel}
+                </div>
+              )}
               {step.id === 'node' && step.version && step.status === 'pending-install' && shouldOfferManualNodeUpgrade(step.version, nodeRequiredVersion) && (
                 <Button
                   size="xs"
@@ -2235,7 +2447,7 @@ export default function EnvCheck({
                   onClick={handleNodeUpgrade}
                   disabled={isRunning}
                 >
-                  手动升级
+                  {windowsNodeInstallPlanPresentation?.actionLabel || '手动升级'}
                 </Button>
               )}
               {step.id === 'openclaw' && openClawGateState?.statusLabel && !isRunning && (

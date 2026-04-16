@@ -3,7 +3,9 @@ import {
   buildWindowsManagedOpenClawRuntimeMarker,
   buildWindowsActiveRuntimeSnapshot,
   buildWindowsSelectedRuntimeSnapshotFields,
+  prepareWindowsExternalOpenClawRuntimeCandidate,
   prepareWindowsManagedOpenClawRuntimeCandidate,
+  resolveWindowsExternalOpenClawRuntimePaths,
   resolveRequiredWindowsOpenClawRuntimePathsForNodeExecutable,
   reuseWindowsSelectedRuntimeSnapshotFields,
   resolveWindowsPrivateOpenClawRuntimePaths,
@@ -150,6 +152,23 @@ describe('resolveRequiredWindowsOpenClawRuntimePathsForNodeExecutable', () => {
   })
 })
 
+describe('resolveWindowsExternalOpenClawRuntimePaths', () => {
+  it('derives the external openclaw shim and package root from a global npm prefix', () => {
+    const paths = resolveWindowsExternalOpenClawRuntimePaths({
+      npmPrefix: 'C:\\Users\\alice\\AppData\\Roaming\\npm',
+    })
+
+    expect(paths.npmPrefix).toBe('C:\\Users\\alice\\AppData\\Roaming\\npm')
+    expect(paths.openclawExecutable).toBe('C:\\Users\\alice\\AppData\\Roaming\\npm\\openclaw.cmd')
+    expect(paths.hostPackageRoot).toBe(
+      'C:\\Users\\alice\\AppData\\Roaming\\npm\\node_modules\\openclaw'
+    )
+    expect(paths.packageJsonPath).toBe(
+      'C:\\Users\\alice\\AppData\\Roaming\\npm\\node_modules\\openclaw\\package.json'
+    )
+  })
+})
+
 describe('buildWindowsActiveRuntimeSnapshot with private Node runtime', () => {
   it('carries the private Node executable and keeps runtime roots under LOCALAPPDATA\\Qclaw\\runtime\\win32', () => {
     const paths = resolveWindowsPrivateNodeRuntimePaths({
@@ -175,6 +194,54 @@ describe('buildWindowsActiveRuntimeSnapshot with private Node runtime', () => {
     )
     expect(snapshot.logsDir).toBe('C:\\Users\\alice\\AppData\\Local\\Qclaw\\runtime\\win32\\logs')
     expect(snapshot.tmpDir).toBe('C:\\Users\\alice\\AppData\\Local\\Qclaw\\runtime\\win32\\tmp')
+  })
+})
+
+describe('prepareWindowsExternalOpenClawRuntimeCandidate', () => {
+  it('builds an external runtime snapshot without relying on the private managed marker', () => {
+    const result = prepareWindowsExternalOpenClawRuntimeCandidate({
+      configPath: 'C:\\Users\\alice\\.openclaw\\openclaw.json',
+      extensionsDir: 'C:\\Users\\alice\\.openclaw\\extensions',
+      nodeExecutable: 'C:\\Program Files\\nodejs\\node.exe',
+      npmPrefix: 'C:\\Users\\alice\\AppData\\Roaming\\npm',
+      stateDir: 'C:\\Users\\alice\\.openclaw',
+    })
+
+    expect(result.ok).toBe(true)
+    expect(result.errors).toEqual([])
+    expect(result.paths).toEqual({
+      hostPackageRoot: 'C:\\Users\\alice\\AppData\\Roaming\\npm\\node_modules\\openclaw',
+      npmPrefix: 'C:\\Users\\alice\\AppData\\Roaming\\npm',
+      openclawExecutable: 'C:\\Users\\alice\\AppData\\Roaming\\npm\\openclaw.cmd',
+      packageJsonPath: 'C:\\Users\\alice\\AppData\\Roaming\\npm\\node_modules\\openclaw\\package.json',
+    })
+    expect(result.snapshot).toMatchObject({
+      configPath: 'C:\\Users\\alice\\.openclaw\\openclaw.json',
+      extensionsDir: 'C:\\Users\\alice\\.openclaw\\extensions',
+      hostPackageRoot: 'C:\\Users\\alice\\AppData\\Roaming\\npm\\node_modules\\openclaw',
+      nodePath: 'C:\\Program Files\\nodejs\\node.exe',
+      npmPrefix: 'C:\\Users\\alice\\AppData\\Roaming\\npm',
+      openclawPath: 'C:\\Users\\alice\\AppData\\Roaming\\npm\\openclaw.cmd',
+      stateDir: 'C:\\Users\\alice\\.openclaw',
+    })
+  })
+
+  it('rejects incomplete external runtime inputs instead of fabricating a partial snapshot', () => {
+    const result = prepareWindowsExternalOpenClawRuntimeCandidate({
+      configPath: '',
+      nodeExecutable: '',
+      npmPrefix: '',
+      stateDir: 'C:\\Users\\alice\\.openclaw',
+    })
+
+    expect(result.ok).toBe(false)
+    expect(result.snapshot).toBeNull()
+    expect(result.paths).toBeNull()
+    expect(result.errors).toEqual([
+      'missing configPath',
+      'missing nodeExecutable',
+      'missing npmPrefix',
+    ])
   })
 })
 

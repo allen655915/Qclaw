@@ -33,6 +33,14 @@ const { registerHooks } = process.getBuiltinModule('node:module') as typeof impo
 type RecordLike = Record<string, unknown>
 
 interface CliModule {
+  beginWindowsRuntimeInstallTransaction: (dependencies?: RecordLike) => {
+    previousAuthoritativeSnapshot: WindowsChannelRuntimeSnapshot | null
+    previousSelectedRuntimeSnapshot: WindowsActiveRuntimeSnapshot | null
+    commitSelectedRuntimeSnapshot: (
+      snapshot: WindowsActiveRuntimeSnapshot | null | undefined
+    ) => Promise<WindowsActiveRuntimeSnapshot | null>
+    restore: (reason?: string) => WindowsActiveRuntimeSnapshot | null
+  }
   buildAuthoritativeWindowsChannelRuntimeSnapshot: (
     existingSnapshot?: WindowsChannelRuntimeSnapshot | null,
     dependencies?: RecordLike
@@ -648,6 +656,47 @@ describe('commitSelectedWindowsActiveRuntimeSnapshot', () => {
       })
       expect(ensureAuthoritativeWindowsChannelRuntimeSnapshot).toHaveBeenCalledTimes(1)
       expect(cachedSnapshot).toEqual(ensuredSnapshot)
+    })
+  })
+})
+
+describe('beginWindowsRuntimeInstallTransaction', () => {
+  it('restores the previous selected runtime and authoritative snapshot after install cleanup clears them', async () => {
+    const previousRuntime = createGlobalRuntimeSnapshot()
+    const previousSnapshot = createChannelRuntimeSnapshot({
+      agentId: 'feishu-runtime-a',
+      runtime: previousRuntime,
+    })
+    let selectedSnapshot: WindowsActiveRuntimeSnapshot | null = previousRuntime
+    let cachedSnapshot: WindowsChannelRuntimeSnapshot | null = previousSnapshot
+
+    await withStubbedWindowsPlatform(async () => {
+      const cliModule = await loadCliModule()
+      const transaction = cliModule.beginWindowsRuntimeInstallTransaction({
+        getSelectedRuntimeSnapshot: () => selectedSnapshot,
+        readCachedWindowsChannelRuntimeSnapshot: () => cachedSnapshot,
+        replaceCachedWindowsChannelRuntimeSnapshot: (
+          snapshot: WindowsChannelRuntimeSnapshot | null | undefined
+        ) => {
+          cachedSnapshot = snapshot ?? null
+          return cachedSnapshot
+        },
+        setSelectedRuntimeSnapshot: (snapshot: WindowsActiveRuntimeSnapshot | null | undefined) => {
+          selectedSnapshot = snapshot ? { ...snapshot } : null
+          return selectedSnapshot
+        },
+      })
+
+      selectedSnapshot = null
+      cachedSnapshot = null
+
+      const restoredSnapshot = transaction.restore('unit-test')
+
+      expect(transaction.previousSelectedRuntimeSnapshot).toEqual(previousRuntime)
+      expect(transaction.previousAuthoritativeSnapshot).toEqual(previousSnapshot)
+      expect(restoredSnapshot).toEqual(previousRuntime)
+      expect(selectedSnapshot).toEqual(previousRuntime)
+      expect(cachedSnapshot).toEqual(previousSnapshot)
     })
   })
 })

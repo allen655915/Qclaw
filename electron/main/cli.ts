@@ -13,7 +13,10 @@ import { applyEnvFileUpdates } from './env-file'
 import { createOAuthOutputScanner, shouldAutoOpenBrowserForArgs } from './oauth-browser'
 import { normalizeAuthChoice } from './openclaw-spawn'
 import { resolveStdioForCommand } from './cli-process'
-import { writeWindowsManagedOpenClawRuntimeMarker } from './platforms/windows/windows-runtime-policy'
+import {
+  resolveWindowsExternalOpenClawRuntimePaths,
+  writeWindowsManagedOpenClawRuntimeMarker,
+} from './platforms/windows/windows-runtime-policy'
 import { buildMacDeveloperToolsProbeEnv } from './mac-developer-tools'
 import {
   probePlatformCommandCapability,
@@ -84,9 +87,11 @@ import type { OpenClawDiscoveryResult, OpenClawInstallCandidate } from '../../sr
 import { buildCliPathWithCandidates, listExecutablePathCandidates } from './runtime-path-discovery'
 import { resolveBoundOpenClawCommand } from './openclaw-runtime-invocation'
 import { ensureWindowsPrivateNodeRuntime } from './platforms/windows/windows-private-node-runtime'
+import { ensureWindowsNvmNodeRuntime } from './platforms/windows/windows-nvm-node-runtime'
 import {
   buildWindowsActiveRuntimeSnapshot,
   buildWindowsSelectedRuntimeSnapshotFields,
+  prepareWindowsExternalOpenClawRuntimeCandidate,
   prepareWindowsManagedOpenClawRuntimeCandidate,
   resolveRequiredWindowsOpenClawRuntimePathsForNodeExecutable,
   reuseWindowsSelectedRuntimeSnapshotFields,
@@ -182,6 +187,12 @@ import {
   isPluginAlreadyInstalledError,
   type OnboardErrorCode,
 } from '../../src/shared/openclaw-cli-errors'
+import type {
+  WindowsNodeInstallExecutionFamily,
+  WindowsNodeInstallExecutionOutcome,
+  WindowsNodeInstallExecutionPlanView,
+  WindowsNodeInstallFallbackReason,
+} from '../../src/shared/windows-node-install-plan'
 import { resolvePairingApproveErrorCode, type PairingApproveErrorCode } from '../../src/shared/pairing-protocol'
 import { classifyGatewayRuntimeState } from '../../src/shared/gateway-runtime-diagnostics'
 import type { GatewayRuntimeStateCode } from '../../src/shared/gateway-runtime-state'
@@ -190,6 +201,11 @@ import {
   getSelectedWindowsActiveRuntimeSnapshot,
   setSelectedWindowsActiveRuntimeSnapshot,
 } from './windows-active-runtime'
+import {
+  buildWindowsNodeInstallExecutionOutcome,
+  resolveWindowsNodeInstallExecutionPlanFromInputs,
+  toWindowsNodeInstallExecutionPlanView,
+} from './windows-node-install-execution'
 import {
   discoverOpenClawInstallations,
   discoverOpenClawInstallationsFromKnownPaths,
@@ -285,8 +301,15 @@ async function inspectSelectedWindowsOpenClawRuntimeCompleteness(): Promise<bool
   return completeWithSnapshot
 }
 
-async function resolveSelectedWindowsNodeExecutablePath(): Promise<string> {
+async function resolveSelectedWindowsNodeExecutablePath(
+  preferredNodeExecutablePath?: string | null
+): Promise<string> {
   if (process.platform !== 'win32') return ''
+
+  const preferredNodePath = String(preferredNodeExecutablePath || '').trim()
+  if (preferredNodePath && await canAccessPath(preferredNodePath)) {
+    return preferredNodePath
+  }
 
   const candidates = listExecutablePathCandidates('node', {
     platform: 'win32',
@@ -304,10 +327,12 @@ async function resolveSelectedWindowsNodeExecutablePath(): Promise<string> {
   return ''
 }
 
-async function resolveSelectedWindowsOpenClawRuntimeSnapshot(): Promise<WindowsActiveRuntimeSnapshot | null> {
+async function resolveSelectedWindowsOpenClawRuntimeSnapshot(options: {
+  nodeExecutablePath?: string | null
+} = {}): Promise<WindowsActiveRuntimeSnapshot | null> {
   if (process.platform !== 'win32') return null
 
-  const nodeExecutable = await resolveSelectedWindowsNodeExecutablePath()
+  const nodeExecutable = await resolveSelectedWindowsNodeExecutablePath(options.nodeExecutablePath)
   if (!nodeExecutable) return null
 
   const requiredRuntimePaths = resolveRequiredWindowsOpenClawRuntimePathsForNodeExecutable(
@@ -786,6 +811,50 @@ export interface EnsureAuthoritativeWindowsChannelRuntimeSnapshotDependencies
   ) => WindowsChannelRuntimeSnapshot | null
 }
 
+export interface WindowsRuntimeInstallTransactionDependencies
+  extends CommitSelectedWindowsActiveRuntimeSnapshotDependencies {
+  commitSelectedWindowsActiveRuntimeSnapshot?: typeof commitSelectedWindowsActiveRuntimeSnapshot
+}
+
+export interface WindowsRuntimeInstallTransaction {
+  previousAuthoritativeSnapshot: WindowsChannelRuntimeSnapshot | null
+  previousSelectedRuntimeSnapshot: WindowsActiveRuntimeSnapshot | null
+  commitSelectedRuntimeSnapshot: (
+    snapshot: WindowsActiveRuntimeSnapshot | null | undefined
+  ) => Promise<WindowsActiveRuntimeSnapshot | null>
+  restore: (reason?: string) => WindowsActiveRuntimeSnapshot | null
+}
+
+function cloneWindowsActiveRuntimeSnapshot(
+  snapshot: WindowsActiveRuntimeSnapshot | null | undefined
+): WindowsActiveRuntimeSnapshot | null {
+  return snapshot ? { ...snapshot } : null
+}
+
+function cloneWindowsChannelRuntimeSnapshot(
+  snapshot: WindowsChannelRuntimeSnapshot | null | undefined
+): WindowsChannelRuntimeSnapshot | null {
+  if (!snapshot) return null
+  return {
+    ...snapshot,
+    gatewayOwner: { ...snapshot.gatewayOwner },
+    managedPlugin: { ...snapshot.managedPlugin },
+    resolvedBinding: { ...snapshot.resolvedBinding },
+  }
+}
+
+function matchesWindowsRuntimeSnapshotBinding(
+  left: WindowsActiveRuntimeSnapshot | null | undefined,
+  right: WindowsActiveRuntimeSnapshot | null | undefined
+): boolean {
+  return (
+    normalizeRuntimePathForCompare(left?.nodePath || '') === normalizeRuntimePathForCompare(right?.nodePath || '')
+    && normalizeRuntimePathForCompare(left?.openclawPath || '') === normalizeRuntimePathForCompare(right?.openclawPath || '')
+    && normalizeRuntimePathForCompare(left?.hostPackageRoot || '') === normalizeRuntimePathForCompare(right?.hostPackageRoot || '')
+    && normalizeRuntimePathForCompare(left?.stateDir || '') === normalizeRuntimePathForCompare(right?.stateDir || '')
+  )
+}
+
 export function readAuthoritativeWindowsChannelRuntimeSnapshot(): WindowsChannelRuntimeSnapshot | null {
   if (process.platform !== 'win32') return null
   return readCachedWindowsChannelRuntimeSnapshot()
@@ -890,6 +959,72 @@ export async function commitSelectedWindowsActiveRuntimeSnapshot(
     setSelectedRuntimeSnapshot(previousSelectedRuntimeSnapshot)
     persistCachedSnapshot(previousAuthoritativeSnapshot)
     throw error
+  }
+}
+
+export function beginWindowsRuntimeInstallTransaction(
+  dependencies: WindowsRuntimeInstallTransactionDependencies = {}
+): WindowsRuntimeInstallTransaction {
+  const getSelectedRuntimeSnapshot =
+    dependencies.getSelectedRuntimeSnapshot || getSelectedWindowsActiveRuntimeSnapshot
+  const readCachedSnapshot =
+    dependencies.readCachedWindowsChannelRuntimeSnapshot || readCachedWindowsChannelRuntimeSnapshot
+  const persistCachedSnapshot =
+    dependencies.replaceCachedWindowsChannelRuntimeSnapshot || replaceCachedWindowsChannelRuntimeSnapshot
+  const setSelectedRuntimeSnapshot =
+    dependencies.setSelectedRuntimeSnapshot || setSelectedWindowsActiveRuntimeSnapshot
+  const previousSelectedRuntimeSnapshot = cloneWindowsActiveRuntimeSnapshot(getSelectedRuntimeSnapshot())
+  const previousAuthoritativeSnapshot = cloneWindowsChannelRuntimeSnapshot(readCachedSnapshot())
+
+  if (process.platform === 'win32') {
+    appendEnvCheckDiagnostic('main-windows-runtime-install-transaction-start', {
+      previousSelectedStateDir: String(previousSelectedRuntimeSnapshot?.stateDir || '').trim() || null,
+      previousSelectedNodePath: String(previousSelectedRuntimeSnapshot?.nodePath || '').trim() || null,
+      previousAuthoritativeStateDir: String(previousAuthoritativeSnapshot?.stateDir || '').trim() || null,
+      previousAuthoritativeNodePath: String(previousAuthoritativeSnapshot?.nodePath || '').trim() || null,
+    }).catch(() => undefined)
+  }
+
+  return {
+    previousAuthoritativeSnapshot,
+    previousSelectedRuntimeSnapshot,
+    commitSelectedRuntimeSnapshot: async (snapshot) => {
+      if (process.platform !== 'win32') {
+        return cloneWindowsActiveRuntimeSnapshot(snapshot)
+      }
+      selectedWindowsActiveRuntimeSnapshotPromise = null
+      return (
+        dependencies.commitSelectedWindowsActiveRuntimeSnapshot
+        || commitSelectedWindowsActiveRuntimeSnapshot
+      )(snapshot, dependencies)
+    },
+    restore: (reason = 'unknown') => {
+      if (process.platform !== 'win32') {
+        return cloneWindowsActiveRuntimeSnapshot(previousSelectedRuntimeSnapshot)
+      }
+
+      try {
+        selectedWindowsActiveRuntimeSnapshotPromise = null
+        const restoredSelectedRuntimeSnapshot = setSelectedRuntimeSnapshot(
+          cloneWindowsActiveRuntimeSnapshot(previousSelectedRuntimeSnapshot)
+        )
+        persistCachedSnapshot(cloneWindowsChannelRuntimeSnapshot(previousAuthoritativeSnapshot))
+        appendEnvCheckDiagnostic('main-windows-runtime-install-transaction-restore', {
+          reason,
+          restoredSelectedStateDir: String(restoredSelectedRuntimeSnapshot?.stateDir || '').trim() || null,
+          restoredSelectedNodePath: String(restoredSelectedRuntimeSnapshot?.nodePath || '').trim() || null,
+          restoredAuthoritativeStateDir: String(previousAuthoritativeSnapshot?.stateDir || '').trim() || null,
+          restoredAuthoritativeNodePath: String(previousAuthoritativeSnapshot?.nodePath || '').trim() || null,
+        }).catch(() => undefined)
+        return restoredSelectedRuntimeSnapshot
+      } catch (error) {
+        appendEnvCheckDiagnostic('main-windows-runtime-install-transaction-restore-failed', {
+          reason,
+          error: error instanceof Error ? error.message : String(error || 'unknown'),
+        }).catch(() => undefined)
+        return cloneWindowsActiveRuntimeSnapshot(previousSelectedRuntimeSnapshot)
+      }
+    },
   }
 }
 
@@ -1059,6 +1194,7 @@ export interface CliResult {
   stderr: string
   code: number | null
   canceled?: boolean
+  nodeInstallExecutionOutcome?: WindowsNodeInstallExecutionOutcome | null
   npmRegistryAttempts?: Array<{
     mirrorId: string
     label: string
@@ -1073,6 +1209,7 @@ interface InstallEnvOptions {
   needOpenClaw: boolean
   nodeInstallerPath?: string
   nodeInstallPlan?: NodeInstallPlan
+  windowsNodeInstallExecutionPlan?: WindowsNodeInstallExecutionPlanView | null
 }
 
 export type MacGitToolsPrepareErrorCode =
@@ -1125,6 +1262,7 @@ export interface NodeCheckResult {
   requiredVersion: string
   targetVersion: string
   installStrategy: 'nvm' | 'installer'
+  executionPlan?: WindowsNodeInstallExecutionPlanView | null
 }
 
 export interface OpenClawCheckResult {
@@ -2246,6 +2384,338 @@ function resolvePreferredWindowsOpenClawInstallPrefix(
   return null
 }
 
+type WindowsOpenClawInstallFamily = 'private-managed' | 'external-global'
+
+interface WindowsOpenClawInstallContext {
+  family: WindowsOpenClawInstallFamily
+  nodeExecutable: string | null
+  npmCommand: string
+  npmCommandOptions: OpenClawNpmCommandOptions
+  npmPrefix: string | null
+  openClawCommandPath: string | null
+}
+
+function resolveWindowsNpmCommandForNodeExecutable(nodeExecutable?: string | null): string {
+  const normalizedNodeExecutable = String(nodeExecutable || '').trim()
+  return normalizedNodeExecutable ? join(dirname(normalizedNodeExecutable), 'npm.cmd') : 'npm'
+}
+
+function resolveWindowsDefaultGlobalNpmPrefix(env: NodeJS.ProcessEnv = process.env): string | null {
+  const appData = String(env.APPDATA || '').trim()
+  return appData ? join(appData, 'npm') : null
+}
+
+function extractLastNonEmptyOutputLine(value: string): string | null {
+  return (
+    String(value || '')
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .at(-1)
+    || null
+  )
+}
+
+async function resolveWindowsExternalOpenClawInstallPrefix(
+  npmCommand: string,
+  npmCommandOptions: OpenClawNpmCommandOptions
+): Promise<string | null> {
+  const probeResult = await runShell(
+    npmCommand,
+    buildOpenClawConfigGetPrefixArgs(npmCommandOptions),
+    MAIN_RUNTIME_POLICY.cli.lightweightProbeTimeoutMs,
+    {
+      controlDomain: 'env-setup',
+      shell: false,
+    }
+  )
+  const resolvedPrefix = extractLastNonEmptyOutputLine(probeResult.stdout)
+  const usablePrefix =
+    resolvedPrefix && resolvedPrefix.toLowerCase() !== 'undefined' && resolvedPrefix.toLowerCase() !== 'null'
+      ? resolvedPrefix
+      : null
+  const fallbackPrefix = resolveWindowsDefaultGlobalNpmPrefix(process.env)
+
+  await appendEnvCheckDiagnostic('main-openclaw-install-prefix-probe', {
+    npmCommand,
+    ok: probeResult.ok,
+    resolvedPrefix: usablePrefix,
+    fallbackPrefix,
+    usedFallback: !usablePrefix && Boolean(fallbackPrefix),
+    stderr: String(probeResult.stderr || '').trim() || null,
+  }).catch(() => undefined)
+
+  return usablePrefix || fallbackPrefix || null
+}
+
+async function resolveWindowsPrivateOpenClawInstallContext(
+  operationLabel: string,
+  options: {
+    nodeExecutable?: string | null
+    npmCommand?: string | null
+    prefixPath?: string | null
+  } = {}
+): Promise<{ context: WindowsOpenClawInstallContext } | { error: CliResult }> {
+  const prefixPath = String(options.prefixPath || '').trim() || null
+  const managedNpmOptionsResult = await resolveManagedOpenClawInstallNpmCommandOptions(
+    operationLabel,
+    {
+      prefixPath,
+    }
+  )
+  if ('error' in managedNpmOptionsResult) return managedNpmOptionsResult
+
+  const npmCommand = String(options.npmCommand || '').trim() || 'npm'
+  const openClawCommandPath = prefixPath ? join(prefixPath, 'openclaw.cmd') : null
+  const context: WindowsOpenClawInstallContext = {
+    family: 'private-managed',
+    nodeExecutable: String(options.nodeExecutable || '').trim() || null,
+    npmCommand,
+    npmCommandOptions: managedNpmOptionsResult.options,
+    npmPrefix: prefixPath,
+    openClawCommandPath,
+  }
+
+  await appendEnvCheckDiagnostic('main-openclaw-install-context-resolved', {
+    family: context.family,
+    npmCommand: context.npmCommand,
+    npmPrefix: context.npmPrefix,
+    openClawCommandPath: context.openClawCommandPath,
+  }).catch(() => undefined)
+
+  return { context }
+}
+
+async function resolveWindowsExternalOpenClawInstallContext(
+  operationLabel: string,
+  options: {
+    nodeExecutable?: string | null
+    npmCommand?: string | null
+  } = {}
+): Promise<{ context: WindowsOpenClawInstallContext } | { error: CliResult }> {
+  const managedNpmOptionsResult = await resolveManagedOpenClawInstallNpmCommandOptions(operationLabel)
+  if ('error' in managedNpmOptionsResult) return managedNpmOptionsResult
+
+  const npmCommand = String(options.npmCommand || '').trim() || 'npm'
+  const npmPrefix = await resolveWindowsExternalOpenClawInstallPrefix(
+    npmCommand,
+    managedNpmOptionsResult.options
+  )
+  const runtimePaths =
+    npmPrefix
+      ? resolveWindowsExternalOpenClawRuntimePaths({
+        npmPrefix,
+      })
+      : null
+  const context: WindowsOpenClawInstallContext = {
+    family: 'external-global',
+    nodeExecutable: String(options.nodeExecutable || '').trim() || null,
+    npmCommand,
+    npmCommandOptions: npmPrefix
+      ? {
+        ...managedNpmOptionsResult.options,
+        prefixPath: npmPrefix,
+      }
+      : managedNpmOptionsResult.options,
+    npmPrefix,
+    openClawCommandPath: runtimePaths?.openclawExecutable || null,
+  }
+
+  await appendEnvCheckDiagnostic('main-openclaw-install-context-resolved', {
+    family: context.family,
+    npmCommand: context.npmCommand,
+    npmPrefix: context.npmPrefix,
+    openClawCommandPath: context.openClawCommandPath,
+  }).catch(() => undefined)
+
+  return { context }
+}
+
+async function resolvePreferredWindowsNodeExecutableForInstall(): Promise<string | null> {
+  const selectedRuntimeNodePath = String(getSelectedWindowsActiveRuntimeSnapshot()?.nodePath || '').trim()
+  if (selectedRuntimeNodePath) return selectedRuntimeNodePath
+
+  const resolvedNodePath = await resolveSelectedWindowsNodeExecutablePath().catch(() => '')
+  return String(resolvedNodePath || '').trim() || null
+}
+
+async function prepareWindowsOpenClawRuntimeCandidateForInstall(
+  context: WindowsOpenClawInstallContext
+): Promise<{ ok: boolean; error?: string; snapshot: WindowsActiveRuntimeSnapshot | null }> {
+  const openClawCommandPath = String(context.openClawCommandPath || '').trim()
+  if (!openClawCommandPath) {
+    return {
+      ok: false,
+      error: 'OpenClaw 安装完成后未能解析命令路径。',
+      snapshot: null,
+    }
+  }
+
+  const openClawPaths = await resolveRuntimeOpenClawPaths({
+    binaryPath: openClawCommandPath,
+    cacheTtlMs: 0,
+    env: process.env,
+    platform: 'win32',
+  }).catch(() => null)
+  if (!openClawPaths?.homeDir || !openClawPaths.configFile) {
+    return {
+      ok: false,
+      error: 'OpenClaw 安装完成后未能解析状态目录或配置文件。',
+      snapshot: null,
+    }
+  }
+
+  const extensionsDir = join(openClawPaths.homeDir, 'extensions')
+  if (context.family === 'private-managed') {
+    const preparedManagedRuntimeSnapshot = await prepareManagedWindowsRuntimeSnapshotFromExistingRuntime({
+      configPath: openClawPaths.configFile,
+      stateDir: openClawPaths.homeDir,
+      extensionsDir,
+    })
+    if (!preparedManagedRuntimeSnapshot) {
+      return {
+        ok: false,
+        error: 'OpenClaw 安装完成，但未能准备私有运行时快照。',
+        snapshot: null,
+      }
+    }
+    return {
+      ok: true,
+      snapshot: preparedManagedRuntimeSnapshot,
+    }
+  }
+
+  const npmPrefix = String(context.npmPrefix || '').trim()
+  const nodeExecutable =
+    String(context.nodeExecutable || '').trim()
+    || String((await resolvePreferredWindowsNodeExecutableForInstall().catch(() => null)) || '').trim()
+  if (!npmPrefix || !nodeExecutable) {
+    return {
+      ok: false,
+      error: 'OpenClaw 安装完成后未能解析全局运行时所需的 Node.js 路径。',
+      snapshot: null,
+    }
+  }
+
+  const preparedExternalRuntime = prepareWindowsExternalOpenClawRuntimeCandidate({
+    configPath: openClawPaths.configFile,
+    extensionsDir,
+    nodeExecutable,
+    npmPrefix,
+    openclawExecutable: openClawCommandPath,
+    stateDir: openClawPaths.homeDir,
+    userDataDir: String(process.env.QCLAW_USER_DATA_DIR || '').trim() || undefined,
+  })
+  if (!preparedExternalRuntime.ok || !preparedExternalRuntime.snapshot) {
+    return {
+      ok: false,
+      error:
+        preparedExternalRuntime.errors.find(Boolean)
+        || 'OpenClaw 安装完成，但未能准备全局运行时快照。',
+      snapshot: null,
+    }
+  }
+
+  return {
+    ok: true,
+    snapshot: preparedExternalRuntime.snapshot,
+  }
+}
+
+async function commitWindowsOpenClawRuntimeCandidateForInstall(
+  context: WindowsOpenClawInstallContext,
+  runtimeInstallTransaction: WindowsRuntimeInstallTransaction
+): Promise<{ ok: boolean; error?: string; snapshot: WindowsActiveRuntimeSnapshot | null }> {
+  const preparedRuntimeCandidate = await prepareWindowsOpenClawRuntimeCandidateForInstall(context)
+  await appendEnvCheckDiagnostic('main-windows-runtime-install-candidate-prepared', {
+    family: context.family,
+    ok: preparedRuntimeCandidate.ok,
+    nodePath: String(preparedRuntimeCandidate.snapshot?.nodePath || '').trim() || null,
+    openclawPath: String(preparedRuntimeCandidate.snapshot?.openclawPath || '').trim() || null,
+    stateDir: String(preparedRuntimeCandidate.snapshot?.stateDir || '').trim() || null,
+    error: preparedRuntimeCandidate.ok ? null : preparedRuntimeCandidate.error || null,
+  }).catch(() => undefined)
+  if (!preparedRuntimeCandidate.ok || !preparedRuntimeCandidate.snapshot) {
+    return preparedRuntimeCandidate
+  }
+
+  try {
+    const committedSnapshot = await runtimeInstallTransaction.commitSelectedRuntimeSnapshot(
+      preparedRuntimeCandidate.snapshot
+    )
+    const committedMatches = matchesWindowsRuntimeSnapshotBinding(
+      committedSnapshot,
+      preparedRuntimeCandidate.snapshot
+    )
+    await appendEnvCheckDiagnostic('main-windows-runtime-install-commit-result', {
+      family: context.family,
+      committedMatches,
+      committedNodePath: String(committedSnapshot?.nodePath || '').trim() || null,
+      committedOpenClawPath: String(committedSnapshot?.openclawPath || '').trim() || null,
+      expectedNodePath: String(preparedRuntimeCandidate.snapshot.nodePath || '').trim() || null,
+      expectedOpenClawPath: String(preparedRuntimeCandidate.snapshot.openclawPath || '').trim() || null,
+    }).catch(() => undefined)
+    if (!committedMatches) {
+      return {
+        ok: false,
+        error: '安装完成，但运行时绑定未能切换到新安装结果。',
+        snapshot: preparedRuntimeCandidate.snapshot,
+      }
+    }
+    return {
+      ok: true,
+      snapshot: committedSnapshot,
+    }
+  } catch (error) {
+    return {
+      ok: false,
+      error: `安装完成，但运行时绑定提交失败：${
+        error instanceof Error ? error.message : String(error || 'unknown')
+      }`,
+      snapshot: preparedRuntimeCandidate.snapshot,
+    }
+  }
+}
+
+async function finalizeAndCommitWindowsOpenClawInstallResult(
+  installResult: CliResult,
+  expectations: {
+    expectNode: boolean
+    runtimeInstallTransaction: WindowsRuntimeInstallTransaction
+    windowsOpenClawInstallContext: WindowsOpenClawInstallContext
+  }
+): Promise<CliResult> {
+  const finalizedInstallResult = await finalizeInstallResult(installResult, {
+    expectNode: expectations.expectNode,
+    expectOpenClaw: true,
+    windowsOpenClawInstallFamily: expectations.windowsOpenClawInstallContext.family,
+    windowsOpenClawCommandPath: expectations.windowsOpenClawInstallContext.openClawCommandPath,
+  })
+  if (!finalizedInstallResult.ok) {
+    expectations.runtimeInstallTransaction.restore('finalize-install-result-failed')
+    return finalizedInstallResult
+  }
+
+  const committedRuntimeCandidate = await commitWindowsOpenClawRuntimeCandidateForInstall(
+    expectations.windowsOpenClawInstallContext,
+    expectations.runtimeInstallTransaction
+  )
+  if (committedRuntimeCandidate.ok) {
+    return finalizedInstallResult
+  }
+
+  expectations.runtimeInstallTransaction.restore('runtime-candidate-commit-failed')
+  return {
+    ok: false,
+    stdout: finalizedInstallResult.stdout,
+    stderr: [
+      String(finalizedInstallResult.stderr || '').trim(),
+      committedRuntimeCandidate.error || '安装完成，但运行时绑定提交失败。',
+    ].filter(Boolean).join('\n'),
+    code: finalizedInstallResult.code ?? 1,
+  }
+}
+
 function normalizeRunShellOptions(
   input?: CommandControlDomain | RunShellOptions
 ): RunShellOptions {
@@ -2645,7 +3115,8 @@ function buildNodeCheckResult(
   installed: boolean,
   requiredVersion: string,
   targetVersion: string,
-  installStrategy: 'nvm' | 'installer'
+  installStrategy: 'nvm' | 'installer',
+  executionPlan?: WindowsNodeInstallExecutionPlanView | null
 ): NodeCheckResult {
   const normalizedVersion = String(version || '').trim()
   const meetsRequirement = installed && isNodeVersionAtLeast(normalizedVersion, requiredVersion)
@@ -2657,6 +3128,26 @@ function buildNodeCheckResult(
     requiredVersion,
     targetVersion,
     installStrategy,
+    executionPlan: executionPlan || null,
+  }
+}
+
+function resolveDetectedNodeExecutablePathFromBinDir(
+  binDir: string | null | undefined
+): string | null {
+  const normalizedBinDir = String(binDir || '').trim()
+  if (!normalizedBinDir) return null
+  return join(normalizedBinDir, isWin ? 'node.exe' : 'node')
+}
+
+function withNodeInstallExecutionOutcome(
+  result: CliResult,
+  executionOutcome?: WindowsNodeInstallExecutionOutcome | null
+): CliResult {
+  if (!executionOutcome) return result
+  return {
+    ...result,
+    nodeInstallExecutionOutcome: executionOutcome,
   }
 }
 
@@ -2670,7 +3161,75 @@ async function resolveNodeInstallPlanForNodeCheck(): Promise<NodeInstallPlan | n
   }).catch(() => null)
 }
 
-export async function checkNode(): Promise<NodeCheckResult> {
+export async function resolveWindowsNodeInstallExecutionPlan(options: {
+  detectedNodeExecutablePath?: string | null
+  nodeCheckResult?: Pick<NodeCheckResult, 'installStrategy' | 'targetVersion'> | null
+  nodeInstallPlan?: NodeInstallPlan | null
+} = {}): Promise<WindowsNodeInstallExecutionPlanView | null> {
+  if (!isWin) return null
+
+  const nodeCheckResult =
+    options.nodeCheckResult || await checkNodeInternal({ includeExecutionPlan: false })
+  const targetVersion =
+    String(options.nodeInstallPlan?.version || nodeCheckResult?.targetVersion || '').trim()
+  const detectedNodeExecutablePath =
+    String(options.detectedNodeExecutablePath || '').trim()
+    || resolveDetectedNodeExecutablePathFromBinDir(detectedNodeBinDir)
+  const previousSelectedRuntimeSnapshot = getSelectedWindowsActiveRuntimeSnapshot()
+  const previousAuthoritativeSnapshot = readAuthoritativeWindowsChannelRuntimeSnapshot()
+  const detectedRuntimeCandidate =
+    detectedNodeExecutablePath
+      ? await resolveSelectedWindowsOpenClawRuntimeSnapshot({
+          nodeExecutablePath: detectedNodeExecutablePath,
+        }).catch(() => null)
+      : null
+  const nvmDir = await detectNvmWindowsDir().catch(() => null)
+  const nvmExecutable = nvmDir ? join(nvmDir, 'nvm.exe') : null
+  const nvmExecutableAvailable = await canAccessPath(nvmExecutable || '')
+  const nvmSymlinkDir = String(process.env.NVM_SYMLINK || '').trim() || null
+
+  let nvmProbeOk = false
+  if (nvmExecutable && nvmExecutableAvailable) {
+    const nvmProbeResult = await runDirect(
+      nvmExecutable,
+      ['version'],
+      MAIN_RUNTIME_POLICY.cli.lightweightProbeTimeoutMs,
+      'env'
+    )
+    nvmProbeOk = nvmProbeResult.ok
+  }
+
+  const resolvedPlan = resolveWindowsNodeInstallExecutionPlanFromInputs({
+    targetVersion,
+    detectedNodePath: detectedNodeExecutablePath,
+    detectedInstallStrategy: nodeCheckResult.installStrategy,
+    nvmDir,
+    nvmExecutable,
+    nvmExecutableAvailable,
+    nvmProbeOk,
+    nvmSymlinkDir,
+    previousSelectedRuntimeSnapshot,
+    previousAuthoritativeSnapshot,
+    hasDetectedRuntimeCandidate: Boolean(detectedRuntimeCandidate),
+  })
+  const planView = toWindowsNodeInstallExecutionPlanView(resolvedPlan)
+
+  await appendEnvCheckDiagnostic('main-node-install-strategy-resolved', {
+    ...planView,
+    previousSelectedNodePath: String(previousSelectedRuntimeSnapshot?.nodePath || '').trim() || null,
+    previousSelectedOpenClawPath: String(previousSelectedRuntimeSnapshot?.openclawPath || '').trim() || null,
+    previousAuthoritativeNodePath:
+      String(previousAuthoritativeSnapshot?.nodePath || '').trim() || null,
+    previousAuthoritativeOpenClawPath:
+      String(previousAuthoritativeSnapshot?.openclawPath || '').trim() || null,
+  }).catch(() => undefined)
+
+  return planView
+}
+
+async function checkNodeInternal(options: {
+  includeExecutionPlan?: boolean
+} = {}): Promise<NodeCheckResult> {
   const requirement = await resolveOpenClawNodeRequirement(
     isWin
       ? {
@@ -2687,6 +3246,7 @@ export async function checkNode(): Promise<NodeCheckResult> {
   const nvmDir = !isWin ? await detectNvmDir() : null
   const nvmWindowsDir = isWin ? await detectNvmWindowsDir().catch(() => null) : null
   const effectiveNvmDir = nvmWindowsDir ?? nvmDir
+  const includeExecutionPlan = options.includeExecutionPlan !== false
 
   const shellNode = await resolveNodeFromShell()
   const nvmNode = nvmDir
@@ -2702,13 +3262,30 @@ export async function checkNode(): Promise<NodeCheckResult> {
   })
 
   if (preferredNode) {
-    rememberDetectedNodeBinDir(preferredNode.candidate.binDir)
-    return buildNodeCheckResult(
+    const baseResult = buildNodeCheckResult(
       preferredNode.candidate.version,
       true,
       requiredVersion,
       targetVersion,
       preferredNode.installStrategy
+    )
+    const executionPlan =
+      includeExecutionPlan && isWin
+        ? await resolveWindowsNodeInstallExecutionPlan({
+            detectedNodeExecutablePath: resolveDetectedNodeExecutablePathFromBinDir(
+              preferredNode.candidate.binDir
+            ),
+            nodeCheckResult: baseResult,
+            nodeInstallPlan: installPlan,
+          })
+        : null
+    return buildNodeCheckResult(
+      preferredNode.candidate.version,
+      true,
+      requiredVersion,
+      targetVersion,
+      preferredNode.installStrategy,
+      executionPlan
     )
   }
 
@@ -2717,17 +3294,58 @@ export async function checkNode(): Promise<NodeCheckResult> {
     if (r.ok) {
       const nodeBinDir = dirname(nodePath)
       rememberDetectedNodeBinDir(nodeBinDir)
-      return buildNodeCheckResult(
+      const baseResult = buildNodeCheckResult(
         r.stdout.trim(),
         true,
         requiredVersion,
         targetVersion,
         resolveNodeInstallStrategy(nodeBinDir, effectiveNvmDir)
       )
+      const executionPlan =
+        includeExecutionPlan && isWin
+          ? await resolveWindowsNodeInstallExecutionPlan({
+              detectedNodeExecutablePath: nodePath,
+              nodeCheckResult: baseResult,
+              nodeInstallPlan: installPlan,
+            })
+          : null
+      return buildNodeCheckResult(
+        r.stdout.trim(),
+        true,
+        requiredVersion,
+        targetVersion,
+        resolveNodeInstallStrategy(nodeBinDir, effectiveNvmDir),
+        executionPlan
+      )
     }
   }
 
-  return buildNodeCheckResult('', false, requiredVersion, targetVersion, effectiveNvmDir ? 'nvm' : 'installer')
+  const baseResult = buildNodeCheckResult(
+    '',
+    false,
+    requiredVersion,
+    targetVersion,
+    effectiveNvmDir ? 'nvm' : 'installer'
+  )
+  const executionPlan =
+    includeExecutionPlan && isWin
+      ? await resolveWindowsNodeInstallExecutionPlan({
+          nodeCheckResult: baseResult,
+          nodeInstallPlan: installPlan,
+        })
+      : null
+  return buildNodeCheckResult(
+    '',
+    false,
+    requiredVersion,
+    targetVersion,
+    effectiveNvmDir ? 'nvm' : 'installer',
+    executionPlan
+  )
+}
+
+export async function checkNode(): Promise<NodeCheckResult> {
+  return checkNodeInternal({ includeExecutionPlan: true })
 }
 
 // ─── Node.js Auto Install ───
@@ -3375,31 +3993,45 @@ export async function discoverOpenClawForEnvCheck(): Promise<OpenClawDiscoveryRe
 export async function installOpenClaw(): Promise<CliResult> {
   return withManagedOperationLock(RUNTIME_INSTALL_LOCK_KEY, async () => {
     if (isWin) {
-      const capabilityError = await guardPlatformCommands(['npm'])
-      if (capabilityError) return capabilityError
-      const managedNpmOptionsResult = await resolveManagedOpenClawInstallNpmCommandOptions(
-        'OpenClaw 命令行工具安装',
-        {
-          prefixPath: resolvePreferredWindowsOpenClawInstallPrefix(),
-        }
-      )
-      if ('error' in managedNpmOptionsResult) return managedNpmOptionsResult.error
-      // Windows: npm install -g 不需要管理员权限（安装到 %APPDATA%\npm）
+      const windowsRuntimeInstallTransaction = beginWindowsRuntimeInstallTransaction()
+      const preferredPrefixPath = resolvePreferredWindowsOpenClawInstallPrefix()
+      const selectedNodeExecutable = await resolvePreferredWindowsNodeExecutableForInstall()
+      const windowsOpenClawInstallContextResult = preferredPrefixPath
+        ? await resolveWindowsPrivateOpenClawInstallContext('OpenClaw 命令行工具安装', {
+          nodeExecutable: selectedNodeExecutable,
+          npmCommand: resolveWindowsNpmCommandForNodeExecutable(selectedNodeExecutable),
+          prefixPath: preferredPrefixPath,
+        })
+        : await resolveWindowsExternalOpenClawInstallContext('OpenClaw 命令行工具安装', {
+          nodeExecutable: selectedNodeExecutable,
+          npmCommand: resolveWindowsNpmCommandForNodeExecutable(selectedNodeExecutable),
+        })
+      if ('error' in windowsOpenClawInstallContextResult) return windowsOpenClawInstallContextResult.error
+      const windowsOpenClawInstallContext = windowsOpenClawInstallContextResult.context
+      if (windowsOpenClawInstallContext.npmCommand === 'npm') {
+        const capabilityError = await guardPlatformCommands(['npm'])
+        if (capabilityError) return capabilityError
+      }
+      // Windows: user-level global installs do not require elevation; private family keeps using the managed prefix.
       const result = await installOpenClawWithNpmMirrorFallback(
         PINNED_OPENCLAW_VERSION,
         (args) =>
           runShell(
-            'npm',
+            windowsOpenClawInstallContext.npmCommand,
             args,
             MAIN_RUNTIME_POLICY.node.installOpenClawTimeoutMs,
-            'env-setup'
+            {
+              controlDomain: 'env-setup',
+              shell: false,
+            }
           ),
-        'OpenClaw 命令行工具安装',
-        managedNpmOptionsResult.options
-      )
-      return finalizeInstallResult(result, {
+          'OpenClaw 命令行工具安装',
+          windowsOpenClawInstallContext.npmCommandOptions
+        )
+      return finalizeAndCommitWindowsOpenClawInstallResult(result, {
         expectNode: false,
-        expectOpenClaw: true,
+        runtimeInstallTransaction: windowsRuntimeInstallTransaction,
+        windowsOpenClawInstallContext,
       })
     }
 
@@ -3423,33 +4055,195 @@ export async function installEnv(opts: InstallEnvOptions): Promise<CliResult> {
     let nodeInstallerPath = opts.nodeInstallerPath
     let openClawNpmCommandOptions: OpenClawNpmCommandOptions | null = null
     const providedNodeInstallPlan = opts.nodeInstallPlan
+    const providedWindowsNodeInstallExecutionPlan = opts.windowsNodeInstallExecutionPlan || null
 
     if (!needNode && !needOpenClaw) {
       return { ok: true, stdout: '', stderr: '', code: 0 }
     }
 
     if (isWin) {
+      const installPlan = needNode
+        ? (providedNodeInstallPlan || (await resolveNodeInstallPlan()))
+        : null
+      const effectiveWindowsNodeInstallExecutionPlan = needNode
+        ? (
+          providedWindowsNodeInstallExecutionPlan
+          || await resolveWindowsNodeInstallExecutionPlan({
+            nodeInstallPlan: installPlan,
+          })
+        )
+        : null
+      const effectiveWindowsNeedOpenClaw =
+        needOpenClaw || Boolean(needNode && effectiveWindowsNodeInstallExecutionPlan?.requiresBindingRepair)
+      const windowsRuntimeInstallTransaction = beginWindowsRuntimeInstallTransaction()
+
+      const withWindowsNodeOutcome = (
+        result: CliResult,
+        options: {
+          appliedFamily?: WindowsNodeInstallExecutionFamily | null
+          fallbackReason?: WindowsNodeInstallFallbackReason
+          usedFallback?: boolean
+          executionMode?: 'legacy-private-runtime' | 'plan-driven'
+        } = {}
+      ): CliResult => {
+        if (!needNode || !effectiveWindowsNodeInstallExecutionPlan) return result
+        return withNodeInstallExecutionOutcome(
+          result,
+          buildWindowsNodeInstallExecutionOutcome({
+            appliedFamily:
+              options.appliedFamily === undefined ? 'private-runtime' : options.appliedFamily,
+            executionMode: options.executionMode || 'plan-driven',
+            fallbackReason: options.fallbackReason || 'not-applicable',
+            plan: effectiveWindowsNodeInstallExecutionPlan,
+            usedFallback: options.usedFallback === true,
+          })
+        )
+      }
+
+      if (needNode && providedWindowsNodeInstallExecutionPlan) {
+        await appendEnvCheckDiagnostic('main-node-install-plan-frozen', {
+          ...providedWindowsNodeInstallExecutionPlan,
+          needNode,
+          needOpenClaw,
+          effectiveNeedOpenClaw: effectiveWindowsNeedOpenClaw,
+        }).catch(() => undefined)
+      }
+
       let windowsSelectedNodePrefix: string | null = null
+      let windowsSelectedNodeExecutable: string | null = null
+      let windowsSelectedNpmCommand: string | null = null
       if (needNode) {
-        const installPlan = providedNodeInstallPlan || (await resolveNodeInstallPlan())
-        const nodeRuntimeResult = await ensureWindowsPrivateNodeRuntime({
-          plan: installPlan,
-          downloadFile,
-          env: process.env,
-          runPowerShell: (command, args, timeoutMs) =>
-            runShell(command, args, timeoutMs, 'env-setup'),
-          timeoutMs: MAIN_RUNTIME_POLICY.node.installNodeTimeoutMs,
-        })
-        if (!nodeRuntimeResult.ok) {
-          return {
-            ok: false,
-            stdout: nodeRuntimeResult.stdout || '',
-            stderr: nodeRuntimeResult.stderr || 'Failed to install private Node.js runtime',
-            code: nodeRuntimeResult.code ?? 1,
+        let nodeInstallFamily: WindowsNodeInstallExecutionFamily | null = null
+        let fallbackReason: WindowsNodeInstallFallbackReason = 'not-applicable'
+        let usedFallback = false
+
+        if (effectiveWindowsNodeInstallExecutionPlan?.family === 'nvm-global' && installPlan) {
+          const nvmNodeRuntimeResult = await ensureWindowsNvmNodeRuntime({
+            targetVersion: effectiveWindowsNodeInstallExecutionPlan.targetVersion,
+            nvmDir: effectiveWindowsNodeInstallExecutionPlan.nvmDir,
+            nvmExecutable: effectiveWindowsNodeInstallExecutionPlan.nvmExecutable,
+            nvmSymlinkDir: effectiveWindowsNodeInstallExecutionPlan.nvmSymlinkDir,
+            timeoutMs: MAIN_RUNTIME_POLICY.node.installNodeTimeoutMs,
+            probeTimeoutMs: MAIN_RUNTIME_POLICY.cli.lightweightProbeTimeoutMs,
+            runDirect: (command, args, timeoutMs) =>
+              runDirect(command, args, timeoutMs, 'env-setup'),
+            runShell: (command, args, timeoutMs, runOptions) =>
+              runShell(command, args, timeoutMs, {
+                controlDomain: 'env-setup',
+                ...(runOptions || {}),
+              }),
+          })
+
+          await appendEnvCheckDiagnostic('main-node-install-nvm-result', {
+            planId: effectiveWindowsNodeInstallExecutionPlan.planId,
+            ok: nvmNodeRuntimeResult.ok,
+            allowPrivateRuntimeFallback: nvmNodeRuntimeResult.allowPrivateRuntimeFallback,
+            fallbackReason: nvmNodeRuntimeResult.fallbackReason,
+            previousNvmCurrentVersion: nvmNodeRuntimeResult.previousNvmCurrentVersion,
+            currentNvmCurrentVersion: nvmNodeRuntimeResult.currentNvmCurrentVersion,
+            rollbackAttempted: nvmNodeRuntimeResult.rollbackAttempted,
+            rollbackSucceeded: nvmNodeRuntimeResult.rollbackSucceeded,
+            nodeBinDir: nvmNodeRuntimeResult.nodeBinDir || null,
+            verifiedNodeVersion: nvmNodeRuntimeResult.verifiedNodeVersion || null,
+            verifiedNpmVersion: nvmNodeRuntimeResult.verifiedNpmVersion || null,
+          }).catch(() => undefined)
+
+          if (nvmNodeRuntimeResult.ok) {
+            nodeInstallFamily = 'nvm-global'
+            if (nvmNodeRuntimeResult.nodeBinDir) {
+              rememberDetectedNodeBinDir(nvmNodeRuntimeResult.nodeBinDir)
+            }
+            windowsSelectedNodeExecutable = nvmNodeRuntimeResult.nodeExecutable || null
+            windowsSelectedNpmCommand = nvmNodeRuntimeResult.npmExecutable || null
+          } else if (!nvmNodeRuntimeResult.allowPrivateRuntimeFallback) {
+            return withWindowsNodeOutcome(
+              {
+                ok: false,
+                stdout: nvmNodeRuntimeResult.stdout || '',
+                stderr: nvmNodeRuntimeResult.stderr || 'Failed to install Node.js via nvm',
+                code: nvmNodeRuntimeResult.code ?? 1,
+              },
+              {
+                appliedFamily: null,
+                fallbackReason: nvmNodeRuntimeResult.fallbackReason,
+              }
+            )
+          } else {
+            usedFallback = true
+            fallbackReason = nvmNodeRuntimeResult.fallbackReason
+            const privateNodeRuntimeResult = await ensureWindowsPrivateNodeRuntime({
+              plan: installPlan,
+              downloadFile,
+              env: process.env,
+              runPowerShell: (command, args, timeoutMs) =>
+                runShell(command, args, timeoutMs, 'env-setup'),
+              timeoutMs: MAIN_RUNTIME_POLICY.node.installNodeTimeoutMs,
+            })
+
+            await appendEnvCheckDiagnostic('main-node-install-fallback-to-private-runtime', {
+              planId: effectiveWindowsNodeInstallExecutionPlan.planId,
+              fallbackReason,
+              privateRuntimeOk: privateNodeRuntimeResult.ok,
+              privateRuntimeNodeBinDir: privateNodeRuntimeResult.nodeBinDir || null,
+            }).catch(() => undefined)
+
+            if (!privateNodeRuntimeResult.ok) {
+              return withWindowsNodeOutcome(
+                {
+                  ok: false,
+                  stdout: privateNodeRuntimeResult.stdout || '',
+                  stderr:
+                    privateNodeRuntimeResult.stderr || 'Failed to install fallback private Node.js runtime',
+                  code: privateNodeRuntimeResult.code ?? 1,
+                },
+                {
+                  appliedFamily: null,
+                  fallbackReason,
+                  usedFallback,
+                }
+              )
+            }
+
+            nodeInstallFamily = 'private-runtime'
+            rememberDetectedNodeBinDir(privateNodeRuntimeResult.nodeBinDir || detectedNodeBinDir)
+            windowsSelectedNodePrefix = privateNodeRuntimeResult.nodeBinDir || null
+            windowsSelectedNodeExecutable = privateNodeRuntimeResult.nodeExecutable || null
+            windowsSelectedNpmCommand = privateNodeRuntimeResult.npmExecutable || null
           }
+        } else if (installPlan) {
+          const privateNodeRuntimeResult = await ensureWindowsPrivateNodeRuntime({
+            plan: installPlan,
+            downloadFile,
+            env: process.env,
+            runPowerShell: (command, args, timeoutMs) =>
+              runShell(command, args, timeoutMs, 'env-setup'),
+            timeoutMs: MAIN_RUNTIME_POLICY.node.installNodeTimeoutMs,
+          })
+          if (!privateNodeRuntimeResult.ok) {
+            return withWindowsNodeOutcome(
+              {
+                ok: false,
+                stdout: privateNodeRuntimeResult.stdout || '',
+                stderr: privateNodeRuntimeResult.stderr || 'Failed to install private Node.js runtime',
+                code: privateNodeRuntimeResult.code ?? 1,
+              },
+              {
+                appliedFamily: null,
+                executionMode: effectiveWindowsNodeInstallExecutionPlan ? 'plan-driven' : 'legacy-private-runtime',
+                fallbackReason:
+                  effectiveWindowsNodeInstallExecutionPlan?.family === 'nvm-global'
+                    ? 'legacy-private-runtime-path'
+                    : 'not-applicable',
+              }
+            )
+          }
+          nodeInstallFamily = 'private-runtime'
+          rememberDetectedNodeBinDir(privateNodeRuntimeResult.nodeBinDir || detectedNodeBinDir)
+          windowsSelectedNodePrefix = privateNodeRuntimeResult.nodeBinDir || null
+          windowsSelectedNodeExecutable = privateNodeRuntimeResult.nodeExecutable || null
+          windowsSelectedNpmCommand = privateNodeRuntimeResult.npmExecutable || null
         }
-        rememberDetectedNodeBinDir(nodeRuntimeResult.nodeBinDir || detectedNodeBinDir)
-        windowsSelectedNodePrefix = nodeRuntimeResult.nodeBinDir || null
+
         process.env.PATH = buildCliPathWithCandidates({
           platform: process.platform,
           currentPath: process.env.PATH || '',
@@ -3458,38 +4252,128 @@ export async function installEnv(opts: InstallEnvOptions): Promise<CliResult> {
         })
         resetCommandCapabilityCache()
         resetRuntimeOpenClawPathsCache()
-      }
-      if (needOpenClaw) {
-        const capabilityError = await guardPlatformCommands(['npm'])
-        if (capabilityError) return capabilityError
-        const managedNpmOptionsResult = await resolveManagedOpenClawInstallNpmCommandOptions(
-          'OpenClaw 命令行工具安装',
-          {
-            prefixPath: resolvePreferredWindowsOpenClawInstallPrefix(windowsSelectedNodePrefix),
+
+        const nextNodeOutcome = (result: CliResult): CliResult =>
+          withWindowsNodeOutcome(result, {
+            appliedFamily: nodeInstallFamily,
+            fallbackReason,
+            usedFallback,
+            executionMode: effectiveWindowsNodeInstallExecutionPlan ? 'plan-driven' : 'legacy-private-runtime',
+          })
+
+        if (!effectiveWindowsNeedOpenClaw) {
+          return nextNodeOutcome(await finalizeInstallResult(
+            { ok: true, stdout: '', stderr: '', code: 0 },
+            {
+              expectNode: true,
+              expectOpenClaw: false,
+            }
+          ))
+        }
+
+        const windowsOpenClawInstallContextResult =
+          nodeInstallFamily === 'private-runtime'
+            ? await resolveWindowsPrivateOpenClawInstallContext('OpenClaw 命令行工具安装', {
+              nodeExecutable: windowsSelectedNodeExecutable,
+              npmCommand:
+                windowsSelectedNpmCommand
+                || resolveWindowsNpmCommandForNodeExecutable(windowsSelectedNodeExecutable),
+              prefixPath: resolvePreferredWindowsOpenClawInstallPrefix(windowsSelectedNodePrefix),
+            })
+            : await resolveWindowsExternalOpenClawInstallContext('OpenClaw 命令行工具安装', {
+              nodeExecutable: windowsSelectedNodeExecutable,
+              npmCommand:
+                windowsSelectedNpmCommand
+                || resolveWindowsNpmCommandForNodeExecutable(windowsSelectedNodeExecutable),
+            })
+        if ('error' in windowsOpenClawInstallContextResult) {
+          windowsRuntimeInstallTransaction.restore('windows-openclaw-install-context-resolution-failed')
+          return nextNodeOutcome(windowsOpenClawInstallContextResult.error)
+        }
+        const windowsOpenClawInstallContext = windowsOpenClawInstallContextResult.context
+        if (windowsOpenClawInstallContext.npmCommand === 'npm') {
+          const capabilityError = await guardPlatformCommands(['npm'])
+          if (capabilityError) {
+            windowsRuntimeInstallTransaction.restore('windows-openclaw-npm-capability-missing')
+            return nextNodeOutcome(capabilityError)
           }
-        )
-        if ('error' in managedNpmOptionsResult) return managedNpmOptionsResult.error
+        }
         const result = await installOpenClawWithNpmMirrorFallback(
           PINNED_OPENCLAW_VERSION,
           (args) =>
             runShell(
-              'npm',
+              windowsOpenClawInstallContext.npmCommand,
               args,
               MAIN_RUNTIME_POLICY.node.installOpenClawTimeoutMs,
-              'env-setup'
+              {
+                controlDomain: 'env-setup',
+                shell: false,
+              }
             ),
           'OpenClaw 命令行工具安装',
-          managedNpmOptionsResult.options
+          windowsOpenClawInstallContext.npmCommandOptions
         )
-        return finalizeInstallResult(result, {
-          expectNode: needNode,
-          expectOpenClaw: true,
+        return nextNodeOutcome(await finalizeAndCommitWindowsOpenClawInstallResult(result, {
+          expectNode: true,
+          runtimeInstallTransaction: windowsRuntimeInstallTransaction,
+          windowsOpenClawInstallContext,
+        }))
+      }
+      if (needOpenClaw) {
+        const preferredPrefixPath = resolvePreferredWindowsOpenClawInstallPrefix(windowsSelectedNodePrefix)
+        const selectedNodeExecutable =
+          windowsSelectedNodeExecutable || await resolvePreferredWindowsNodeExecutableForInstall()
+        const windowsOpenClawInstallContextResult = preferredPrefixPath
+          ? await resolveWindowsPrivateOpenClawInstallContext('OpenClaw 命令行工具安装', {
+            nodeExecutable: selectedNodeExecutable,
+            npmCommand:
+              windowsSelectedNpmCommand
+              || resolveWindowsNpmCommandForNodeExecutable(selectedNodeExecutable),
+            prefixPath: preferredPrefixPath,
+          })
+          : await resolveWindowsExternalOpenClawInstallContext('OpenClaw 命令行工具安装', {
+            nodeExecutable: selectedNodeExecutable,
+            npmCommand:
+              windowsSelectedNpmCommand
+              || resolveWindowsNpmCommandForNodeExecutable(selectedNodeExecutable),
+          })
+        if ('error' in windowsOpenClawInstallContextResult) {
+          windowsRuntimeInstallTransaction.restore('windows-openclaw-only-context-resolution-failed')
+          return windowsOpenClawInstallContextResult.error
+        }
+        const windowsOpenClawInstallContext = windowsOpenClawInstallContextResult.context
+        if (windowsOpenClawInstallContext.npmCommand === 'npm') {
+          const capabilityError = await guardPlatformCommands(['npm'])
+          if (capabilityError) {
+            windowsRuntimeInstallTransaction.restore('windows-openclaw-only-npm-capability-missing')
+            return capabilityError
+          }
+        }
+        const result = await installOpenClawWithNpmMirrorFallback(
+          PINNED_OPENCLAW_VERSION,
+          (args) =>
+            runShell(
+              windowsOpenClawInstallContext.npmCommand,
+              args,
+              MAIN_RUNTIME_POLICY.node.installOpenClawTimeoutMs,
+              {
+                controlDomain: 'env-setup',
+                shell: false,
+              }
+            ),
+          'OpenClaw 命令行工具安装',
+          windowsOpenClawInstallContext.npmCommandOptions
+        )
+        return await finalizeAndCommitWindowsOpenClawInstallResult(result, {
+          expectNode: false,
+          runtimeInstallTransaction: windowsRuntimeInstallTransaction,
+          windowsOpenClawInstallContext,
         })
       }
-      return finalizeInstallResult(
+      return await finalizeInstallResult(
         { ok: true, stdout: '', stderr: '', code: 0 },
         {
-          expectNode: needNode,
+          expectNode: false,
           expectOpenClaw: false,
         }
       )
@@ -5660,13 +6544,19 @@ async function finalizeInstallResult(
   expectations: {
     expectNode: boolean
     expectOpenClaw: boolean
+    windowsOpenClawCommandPath?: string | null
+    windowsOpenClawInstallFamily?: WindowsOpenClawInstallFamily | null
   }
 ): Promise<CliResult> {
   if (!installResult.ok) {
     return installResult
   }
 
-  if (process.platform === 'win32' && expectations.expectOpenClaw) {
+  if (
+    process.platform === 'win32'
+    && expectations.expectOpenClaw
+    && expectations.windowsOpenClawInstallFamily !== 'external-global'
+  ) {
     await writeWindowsManagedOpenClawRuntimeMarker().catch(() => undefined)
   }
 
@@ -5681,8 +6571,12 @@ async function finalizeInstallResult(
   }
 
   if (expectations.expectOpenClaw) {
+    const openClawCommandPath =
+      process.platform === 'win32'
+        ? String(expectations.windowsOpenClawCommandPath || '').trim() || 'openclaw'
+        : 'openclaw'
     const openClawReady = await waitForCommandAvailable(
-      'openclaw',
+      openClawCommandPath,
       ['--version'],
       undefined,
       undefined,
