@@ -2069,6 +2069,136 @@ describe('executeAuthRoute', () => {
     ])
   })
 
+  it('waits for gateway recovery before retrying api key onboarding on missing gateway.mode', async () => {
+    const runCommand = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: false,
+        stdout: '',
+        stderr: 'Gateway start blocked: existing config is missing gateway.mode',
+        code: 1,
+      })
+      .mockResolvedValueOnce({ ok: true, stdout: 'configured', stderr: '', code: 0 })
+    const readConfig = vi.fn().mockResolvedValue({
+      gateway: {
+        auth: {
+          token: 'same-token',
+        },
+      },
+    })
+    const ensureGatewayRunning = vi.fn().mockResolvedValue({
+      ok: true,
+      running: true,
+      stdout: 'Gateway ready',
+      stderr: '',
+      code: 0,
+      attemptedCommands: [
+        ['doctor', '--fix', '--non-interactive'],
+        ['health', '--json'],
+      ],
+    })
+
+    const result = await executeAuthRoute(
+      {
+        method: openaiApiKeyMethod,
+        providerId: 'openai',
+        methodId: 'openai-api-key',
+        secret: 'sk-live-123',
+      },
+      { runCommand, readConfig, ensureGatewayRunning } as any
+    )
+
+    expect(ensureGatewayRunning).toHaveBeenCalledTimes(1)
+    expect(runCommand).toHaveBeenCalledTimes(2)
+    expect(result.ok).toBe(true)
+    expect(result.attemptedCommands).toEqual([
+      [
+        'onboard',
+        '--non-interactive',
+        '--auth-choice',
+        'openai-api-key',
+        '--openai-api-key',
+        'sk-live-123',
+        '--accept-risk',
+        '--no-install-daemon',
+        '--skip-channels',
+        '--skip-health',
+        '--skip-skills',
+        '--skip-ui',
+      ],
+      ['doctor', '--fix', '--non-interactive'],
+      ['health', '--json'],
+      [
+        'onboard',
+        '--non-interactive',
+        '--auth-choice',
+        'openai-api-key',
+        '--openai-api-key',
+        'sk-live-123',
+        '--accept-risk',
+        '--no-install-daemon',
+        '--skip-channels',
+        '--skip-health',
+        '--skip-skills',
+        '--skip-ui',
+      ],
+    ])
+  })
+
+  it('does not trigger gateway recovery for generic config_invalid onboarding errors', async () => {
+    const runCommand = vi.fn().mockResolvedValueOnce({
+      ok: false,
+      stdout: 'Config invalid',
+      stderr: 'Problem: <root>: Unrecognized key: "defaultModel"\nRun "openclaw doctor --fix"',
+      code: 1,
+    })
+    const readConfig = vi.fn().mockResolvedValue({
+      gateway: {
+        auth: {
+          token: 'same-token',
+        },
+      },
+    })
+    const ensureGatewayRunning = vi.fn().mockResolvedValue({
+      ok: true,
+      running: true,
+      stdout: 'Gateway ready',
+      stderr: '',
+      code: 0,
+      attemptedCommands: [['doctor', '--fix', '--non-interactive']],
+    })
+
+    const result = await executeAuthRoute(
+      {
+        method: openaiApiKeyMethod,
+        providerId: 'openai',
+        methodId: 'openai-api-key',
+        secret: 'sk-live-123',
+      },
+      { runCommand, readConfig, ensureGatewayRunning } as any
+    )
+
+    expect(ensureGatewayRunning).not.toHaveBeenCalled()
+    expect(runCommand).toHaveBeenCalledTimes(1)
+    expect(result.ok).toBe(false)
+    expect(result.attemptedCommands).toEqual([
+      [
+        'onboard',
+        '--non-interactive',
+        '--auth-choice',
+        'openai-api-key',
+        '--openai-api-key',
+        'sk-live-123',
+        '--accept-risk',
+        '--no-install-daemon',
+        '--skip-channels',
+        '--skip-health',
+        '--skip-skills',
+        '--skip-ui',
+      ],
+    ])
+  })
+
   it('executes custom provider onboarding with the official custom-provider flags', async () => {
     const runCommand = vi.fn(async () => ({ ok: true, stdout: 'configured', stderr: '', code: 0 }))
     const readConfig = vi

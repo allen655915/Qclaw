@@ -1526,6 +1526,17 @@ function shouldRetryOnboardAfterGatewayRecovery(result: CliResult): boolean {
   return hasLocalRefusedSignal
 }
 
+function onboardFailureLooksLikeMissingGatewayMode(result: CliResult): boolean {
+  const output = `${String(result.stderr || '')}\n${String(result.stdout || '')}`.toLowerCase()
+  if (!output.includes('gateway.mode')) return false
+
+  return (
+    output.includes('missing gateway.mode') ||
+    output.includes('existing config is missing gateway.mode') ||
+    output.includes('gateway start blocked')
+  )
+}
+
 function buildOnboardGatewayRecoveryFailureMessage(params: {
   authChoice: string
   onboardError: string
@@ -1553,7 +1564,9 @@ async function executeOnboardCommandWithGatewayRecovery(params: {
 > {
   params.attemptedCommands.push(params.command)
   let result = await params.runCommand(params.command, ONBOARD_TIMEOUT_MS)
-  if (result.ok || !shouldRetryOnboardAfterGatewayRecovery(result)) {
+  const shouldRetry =
+    shouldRetryOnboardAfterGatewayRecovery(result) || onboardFailureLooksLikeMissingGatewayMode(result)
+  if (result.ok || !shouldRetry) {
     return { status: 'result', result, recoveredGateway: false }
   }
 

@@ -69,10 +69,34 @@ describe('getModelCatalog', () => {
       loadCapabilities,
       runCommand,
       now: () => new Date('2026-03-12T00:00:00.000Z'),
-      query: { bypassCache: true },
     })
 
     expect(loadCapabilities).toHaveBeenCalledWith({ profile: 'bootstrap' })
+    expect(result.source).toBe('live')
+  })
+
+  it('forces bootstrap capability refresh when bypassing the catalog cache', async () => {
+    const loadCapabilities = vi.fn(async () => ({
+      supports: {
+        modelsListAllJson: true,
+      },
+      commandFlags: {
+        'models list': ['--all', '--json'],
+      },
+    }) as any)
+    const runCommand = vi.fn(async () => ok(JSON.stringify({ models: SAMPLE_MODELS })))
+
+    const result = await getModelCatalog({
+      loadCapabilities,
+      runCommand,
+      now: () => new Date('2026-03-12T00:00:00.000Z'),
+      query: { bypassCache: true },
+    })
+
+    expect(loadCapabilities).toHaveBeenCalledWith({
+      profile: 'bootstrap',
+      forceRefresh: true,
+    })
     expect(result.source).toBe('live')
   })
 
@@ -228,4 +252,5 @@ describe('getModelCatalog', () => {
       'openai/gpt-4o',
     ])
   })
+
 })

@@ -61,7 +61,10 @@ interface GetModelCatalogOptions {
   ttlMs?: number
   runCommand?: (args: string[], timeout?: number) => Promise<CliCommandResult>
   capabilities?: OpenClawCapabilities
-  loadCapabilities?: (options?: { profile?: OpenClawCapabilitiesProfile }) => Promise<OpenClawCapabilities>
+  loadCapabilities?: (options?: {
+    profile?: OpenClawCapabilitiesProfile
+    forceRefresh?: boolean
+  }) => Promise<OpenClawCapabilities>
   readCache?: () => Promise<ModelCatalogCache | null>
   writeCache?: (cache: ModelCatalogCache) => Promise<void>
   now?: () => Date
@@ -170,13 +173,18 @@ async function resolveCapabilities(
   options: GetModelCatalogOptions
 ): Promise<OpenClawCapabilities | undefined> {
   if (options.capabilities) return options.capabilities
+  const forceRefresh = options.query?.bypassCache === true
+  const capabilityOptions = {
+    profile: MODEL_CATALOG_CAPABILITIES_PROFILE,
+    ...(forceRefresh ? { forceRefresh: true } : {}),
+  }
   if (options.loadCapabilities) {
-    return options.loadCapabilities({ profile: MODEL_CATALOG_CAPABILITIES_PROFILE })
+    return options.loadCapabilities(capabilityOptions)
   }
   if (options.runCommand) return undefined
 
   const { loadOpenClawCapabilities } = await import('./openclaw-capabilities')
-  return loadOpenClawCapabilities({ profile: MODEL_CATALOG_CAPABILITIES_PROFILE })
+  return loadOpenClawCapabilities(capabilityOptions)
 }
 
 async function defaultReadCache(): Promise<ModelCatalogCache | null> {
