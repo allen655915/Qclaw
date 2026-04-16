@@ -47,6 +47,112 @@ describe('verifyNodeZipChecksum', () => {
 })
 
 describe('ensureWindowsPrivateNodeRuntime', () => {
+  it('prefers the Node mirror for zip and checksum downloads before falling back to the plan URL', async () => {
+    const downloadFile = vi.fn(async (url: string) => {
+      if (url === 'https://npmmirror.com/mirrors/node/v24.14.1/node-v24.14.1-win-x64.zip') {
+        throw new Error('mirror zip failed')
+      }
+      if (url === 'https://npmmirror.com/mirrors/node/v24.14.1/SHASUMS256.txt') {
+        throw new Error('mirror checksum failed')
+      }
+      return undefined
+    })
+    const runPowerShell = vi.fn(async () => ({
+      ok: true,
+      stdout: '',
+      stderr: '',
+      code: 0,
+    }))
+    let accessCount = 0
+    const access = vi.fn(async () => {
+      accessCount += 1
+      if (accessCount === 1) {
+        throw new Error('missing')
+      }
+      return undefined
+    })
+
+    const result = await ensureWindowsPrivateNodeRuntime(
+      {
+        plan: makePlan(),
+        downloadFile,
+        env: buildTestEnv({
+          LOCALAPPDATA: 'C:\\Users\\alice\\AppData\\Local',
+        }),
+        runPowerShell,
+        timeoutMs: 1,
+      },
+      {
+        access,
+        mkdir: vi.fn(async () => undefined),
+        readTextFile: vi.fn(async () =>
+          'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  node-v24.14.1-win-x64.zip'
+        ),
+        rename: vi.fn(async () => undefined),
+        rm: vi.fn(async () => undefined),
+        sha256File: vi.fn(async () => 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'),
+      }
+    )
+
+    expect(result.ok).toBe(true)
+    expect(downloadFile.mock.calls.map((call) => call[0])).toEqual([
+      'https://npmmirror.com/mirrors/node/v24.14.1/node-v24.14.1-win-x64.zip',
+      'https://nodejs.org/dist/v24.14.1/node-v24.14.1-win-x64.zip',
+      'https://npmmirror.com/mirrors/node/v24.14.1/SHASUMS256.txt',
+      'https://nodejs.org/dist/v24.14.1/SHASUMS256.txt',
+    ])
+  })
+
+  it('does not retry duplicate download sources when the plan already uses the mirror base URL', async () => {
+    const downloadFile = vi.fn(async () => undefined)
+    const runPowerShell = vi.fn(async () => ({
+      ok: true,
+      stdout: '',
+      stderr: '',
+      code: 0,
+    }))
+    let accessCount = 0
+    const access = vi.fn(async () => {
+      accessCount += 1
+      if (accessCount === 1) {
+        throw new Error('missing')
+      }
+      return undefined
+    })
+
+    const result = await ensureWindowsPrivateNodeRuntime(
+      {
+        plan: {
+          ...makePlan(),
+          distBaseUrl: 'https://npmmirror.com/mirrors/node',
+          url: 'https://npmmirror.com/mirrors/node/v24.14.1/node-v24.14.1-win-x64.zip',
+        },
+        downloadFile,
+        env: buildTestEnv({
+          LOCALAPPDATA: 'C:\\Users\\alice\\AppData\\Local',
+        }),
+        runPowerShell,
+        timeoutMs: 1,
+      },
+      {
+        access,
+        mkdir: vi.fn(async () => undefined),
+        readTextFile: vi.fn(async () =>
+          'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  node-v24.14.1-win-x64.zip'
+        ),
+        rename: vi.fn(async () => undefined),
+        rm: vi.fn(async () => undefined),
+        sha256File: vi.fn(async () => 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'),
+      }
+    )
+
+    expect(result.ok).toBe(true)
+    expect(downloadFile.mock.calls.map((call) => call[0])).toEqual([
+      'https://npmmirror.com/mirrors/node/v24.14.1/node-v24.14.1-win-x64.zip',
+      'https://npmmirror.com/mirrors/node/v24.14.1/SHASUMS256.txt',
+    ])
+  })
+
   it('returns an existing private node runtime without downloading again', async () => {
     const downloadFile = vi.fn(async () => {
       throw new Error('download should not be called')

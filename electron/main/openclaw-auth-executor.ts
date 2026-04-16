@@ -31,6 +31,7 @@ import {
   type DirectProviderApiKeyAuthApplyParams,
   type DirectProviderApiKeyAuthApplyResult,
 } from './openclaw-direct-api-key-auth'
+import { appendEnvCheckDiagnostic } from './env-check-diagnostics'
 import {
   confirmRuntimeReconcile,
   issueDesiredRuntimeRevision,
@@ -130,6 +131,7 @@ interface ExecuteAuthRouteOptions {
   ) => Promise<Awaited<ReturnType<typeof pruneStalePluginConfigEntries>>>
   capabilities?: OpenClawCapabilities
   loadCapabilities?: () => Promise<OpenClawCapabilities>
+  reloadCapabilities?: () => Promise<OpenClawCapabilities>
   ensureGatewayRunning?: () => Promise<GatewayEnsureRunningResult>
   readGatewayStatus?: () => Promise<GatewayStatusCheckResult>
   repairMiniMaxOauthAgentAuthProfiles?: () => Promise<void>
@@ -267,6 +269,49 @@ async function resolveCapabilities(
     return loadOpenClawCapabilities()
   }
   return undefined
+}
+
+async function buildOnboardRouteCommandWithRefresh(params: {
+  method: OpenClawAuthMethodDescriptor
+  secret?: string
+  capabilities: OpenClawCapabilities | undefined
+  reloadCapabilities?: () => Promise<OpenClawCapabilities>
+  providerId?: string
+  methodId?: string
+}): Promise<{
+  buildResult: OpenClawCommandBuildResult
+}> {
+  const initial = buildOnboardRouteCommand(params.method, params.secret, params.capabilities)
+  if (initial.ok || initial.errorCode !== 'unsupported_flag') {
+    return {
+      buildResult: initial,
+    }
+  }
+
+  void appendEnvCheckDiagnostic('main-openclaw-auth-onboard-build-refresh', {
+    providerId: params.providerId,
+    methodId: params.methodId,
+    missing: initial.missing || [],
+  })
+
+  const reloadCapabilities =
+    params.reloadCapabilities ??
+    (async () => {
+      const { loadOpenClawCapabilities } = await import('./openclaw-capabilities')
+      return loadOpenClawCapabilities({ forceRefresh: true })
+    })
+
+  try {
+    const refreshedCapabilities = await reloadCapabilities()
+    return {
+      buildResult: buildOnboardRouteCommand(params.method, params.secret, refreshedCapabilities),
+    }
+  } catch (error) {
+    console.error('Failed to refresh OpenClaw capabilities for onboard auth recovery', error)
+    return {
+      buildResult: initial,
+    }
+  }
 }
 
 async function resolveMainAgentAuthEnv(): Promise<Partial<NodeJS.ProcessEnv> | null> {
@@ -2358,9 +2403,16 @@ export async function executeAuthRoute(
     const configBeforeAuth = await readConfig().catch(() => null)
     gatewayTokenBeforeAuth = readGatewayAuthToken(configBeforeAuth)
     const mainAgentAuthEnv = await resolveCommandAuthEnv().catch(() => null)
-    const onboardCommand = buildOnboardRouteCommand(method, input.secret, capabilities)
-    if (!onboardCommand.ok) {
-      return fromBuildFailure(onboardCommand, attemptedCommands, route.kind, {
+    const onboardCommand = await buildOnboardRouteCommandWithRefresh({
+      method,
+      secret: input.secret,
+      capabilities,
+      reloadCapabilities: options.reloadCapabilities,
+      providerId: route.providerId,
+      methodId: resolvedRouteMethodId.value,
+    })
+    if (!onboardCommand.buildResult.ok) {
+      return fromBuildFailure(onboardCommand.buildResult, attemptedCommands, route.kind, {
         loginProviderId: route.providerId,
         routeMethodId: resolvedRouteMethodId.value,
         pluginId,
@@ -2385,7 +2437,7 @@ export async function executeAuthRoute(
       onboardResult = await executeOnboardCommandWithGatewayRecovery({
         routeKind: route.kind,
         authChoice: method.authChoice,
-        command: onboardCommand.command,
+        command: onboardCommand.buildResult.command,
         attemptedCommands,
         runCommand:
           mainAgentAuthEnv && runCommandWithEnv

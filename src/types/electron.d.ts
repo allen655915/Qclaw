@@ -1869,6 +1869,7 @@ interface ElectronApi {
   clearModelAuthProfiles(input: {
     providerIds: string[]
     authStorePath?: string
+    matchMode?: 'merged' | 'exact'
   }): Promise<{
     ok: boolean
     removed: number
@@ -1880,6 +1881,7 @@ interface ElectronApi {
   inspectModelAuthProfiles(input: {
     providerIds: string[]
     authStorePath?: string
+    matchMode?: 'merged' | 'exact'
   }): Promise<{
     ok: boolean
     present: boolean
@@ -1890,6 +1892,7 @@ interface ElectronApi {
   }>
   clearExternalProviderAuth(input: {
     providerIds: string[]
+    matchMode?: 'merged' | 'exact'
   }): Promise<{
     ok: boolean
     cleared: boolean

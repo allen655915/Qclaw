@@ -66,6 +66,7 @@ interface ProviderRemovalVerificationDeps {
   inspectAuthStore: (input: {
     providerIds: string[]
     authStorePath: string
+    matchMode?: CleanupMatchMode
   }) => Promise<{
     ok: boolean
     present: boolean
@@ -249,6 +250,7 @@ export function applyOptimisticConfiguredProviderState(params: {
 const MODELS_PAGE_CACHE_TTL_MS = 60 * 1000
 const modelsPageCache = createPageDataCache<ModelsPageSnapshot>({ ttlMs: MODELS_PAGE_CACHE_TTL_MS })
 const MODELS_RESERVED_KEYS = new Set(['mode', 'providers', 'allow', 'deny', 'fallbacks', 'imageFallbacks', 'aliases'])
+type CleanupMatchMode = 'merged' | 'exact'
 
 function normalizeProviderId(value: unknown): string {
   return String(value || '').trim().toLowerCase()
@@ -263,29 +265,69 @@ function normalizeProviderIds(providerId: string): Set<string> {
   return new Set(values.map((value) => normalizeProviderId(value)).filter(Boolean))
 }
 
-function modelBelongsToProvider(modelKey: unknown, providerIds: Set<string>): boolean {
+function buildCleanupProviderIds(providerId: string, matchMode: CleanupMatchMode = 'merged'): string[] {
+  const normalizedProviderId = normalizeProviderId(providerId)
+  if (!normalizedProviderId) return []
+  if (matchMode === 'exact') {
+    const exactProviderIds = normalizedProviderId === 'google-gemini-cli'
+      ? [normalizedProviderId, 'gemini']
+      : [normalizedProviderId]
+    return Array.from(new Set(exactProviderIds.map((value) => normalizeProviderId(value)).filter(Boolean)))
+  }
+  return Array.from(normalizeProviderIds(providerId))
+}
+
+function buildCleanupProviderSet(providerId: string, matchMode: CleanupMatchMode = 'merged'): Set<string> {
+  return new Set(buildCleanupProviderIds(providerId, matchMode))
+}
+
+function providerSetMatches(
+  providerIds: Set<string>,
+  value: unknown,
+  matchMode: CleanupMatchMode = 'merged'
+): boolean {
+  const normalized = normalizeProviderId(value)
+  if (!normalized) return false
+  if (providerIds.has(normalized)) return true
+  if (matchMode === 'exact') return false
+  const canonical = canonicalizeModelProviderId(normalized)
+  return providerIds.has(canonical)
+}
+
+function modelBelongsToProvider(
+  modelKey: unknown,
+  providerIds: Set<string>,
+  matchMode: CleanupMatchMode = 'merged'
+): boolean {
   const key = String(modelKey || '').trim()
   if (!key.includes('/')) return false
   const provider = normalizeProviderId(key.split('/')[0])
-  const canonicalProvider = canonicalizeModelProviderId(provider)
-  return providerIds.has(provider) || providerIds.has(canonicalProvider)
+  return providerSetMatches(providerIds, provider, matchMode)
 }
 
-function pruneModelList(list: unknown, providerIds: Set<string>): { next: string[] | null; changed: boolean } {
+function pruneModelList(
+  list: unknown,
+  providerIds: Set<string>,
+  matchMode: CleanupMatchMode = 'merged'
+): { next: string[] | null; changed: boolean } {
   if (!Array.isArray(list)) return { next: null, changed: false }
   const next = list
     .map((item) => String(item || '').trim())
     .filter(Boolean)
-    .filter((item) => !modelBelongsToProvider(item, providerIds))
+    .filter((item) => !modelBelongsToProvider(item, providerIds, matchMode))
   return { next, changed: next.length !== list.length }
 }
 
-function pruneAliases(value: unknown, providerIds: Set<string>): { next: unknown; changed: boolean } {
+function pruneAliases(
+  value: unknown,
+  providerIds: Set<string>,
+  matchMode: CleanupMatchMode = 'merged'
+): { next: unknown; changed: boolean } {
   if (Array.isArray(value)) {
     const next = value.filter((item: any) => {
       const model = String(item?.model ?? item?.target ?? '').trim()
       if (!model) return true
-      return !modelBelongsToProvider(model, providerIds)
+      return !modelBelongsToProvider(model, providerIds, matchMode)
     })
     return { next, changed: next.length !== value.length }
   }
@@ -299,7 +341,7 @@ function pruneAliases(value: unknown, providerIds: Set<string>): { next: unknown
   let changed = false
   for (const [alias, model] of Object.entries(source)) {
     const modelKey = String(model || '').trim()
-    if (modelKey && modelBelongsToProvider(modelKey, providerIds)) {
+    if (modelKey && modelBelongsToProvider(modelKey, providerIds, matchMode)) {
       changed = true
       continue
     }
@@ -312,22 +354,16 @@ function pruneAliases(value: unknown, providerIds: Set<string>): { next: unknown
   return { next, changed }
 }
 
-function providerSetMatches(providerIds: Set<string>, value: unknown): boolean {
-  const normalized = normalizeProviderId(value)
-  if (!normalized) return false
-  const canonical = canonicalizeModelProviderId(normalized)
-  return providerIds.has(normalized) || providerIds.has(canonical)
-}
-
 function runtimeStatusReferencesProvider(
   modelStatus: Record<string, any> | null,
-  providerIds: Set<string>
+  providerIds: Set<string>,
+  matchMode: CleanupMatchMode = 'merged'
 ): boolean {
   if (!modelStatus || typeof modelStatus !== 'object') {
     return false
   }
 
-  const matchesModel = (value: unknown) => modelBelongsToProvider(value, providerIds)
+  const matchesModel = (value: unknown) => modelBelongsToProvider(value, providerIds, matchMode)
   const matchesModelList = (value: unknown) =>
     Array.isArray(value) && value.some((entry) => matchesModel(entry))
 
@@ -382,7 +418,8 @@ function collectEnvKeysFromValue(value: unknown, collector: Set<string>): void {
 
 function stripLegacyTopLevelDefaultModel(
   config: Record<string, any>,
-  providerIds: Set<string>
+  providerIds: Set<string>,
+  matchMode: CleanupMatchMode = 'merged'
 ): boolean {
   if (!config || typeof config !== 'object' || Array.isArray(config)) {
     return false
@@ -390,7 +427,7 @@ function stripLegacyTopLevelDefaultModel(
   if (!Object.prototype.hasOwnProperty.call(config, 'defaultModel')) {
     return false
   }
-  if (!modelBelongsToProvider(config.defaultModel, providerIds)) {
+  if (!modelBelongsToProvider(config.defaultModel, providerIds, matchMode)) {
     return false
   }
   delete config.defaultModel
@@ -399,11 +436,12 @@ function stripLegacyTopLevelDefaultModel(
 
 export function removeProviderFromConfig(
   sourceConfig: Record<string, any> | null,
-  providerId: string
+  providerId: string,
+  matchMode: CleanupMatchMode = 'merged'
 ): { nextConfig: Record<string, any>; removed: boolean } {
   const baseConfig = sourceConfig && typeof sourceConfig === 'object' ? sourceConfig : {}
   const nextConfig = JSON.parse(JSON.stringify(baseConfig)) as Record<string, any>
-  const providerIds = normalizeProviderIds(providerId)
+  const providerIds = buildCleanupProviderSet(providerId, matchMode)
   let removed = false
 
   const modelsSection = nextConfig.models
@@ -411,9 +449,7 @@ export function removeProviderFromConfig(
     const providers = modelsSection.providers
     if (providers && typeof providers === 'object' && !Array.isArray(providers)) {
       for (const key of Object.keys(providers)) {
-        const normalized = normalizeProviderId(key)
-        const canonical = canonicalizeModelProviderId(normalized)
-        if (providerIds.has(normalized) || providerIds.has(canonical)) {
+        if (providerSetMatches(providerIds, key, matchMode)) {
           delete providers[key]
           removed = true
         }
@@ -422,118 +458,116 @@ export function removeProviderFromConfig(
 
     for (const key of Object.keys(modelsSection)) {
       if (MODELS_RESERVED_KEYS.has(key)) continue
-      const normalized = normalizeProviderId(key)
-      const canonical = canonicalizeModelProviderId(normalized)
-      if (providerIds.has(normalized) || providerIds.has(canonical)) {
+      if (providerSetMatches(providerIds, key, matchMode)) {
         delete modelsSection[key]
         removed = true
       }
     }
 
-    if (modelBelongsToProvider(modelsSection.default, providerIds)) {
+    if (modelBelongsToProvider(modelsSection.default, providerIds, matchMode)) {
       delete modelsSection.default
       removed = true
     }
-    if (modelBelongsToProvider(modelsSection.main, providerIds)) {
+    if (modelBelongsToProvider(modelsSection.main, providerIds, matchMode)) {
       delete modelsSection.main
       removed = true
     }
-    if (modelBelongsToProvider(modelsSection.image, providerIds)) {
+    if (modelBelongsToProvider(modelsSection.image, providerIds, matchMode)) {
       delete modelsSection.image
       removed = true
     }
-    if (modelBelongsToProvider(modelsSection.imageDefault, providerIds)) {
+    if (modelBelongsToProvider(modelsSection.imageDefault, providerIds, matchMode)) {
       delete modelsSection.imageDefault
       removed = true
     }
   }
 
-  if (stripLegacyTopLevelDefaultModel(nextConfig, providerIds)) {
+  if (stripLegacyTopLevelDefaultModel(nextConfig, providerIds, matchMode)) {
     removed = true
   }
-  if (modelBelongsToProvider(nextConfig.model, providerIds)) {
+  if (modelBelongsToProvider(nextConfig.model, providerIds, matchMode)) {
     delete nextConfig.model
     removed = true
   }
 
-  const topLevelFallbacks = pruneModelList(nextConfig.fallbacks, providerIds)
+  const topLevelFallbacks = pruneModelList(nextConfig.fallbacks, providerIds, matchMode)
   if (topLevelFallbacks.changed) {
     nextConfig.fallbacks = topLevelFallbacks.next
     removed = true
   }
-  const topLevelImageFallbacks = pruneModelList(nextConfig.imageFallbacks, providerIds)
+  const topLevelImageFallbacks = pruneModelList(nextConfig.imageFallbacks, providerIds, matchMode)
   if (topLevelImageFallbacks.changed) {
     nextConfig.imageFallbacks = topLevelImageFallbacks.next
     removed = true
   }
-  const topLevelImageFallbacksSnake = pruneModelList(nextConfig.image_fallbacks, providerIds)
+  const topLevelImageFallbacksSnake = pruneModelList(nextConfig.image_fallbacks, providerIds, matchMode)
   if (topLevelImageFallbacksSnake.changed) {
     nextConfig.image_fallbacks = topLevelImageFallbacksSnake.next
     removed = true
   }
-  const topLevelAllowed = pruneModelList(nextConfig.allowed, providerIds)
+  const topLevelAllowed = pruneModelList(nextConfig.allowed, providerIds, matchMode)
   if (topLevelAllowed.changed) {
     nextConfig.allowed = topLevelAllowed.next
     removed = true
   }
-  const topLevelAllow = pruneModelList(nextConfig.allow, providerIds)
+  const topLevelAllow = pruneModelList(nextConfig.allow, providerIds, matchMode)
   if (topLevelAllow.changed) {
     nextConfig.allow = topLevelAllow.next
     removed = true
   }
-  const topLevelDenied = pruneModelList(nextConfig.denied, providerIds)
+  const topLevelDenied = pruneModelList(nextConfig.denied, providerIds, matchMode)
   if (topLevelDenied.changed) {
     nextConfig.denied = topLevelDenied.next
     removed = true
   }
-  const topLevelDeny = pruneModelList(nextConfig.deny, providerIds)
+  const topLevelDeny = pruneModelList(nextConfig.deny, providerIds, matchMode)
   if (topLevelDeny.changed) {
     nextConfig.deny = topLevelDeny.next
     removed = true
   }
-  const topLevelAliases = pruneAliases(nextConfig.aliases, providerIds)
+  const topLevelAliases = pruneAliases(nextConfig.aliases, providerIds, matchMode)
   if (topLevelAliases.changed) {
     nextConfig.aliases = topLevelAliases.next
     removed = true
   }
 
   if (modelsSection && typeof modelsSection === 'object' && !Array.isArray(modelsSection)) {
-    const modelFallbacks = pruneModelList(modelsSection.fallbacks, providerIds)
+    const modelFallbacks = pruneModelList(modelsSection.fallbacks, providerIds, matchMode)
     if (modelFallbacks.changed) {
       modelsSection.fallbacks = modelFallbacks.next
       removed = true
     }
-    const modelImageFallbacks = pruneModelList(modelsSection.imageFallbacks, providerIds)
+    const modelImageFallbacks = pruneModelList(modelsSection.imageFallbacks, providerIds, matchMode)
     if (modelImageFallbacks.changed) {
       modelsSection.imageFallbacks = modelImageFallbacks.next
       removed = true
     }
-    const modelImageFallbacksSnake = pruneModelList(modelsSection.image_fallbacks, providerIds)
+    const modelImageFallbacksSnake = pruneModelList(modelsSection.image_fallbacks, providerIds, matchMode)
     if (modelImageFallbacksSnake.changed) {
       modelsSection.image_fallbacks = modelImageFallbacksSnake.next
       removed = true
     }
-    const modelAllowed = pruneModelList(modelsSection.allowed, providerIds)
+    const modelAllowed = pruneModelList(modelsSection.allowed, providerIds, matchMode)
     if (modelAllowed.changed) {
       modelsSection.allowed = modelAllowed.next
       removed = true
     }
-    const modelAllow = pruneModelList(modelsSection.allow, providerIds)
+    const modelAllow = pruneModelList(modelsSection.allow, providerIds, matchMode)
     if (modelAllow.changed) {
       modelsSection.allow = modelAllow.next
       removed = true
     }
-    const modelDenied = pruneModelList(modelsSection.denied, providerIds)
+    const modelDenied = pruneModelList(modelsSection.denied, providerIds, matchMode)
     if (modelDenied.changed) {
       modelsSection.denied = modelDenied.next
       removed = true
     }
-    const modelDeny = pruneModelList(modelsSection.deny, providerIds)
+    const modelDeny = pruneModelList(modelsSection.deny, providerIds, matchMode)
     if (modelDeny.changed) {
       modelsSection.deny = modelDeny.next
       removed = true
     }
-    const modelAliases = pruneAliases(modelsSection.aliases, providerIds)
+    const modelAliases = pruneAliases(modelsSection.aliases, providerIds, matchMode)
     if (modelAliases.changed) {
       modelsSection.aliases = modelAliases.next
       removed = true
@@ -542,25 +576,25 @@ export function removeProviderFromConfig(
 
   const defaultsModel = nextConfig?.agents?.defaults?.model
   if (defaultsModel && typeof defaultsModel === 'object' && !Array.isArray(defaultsModel)) {
-    if (modelBelongsToProvider(defaultsModel.primary, providerIds)) {
+    if (modelBelongsToProvider(defaultsModel.primary, providerIds, matchMode)) {
       delete defaultsModel.primary
       removed = true
     }
-    if (modelBelongsToProvider(defaultsModel.image, providerIds)) {
+    if (modelBelongsToProvider(defaultsModel.image, providerIds, matchMode)) {
       delete defaultsModel.image
       removed = true
     }
-    const defaultFallbacks = pruneModelList(defaultsModel.fallbacks, providerIds)
+    const defaultFallbacks = pruneModelList(defaultsModel.fallbacks, providerIds, matchMode)
     if (defaultFallbacks.changed) {
       defaultsModel.fallbacks = defaultFallbacks.next
       removed = true
     }
-    const defaultImageFallbacks = pruneModelList(defaultsModel.imageFallbacks, providerIds)
+    const defaultImageFallbacks = pruneModelList(defaultsModel.imageFallbacks, providerIds, matchMode)
     if (defaultImageFallbacks.changed) {
       defaultsModel.imageFallbacks = defaultImageFallbacks.next
       removed = true
     }
-    const defaultImageFallbacksSnake = pruneModelList(defaultsModel.image_fallbacks, providerIds)
+    const defaultImageFallbacksSnake = pruneModelList(defaultsModel.image_fallbacks, providerIds, matchMode)
     if (defaultImageFallbacksSnake.changed) {
       defaultsModel.image_fallbacks = defaultImageFallbacksSnake.next
       removed = true
@@ -570,7 +604,7 @@ export function removeProviderFromConfig(
   const defaultsModels = nextConfig?.agents?.defaults?.models
   if (defaultsModels && typeof defaultsModels === 'object' && !Array.isArray(defaultsModels)) {
     for (const key of Object.keys(defaultsModels)) {
-      if (modelBelongsToProvider(key, providerIds)) {
+      if (modelBelongsToProvider(key, providerIds, matchMode)) {
         delete defaultsModels[key]
         removed = true
       }
@@ -582,7 +616,10 @@ export function removeProviderFromConfig(
     for (const [profileKey, profile] of Object.entries(authProfiles as Record<string, any>)) {
       const profileProvider = profile && typeof profile === 'object' ? profile.provider : ''
       const keyProvider = String(profileKey || '').split(':')[0]
-      if (providerSetMatches(providerIds, profileProvider) || providerSetMatches(providerIds, keyProvider)) {
+      if (
+        providerSetMatches(providerIds, profileProvider, matchMode)
+        || providerSetMatches(providerIds, keyProvider, matchMode)
+      ) {
         delete (authProfiles as Record<string, any>)[profileKey]
         removed = true
       }
@@ -594,24 +631,22 @@ export function removeProviderFromConfig(
 
 export function removeProviderFromStatus(
   sourceStatus: Record<string, any> | null,
-  providerId: string
+  providerId: string,
+  matchMode: CleanupMatchMode = 'merged'
 ): { nextStatus: Record<string, any> | null; removed: boolean } {
   if (!sourceStatus || typeof sourceStatus !== 'object') {
     return { nextStatus: sourceStatus, removed: false }
   }
 
   const nextStatus = JSON.parse(JSON.stringify(sourceStatus)) as Record<string, any>
-  const providerIds = normalizeProviderIds(providerId)
-  if (providerIds.has('google')) {
-    providerIds.add('gemini')
-  }
+  const providerIds = buildCleanupProviderSet(providerId, matchMode)
 
   let removed = false
   const statusProviders = nextStatus?.auth?.providers
   if (Array.isArray(statusProviders)) {
     const filteredProviders = statusProviders.filter((item: any) => {
       const providerValue = item?.provider || item?.providerId
-      return !providerSetMatches(providerIds, providerValue)
+      return !providerSetMatches(providerIds, providerValue, matchMode)
     })
     if (filteredProviders.length !== statusProviders.length) {
       nextStatus.auth.providers = filteredProviders
@@ -623,7 +658,7 @@ export function removeProviderFromStatus(
   if (Array.isArray(oauthProviders)) {
     const filteredOauthProviders = oauthProviders.filter((item: any) => {
       const providerValue = item?.provider || item?.providerId
-      return !providerSetMatches(providerIds, providerValue)
+      return !providerSetMatches(providerIds, providerValue, matchMode)
     })
     if (filteredOauthProviders.length !== oauthProviders.length) {
       nextStatus.auth.oauth.providers = filteredOauthProviders
@@ -631,11 +666,11 @@ export function removeProviderFromStatus(
     }
   }
 
-  if (modelBelongsToProvider(nextStatus.defaultModel, providerIds)) {
+  if (modelBelongsToProvider(nextStatus.defaultModel, providerIds, matchMode)) {
     delete nextStatus.defaultModel
     removed = true
   }
-  if (modelBelongsToProvider(nextStatus.model, providerIds)) {
+  if (modelBelongsToProvider(nextStatus.model, providerIds, matchMode)) {
     delete nextStatus.model
     removed = true
   }
@@ -648,21 +683,20 @@ export function removeProviderFromStatus(
 
 export function detectResidualProviderConfiguration(params: {
   providerId: string
+  matchMode?: CleanupMatchMode
   envVars: Record<string, string> | null
   config: Record<string, any> | null
   modelStatus: Record<string, any> | null
   observedEnvKeys?: string[]
 }): ResidualProviderConfiguration {
-  const providerIds = normalizeProviderIds(params.providerId)
-  if (providerIds.has('google')) {
-    providerIds.add('gemini')
-  }
+  const matchMode = params.matchMode || 'merged'
+  const providerIds = buildCleanupProviderSet(params.providerId, matchMode)
 
   const statusProviderIds = extractConfiguredProviderIds({
     config: null,
     modelStatus: params.modelStatus,
   })
-  if (statusProviderIds.some((providerId) => providerSetMatches(providerIds, providerId))) {
+  if (statusProviderIds.some((providerId) => providerSetMatches(providerIds, providerId, matchMode))) {
     const authStorePath = String(params.modelStatus?.auth?.storePath || '').trim()
     return {
       present: true,
@@ -671,7 +705,7 @@ export function detectResidualProviderConfiguration(params: {
     }
   }
 
-  if (runtimeStatusReferencesProvider(params.modelStatus, providerIds)) {
+  if (runtimeStatusReferencesProvider(params.modelStatus, providerIds, matchMode)) {
     const authStorePath = String(params.modelStatus?.auth?.storePath || '').trim()
     return {
       present: true,
@@ -684,7 +718,7 @@ export function detectResidualProviderConfiguration(params: {
     config: params.config,
     modelStatus: null,
   })
-  if (configProviderIds.some((providerId) => providerSetMatches(providerIds, providerId))) {
+  if (configProviderIds.some((providerId) => providerSetMatches(providerIds, providerId, matchMode))) {
     return {
       present: true,
       source: 'config',
@@ -712,19 +746,33 @@ export function detectResidualProviderConfiguration(params: {
   }
 }
 
-function getRemovalProviderIds(providerId: string): string[] {
-  const providerIds = normalizeProviderIds(providerId)
-  if (providerIds.has('google')) {
-    providerIds.add('gemini')
+function getRemovalProviderIds(providerId: string, matchMode: CleanupMatchMode = 'merged'): string[] {
+  return buildCleanupProviderIds(providerId, matchMode)
+}
+
+export function resolveCleanupMatchMode(providerId: string): CleanupMatchMode {
+  return normalizeProviderId(providerId) === 'openai-codex' ? 'exact' : 'merged'
+}
+
+export function resolveCleanupAuthOrderProviderIds(
+  providerId: string,
+  matchMode: CleanupMatchMode = 'merged'
+): string[] {
+  const providerIds = getRemovalProviderIds(providerId, matchMode)
+  if (matchMode === 'exact') {
+    return providerIds
   }
-  return Array.from(providerIds)
+
+  return Array.from(new Set(providerIds.map((item) => canonicalizeModelProviderId(item)).filter(Boolean)))
 }
 
 export function collectProviderBoundEnvKeysFromStatus(params: {
   providerId: string
+  matchMode?: CleanupMatchMode
   modelStatus: Record<string, any> | null
 }): string[] {
-  const providerIds = new Set(getRemovalProviderIds(params.providerId).map((value) => normalizeProviderId(value)).filter(Boolean))
+  const matchMode = params.matchMode || 'merged'
+  const providerIds = new Set(getRemovalProviderIds(params.providerId, matchMode))
   const authProviders = [
     ...(Array.isArray(params.modelStatus?.auth?.providers) ? params.modelStatus.auth.providers : []),
     ...(Array.isArray(params.modelStatus?.auth?.oauth?.providers) ? params.modelStatus.auth.oauth.providers : []),
@@ -733,7 +781,7 @@ export function collectProviderBoundEnvKeysFromStatus(params: {
 
   for (const entry of authProviders) {
     const providerValue = String(entry?.provider ?? entry?.providerId ?? '').trim()
-    if (!providerSetMatches(providerIds, providerValue)) continue
+    if (!providerSetMatches(providerIds, providerValue, matchMode)) continue
     collectEnvKeysFromValue(entry, envKeys)
   }
 
@@ -752,11 +800,13 @@ function collectKnownProviderEnvKeys(providerId: string): string[] {
 
 export function resolveProviderRemovalEnvKeys(params: {
   providerId: string
+  matchMode?: CleanupMatchMode
   candidateEnvKeys?: string[]
   config: Record<string, any> | null
   modelStatus: Record<string, any> | null
 }): string[] {
-  const providerIds = new Set(getRemovalProviderIds(params.providerId).map((value) => normalizeProviderId(value)).filter(Boolean))
+  const matchMode = params.matchMode || 'merged'
+  const providerIds = new Set(getRemovalProviderIds(params.providerId, matchMode))
   const remainingProviderIds = new Set(
     extractConfiguredProviderIds({
       config: params.config,
@@ -767,11 +817,11 @@ export function resolveProviderRemovalEnvKeys(params: {
   )
 
   for (const providerId of providerIds) {
-    remainingProviderIds.delete(canonicalizeModelProviderId(providerId))
+    remainingProviderIds.delete(matchMode === 'exact' ? providerId : canonicalizeModelProviderId(providerId))
   }
 
   const candidateEnvKeys = new Set<string>([
-    ...collectKnownProviderEnvKeys(params.providerId),
+    ...(matchMode === 'exact' ? [] : collectKnownProviderEnvKeys(params.providerId)),
     ...((params.candidateEnvKeys || []).map((envKey) => normalizeEnvKey(envKey)).filter(Boolean)),
   ])
 
@@ -791,8 +841,15 @@ function resolveModelStatusAuthStorePath(modelStatus: Record<string, any> | null
   return authStorePath || undefined
 }
 
-function providerSupportsExternalAuthCleanup(providerId: string): boolean {
-  return getRemovalProviderIds(providerId).some((item) => canonicalizeModelProviderId(item) === 'openai')
+function providerSupportsExternalAuthCleanup(
+  providerId: string,
+  matchMode: CleanupMatchMode = 'merged'
+): boolean {
+  const providerIds = getRemovalProviderIds(providerId, matchMode)
+  if (matchMode === 'exact') {
+    return providerIds.includes('openai-codex')
+  }
+  return providerIds.some((item) => canonicalizeModelProviderId(item) === 'openai')
 }
 
 function authProfileCleanupChanged(result: {
@@ -824,9 +881,11 @@ export async function verifyProviderRemovalState(
     provider: { id: string; name: string }
     currentStatusSnapshot: Record<string, any> | null
     authStorePathHint?: string
+    matchMode?: CleanupMatchMode
   },
   deps: ProviderRemovalVerificationDeps
 ): Promise<ProviderRemovalVerification> {
+  const matchMode = input.matchMode || 'merged'
   const providerDisplayName = String(input.provider?.name || input.provider?.id || '').trim() || '该 AI 提供商'
   const [latestEnv, latestConfigRaw, upstreamState] = await Promise.all([
     deps.readEnvFile().catch(() => ({})),
@@ -854,13 +913,16 @@ export async function verifyProviderRemovalState(
   const latestUpstreamStatus = getUpstreamModelStatusLike(upstreamState)
   const observedEnvKeys = resolveProviderRemovalEnvKeys({
     providerId: input.provider.id,
+    matchMode,
     candidateEnvKeys: [
       ...collectProviderBoundEnvKeysFromStatus({
         providerId: input.provider.id,
+        matchMode,
         modelStatus: input.currentStatusSnapshot,
       }),
       ...collectProviderBoundEnvKeysFromStatus({
         providerId: input.provider.id,
+        matchMode,
         modelStatus: latestUpstreamStatus,
       }),
     ],
@@ -869,6 +931,7 @@ export async function verifyProviderRemovalState(
   })
   const residual = detectResidualProviderConfiguration({
     providerId: input.provider.id,
+    matchMode,
     envVars: latestEnv,
     config: latestConfig,
     modelStatus: latestUpstreamStatus,
@@ -909,8 +972,9 @@ export async function verifyProviderRemovalState(
 
   if (authStorePath) {
     const inspectResult = await deps.inspectAuthStore({
-      providerIds: getRemovalProviderIds(input.provider.id),
+      providerIds: getRemovalProviderIds(input.provider.id, matchMode),
       authStorePath,
+      matchMode,
     }).catch((error: any) => ({
       ok: false,
       present: false,
@@ -1263,6 +1327,7 @@ export default function ModelsPage() {
         provider,
         currentStatusSnapshot: modelStatusRef.current,
         authStorePathHint,
+        matchMode: resolveCleanupMatchMode(provider.id),
       },
       {
         readEnvFile: () => window.api.readEnvFile(),
@@ -1275,10 +1340,12 @@ export default function ModelsPage() {
   )
 
   const repairResidualProviderAuthStore = useCallback(async (provider: { id: string }, authStorePath: string) => {
-    const providerIdList = getRemovalProviderIds(provider.id)
+    const matchMode = resolveCleanupMatchMode(provider.id)
+    const providerIdList = getRemovalProviderIds(provider.id, matchMode)
     return window.api.clearModelAuthProfiles({
       providerIds: providerIdList,
       authStorePath,
+      matchMode,
     })
   }, [])
 
@@ -1287,7 +1354,8 @@ export default function ModelsPage() {
       provider: { id: string; name: string },
       authStorePath: string
     ): Promise<{ attempted: boolean; verification?: ProviderRemovalVerification; message?: string }> => {
-      if (!providerSupportsExternalAuthCleanup(provider.id)) {
+      const matchMode = resolveCleanupMatchMode(provider.id)
+      if (!providerSupportsExternalAuthCleanup(provider.id, matchMode)) {
         return { attempted: false }
       }
 
@@ -1307,9 +1375,10 @@ export default function ModelsPage() {
         message: `清理中：正在退出 Codex 命令行工具登录并移除 AI 提供商「${providerDisplayName}」的外部认证来源...`,
       })
 
-      const providerIdList = getRemovalProviderIds(provider.id)
+      const providerIdList = getRemovalProviderIds(provider.id, matchMode)
       const externalCleanupResult = await window.api.clearExternalProviderAuth({
         providerIds: providerIdList,
+        matchMode,
       })
       if (!externalCleanupResult.ok) {
         return {
@@ -1355,11 +1424,12 @@ export default function ModelsPage() {
       message: `清理中：正在删除 AI 提供商「${providerDisplayName}」...`,
     })
     try {
+      const matchMode = resolveCleanupMatchMode(provider.id)
       const latestConfigRaw = await window.api.readConfig()
       const latestConfig = latestConfigRaw && typeof latestConfigRaw === 'object'
         ? (latestConfigRaw as Record<string, any>)
         : null
-      const { nextConfig, removed } = removeProviderFromConfig(latestConfig, provider.id)
+      const { nextConfig, removed } = removeProviderFromConfig(latestConfig, provider.id, matchMode)
       let configChanged = false
       if (removed) {
         const writeResult = await window.api.applyConfigPatchGuarded({
@@ -1373,13 +1443,19 @@ export default function ModelsPage() {
         configChanged = Boolean(writeResult.wrote)
       }
 
-      const providerIdList = getRemovalProviderIds(provider.id)
-      const optimisticStatusAfterRemoval = removeProviderFromStatus(modelStatusRef.current, provider.id).nextStatus
+      const providerIdList = getRemovalProviderIds(provider.id, matchMode)
+      const optimisticStatusAfterRemoval = removeProviderFromStatus(
+        modelStatusRef.current,
+        provider.id,
+        matchMode
+      ).nextStatus
       const envUpdates: Record<string, string> = {}
       for (const envKey of resolveProviderRemovalEnvKeys({
         providerId: provider.id,
+        matchMode,
         candidateEnvKeys: collectProviderBoundEnvKeysFromStatus({
           providerId: provider.id,
+          matchMode,
           modelStatus: modelStatusRef.current,
         }),
         config: nextConfig,
@@ -1392,6 +1468,7 @@ export default function ModelsPage() {
         window.api.clearModelAuthProfiles({
           providerIds: providerIdList,
           authStorePath: resolveModelStatusAuthStorePath(modelStatus),
+          matchMode,
         }),
         Object.keys(envUpdates).length > 0
           ? window.api.writeEnvFileGuarded({
@@ -1412,13 +1489,7 @@ export default function ModelsPage() {
         clearProfilesResult.authStorePath ||
         resolveModelStatusAuthStorePath(modelStatusRef.current)
 
-      const authOrderProviderIds = Array.from(
-        new Set(
-          providerIdList
-            .map((item) => canonicalizeModelProviderId(item))
-            .filter(Boolean)
-        )
-      )
+      const authOrderProviderIds = resolveCleanupAuthOrderProviderIds(provider.id, matchMode)
       let envChanged = false
       let envWarning = ''
       if (envWriteResult) {
@@ -1553,7 +1624,8 @@ export default function ModelsPage() {
       setModelStatus((prev) => {
         const { nextStatus } = removeProviderFromStatus(
           prev && typeof prev === 'object' ? (prev as Record<string, any>) : null,
-          provider.id
+          provider.id,
+          matchMode
         )
         return nextStatus
       })

@@ -124,6 +124,54 @@ describe('models-page provider cleanup', () => {
     expect(nextConfig.models.providers.anthropic).toEqual({ enabled: true })
   })
 
+  it('keeps OpenAI config when removing openai-codex in exact mode', () => {
+    const sourceConfig = {
+      defaultModel: 'openai/gpt-4o',
+      aliases: {
+        coding: 'openai/gpt-4.1',
+      },
+      models: {
+        providers: {
+          openai: { enabled: true },
+          'openai-codex': { enabled: true },
+          anthropic: { enabled: true },
+        },
+      },
+    }
+
+    const removeProviderFromConfigWithMode = removeProviderFromConfig as any
+    const { nextConfig, removed } = removeProviderFromConfigWithMode(sourceConfig, 'openai-codex', 'exact')
+
+    expect(removed).toBe(true)
+    expect(nextConfig.defaultModel).toBe('openai/gpt-4o')
+    expect(nextConfig.aliases).toEqual({
+      coding: 'openai/gpt-4.1',
+    })
+    expect(nextConfig.models.providers.openai).toEqual({ enabled: true })
+    expect(nextConfig.models.providers['openai-codex']).toBeUndefined()
+    expect(nextConfig.models.providers.anthropic).toEqual({ enabled: true })
+  })
+
+  it('uses exact cleanup scope and literal auth-order ids for openai-codex', async () => {
+    const modelsPageModule = await import('../ModelsPage')
+    const resolveCleanupMatchMode = (modelsPageModule as any).resolveCleanupMatchMode
+    const resolveCleanupAuthOrderProviderIds = (modelsPageModule as any).resolveCleanupAuthOrderProviderIds
+
+    expect(typeof resolveCleanupMatchMode).toBe('function')
+    expect(typeof resolveCleanupAuthOrderProviderIds).toBe('function')
+    expect(resolveCleanupMatchMode('openai-codex')).toBe('exact')
+    expect(resolveCleanupAuthOrderProviderIds('openai-codex', 'exact')).toEqual(['openai-codex'])
+  })
+
+  it('keeps merged auth-order cleanup canonicalized for openai', async () => {
+    const modelsPageModule = await import('../ModelsPage')
+    const resolveCleanupMatchMode = (modelsPageModule as any).resolveCleanupMatchMode
+    const resolveCleanupAuthOrderProviderIds = (modelsPageModule as any).resolveCleanupAuthOrderProviderIds
+
+    expect(resolveCleanupMatchMode('openai')).toBe('merged')
+    expect(resolveCleanupAuthOrderProviderIds('openai', 'merged')).toEqual(['openai'])
+  })
+
   it('preserves unrelated legacy top-level defaultModel when removing another provider', () => {
     const sourceConfig = {
       defaultModel: 'openai/gpt-4o',
@@ -360,6 +408,32 @@ describe('models-page provider cleanup', () => {
     ).toEqual([])
   })
 
+  it('does not claim OPENAI_API_KEY from static registry fallback during exact Codex cleanup', async () => {
+    const modelsPageModule = await import('../ModelsPage')
+    const resolveProviderRemovalEnvKeys = (modelsPageModule as any).resolveProviderRemovalEnvKeys
+
+    expect(typeof resolveProviderRemovalEnvKeys).toBe('function')
+    expect(
+      resolveProviderRemovalEnvKeys({
+        providerId: 'openai-codex',
+        matchMode: 'exact',
+        candidateEnvKeys: [],
+        config: {
+          models: {
+            providers: {
+              openai: { enabled: true },
+            },
+          },
+        },
+        modelStatus: {
+          auth: {
+            providers: [{ provider: 'openai', status: 'ok' }],
+          },
+        },
+      })
+    ).toEqual([])
+  })
+
   it('ignores a shared env key during openai removal verification when custom-openai is still configured', async () => {
     const verification = await verifyProviderRemovalState(
       {
@@ -409,6 +483,72 @@ describe('models-page provider cleanup', () => {
             modelStatusLike: {
               auth: {
                 providers: [{ provider: 'custom-openai', status: 'ok' }],
+              },
+            },
+          },
+        }),
+        inspectAuthStore: async () => ({
+          ok: true,
+          present: false,
+          matchedProfileIds: [],
+          matchedLastGoodKeys: [],
+        }),
+      }
+    )
+
+    expect(verification).toEqual({
+      ok: true,
+      authStorePath: undefined,
+    })
+  })
+
+  it('only flags exact Codex auth residues during exact verification', async () => {
+    const verification = await verifyProviderRemovalState(
+      {
+        provider: {
+          id: 'openai-codex',
+          name: 'OpenAI Codex',
+        },
+        currentStatusSnapshot: {
+          auth: {
+            providers: [{ provider: 'openai', status: 'ok' }],
+          },
+        },
+        matchMode: 'exact',
+      } as any,
+      {
+        readEnvFile: async () => ({
+          OPENAI_API_KEY: 'sk-openai-still-valid',
+        }),
+        readConfig: async () => ({
+          models: {
+            providers: {
+              openai: { enabled: true },
+            },
+          },
+        }),
+        readUpstreamState: async () => ({
+          ok: true,
+          source: 'control-ui-app',
+          fallbackUsed: false,
+          diagnostics: {
+            upstreamAvailable: true,
+            connected: true,
+            hasClient: true,
+            hasHelloSnapshot: true,
+            hasHealthResult: true,
+            hasSessionsState: false,
+            hasModelCatalogState: false,
+            appKeys: [],
+          },
+          data: {
+            source: 'control-ui-app',
+            connected: true,
+            hasClient: true,
+            appKeys: [],
+            modelStatusLike: {
+              auth: {
+                providers: [{ provider: 'openai', status: 'ok' }],
               },
             },
           },

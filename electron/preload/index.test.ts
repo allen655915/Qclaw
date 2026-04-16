@@ -285,26 +285,32 @@ describe('preload api model channels', () => {
     await api.clearModelAuthProfiles({
       providerIds: ['openai', 'openai-codex'],
       authStorePath: '/tmp/openclaw/agents/main/agent/auth-profiles.json',
+      matchMode: 'exact',
     })
     expect(invokeMock).toHaveBeenLastCalledWith('local-models:clear-auth-profiles', {
       providerIds: ['openai', 'openai-codex'],
       authStorePath: '/tmp/openclaw/agents/main/agent/auth-profiles.json',
+      matchMode: 'exact',
     })
 
     await api.inspectModelAuthProfiles({
       providerIds: ['openai', 'openai-codex'],
       authStorePath: '/tmp/openclaw/agents/main/agent/auth-profiles.json',
+      matchMode: 'exact',
     })
     expect(invokeMock).toHaveBeenLastCalledWith('local-models:inspect-auth-profiles', {
       providerIds: ['openai', 'openai-codex'],
       authStorePath: '/tmp/openclaw/agents/main/agent/auth-profiles.json',
+      matchMode: 'exact',
     })
 
     await api.clearExternalProviderAuth({
       providerIds: ['openai', 'openai-codex'],
+      matchMode: 'exact',
     })
     expect(invokeMock).toHaveBeenLastCalledWith('local-models:clear-external-auth', {
       providerIds: ['openai', 'openai-codex'],
+      matchMode: 'exact',
     })
 
     await api.ensureGatewayRunning()

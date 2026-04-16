@@ -264,11 +264,22 @@ export const api = {
     ipcRenderer.invoke('local-models:write-env', updates),
   ensureLocalAuthProfile: (input: Record<string, any>) =>
     ipcRenderer.invoke('local-models:ensure-auth', input),
-  clearModelAuthProfiles: (input: { providerIds: string[]; authStorePath?: string }) =>
+  clearModelAuthProfiles: (input: {
+    providerIds: string[]
+    authStorePath?: string
+    matchMode?: 'merged' | 'exact'
+  }) =>
     ipcRenderer.invoke('local-models:clear-auth-profiles', input),
-  inspectModelAuthProfiles: (input: { providerIds: string[]; authStorePath?: string }) =>
+  inspectModelAuthProfiles: (input: {
+    providerIds: string[]
+    authStorePath?: string
+    matchMode?: 'merged' | 'exact'
+  }) =>
     ipcRenderer.invoke('local-models:inspect-auth-profiles', input),
-  clearExternalProviderAuth: (input: { providerIds: string[] }) =>
+  clearExternalProviderAuth: (input: {
+    providerIds: string[]
+    matchMode?: 'merged' | 'exact'
+  }) =>
     ipcRenderer.invoke('local-models:clear-external-auth', input),
 
   // Models center

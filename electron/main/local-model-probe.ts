@@ -213,9 +213,12 @@ export interface RepairAgentAuthProfilesFromOtherAgentStoresResult {
   error?: string
 }
 
+type CleanupMatchMode = 'merged' | 'exact'
+
 export interface ClearModelAuthProfilesInput {
   providerIds: string[]
   authStorePath?: string
+  matchMode?: CleanupMatchMode
 }
 
 export interface ClearModelAuthProfilesResult {
@@ -230,6 +233,7 @@ export interface ClearModelAuthProfilesResult {
 export interface InspectModelAuthProfilesInput {
   providerIds: string[]
   authStorePath?: string
+  matchMode?: CleanupMatchMode
 }
 
 export interface InspectModelAuthProfilesResult {
@@ -326,6 +330,17 @@ function buildExactProviderSet(providerIds: string[]): Set<string> {
   return new Set(providerIds.map((value) => normalizeProviderId(value)).filter(Boolean))
 }
 
+function buildCleanupProviderSet(
+  providerIds: string[],
+  matchMode: CleanupMatchMode = 'merged'
+): Set<string> {
+  if (matchMode === 'exact') {
+    return buildExactProviderSet(providerIds)
+  }
+
+  return buildProviderSet(providerIds)
+}
+
 function buildScopedAgentRepairProviderSet(providerIds: string[]): Set<string> {
   const scopedProviders = new Set<string>()
   for (const providerId of providerIds) {
@@ -377,6 +392,32 @@ function lastGoodEntryMatchesExactProvider(providerSet: Set<string>, key: string
 
   const profileProvider = normalizeProviderId(String(value || '').split(':')[0])
   return Boolean(profileProvider && providerSet.has(profileProvider))
+}
+
+function profileMatchesCleanupProvider(
+  providerSet: Set<string>,
+  profileId: string,
+  profile: any,
+  matchMode: CleanupMatchMode = 'merged'
+): boolean {
+  if (matchMode === 'exact') {
+    return profileMatchesExactProvider(providerSet, profileId, profile)
+  }
+
+  return profileMatchesProvider(providerSet, profileId, profile)
+}
+
+function lastGoodEntryMatchesCleanupProvider(
+  providerSet: Set<string>,
+  key: string,
+  value: unknown,
+  matchMode: CleanupMatchMode = 'merged'
+): boolean {
+  if (matchMode === 'exact') {
+    return lastGoodEntryMatchesExactProvider(providerSet, key, value)
+  }
+
+  return lastGoodEntryMatchesProvider(providerSet, key, value)
 }
 
 function buildFallbackAuthStorePath(homeDir: string, pathStyleHint?: unknown): string {
@@ -960,7 +1001,8 @@ export async function clearModelAuthProfilesByProvider(
   input: ClearModelAuthProfilesInput,
   options: LocalAuthProfileStoreOptions = {}
 ): Promise<ClearModelAuthProfilesResult> {
-  const providerSet = buildProviderSet(input?.providerIds || [])
+  const matchMode = input?.matchMode || 'merged'
+  const providerSet = buildCleanupProviderSet(input?.providerIds || [], matchMode)
   if (providerSet.size === 0) {
     return { ok: true, removed: 0, removedProfileIds: [] }
   }
@@ -991,8 +1033,12 @@ export async function clearModelAuthProfilesByProvider(
 
     const clearedLastGoodKeys: string[] = []
     if (data.lastGood && typeof data.lastGood === 'object' && !Array.isArray(data.lastGood)) {
-      for (const key of Object.keys(data.lastGood)) {
-        if (providerSet.has(canonicalizeProviderId(key))) {
+      for (const [key, value] of Object.entries(data.lastGood)) {
+        const shouldClear = matchMode === 'exact'
+          ? lastGoodEntryMatchesCleanupProvider(providerSet, key, value, matchMode)
+          : providerSet.has(canonicalizeProviderId(key))
+
+        if (shouldClear) {
           delete data.lastGood[key]
           clearedLastGoodKeys.push(key)
         }
@@ -1001,7 +1047,7 @@ export async function clearModelAuthProfilesByProvider(
 
     const removedProfileIds: string[] = []
     for (const [profileId, profile] of Object.entries(data.profiles)) {
-      if (profileMatchesProvider(providerSet, profileId, profile)) {
+      if (profileMatchesCleanupProvider(providerSet, profileId, profile, matchMode)) {
         delete data.profiles[profileId]
         removedProfileIds.push(profileId)
       }
@@ -1043,7 +1089,8 @@ export async function inspectModelAuthProfilesByProvider(
   input: InspectModelAuthProfilesInput,
   options: LocalAuthProfileStoreOptions = {}
 ): Promise<InspectModelAuthProfilesResult> {
-  const providerSet = buildProviderSet(input?.providerIds || [])
+  const matchMode = input?.matchMode || 'merged'
+  const providerSet = buildCleanupProviderSet(input?.providerIds || [], matchMode)
   if (providerSet.size === 0) {
     return {
       ok: true,
@@ -1087,11 +1134,11 @@ export async function inspectModelAuthProfilesByProvider(
       : {}
 
     const matchedProfileIds = Object.entries(profiles)
-      .filter(([profileId, profile]) => profileMatchesProvider(providerSet, profileId, profile))
+      .filter(([profileId, profile]) => profileMatchesCleanupProvider(providerSet, profileId, profile, matchMode))
       .map(([profileId]) => profileId)
 
     const matchedLastGoodKeys = Object.entries(lastGood)
-      .filter(([key, value]) => lastGoodEntryMatchesProvider(providerSet, key, value))
+      .filter(([key, value]) => lastGoodEntryMatchesCleanupProvider(providerSet, key, value, matchMode))
       .map(([key]) => key)
 
     return {

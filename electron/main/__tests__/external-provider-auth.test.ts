@@ -54,6 +54,53 @@ describe('clearExternalProviderAuth', () => {
     })
   })
 
+  it('runs codex logout only for exact openai-codex cleanup', async () => {
+    const runCommand = vi.fn(async () => ({
+      ok: true,
+      stdout: '',
+      stderr: '',
+      code: 0,
+    }))
+
+    const result = await clearExternalProviderAuth(
+      {
+        providerIds: ['openai-codex'],
+        matchMode: 'exact',
+      } as any,
+      {
+        runCommand,
+      }
+    )
+
+    expect(runCommand).toHaveBeenCalledWith('codex', ['logout'], expect.any(Number))
+    expect(result).toEqual({
+      ok: true,
+      cleared: true,
+      attemptedSources: ['codex-cli'],
+    })
+  })
+
+  it('does not run codex logout for exact openai cleanup', async () => {
+    const runCommand = vi.fn()
+
+    const result = await clearExternalProviderAuth(
+      {
+        providerIds: ['openai'],
+        matchMode: 'exact',
+      } as any,
+      {
+        runCommand,
+      }
+    )
+
+    expect(runCommand).not.toHaveBeenCalled()
+    expect(result).toEqual({
+      ok: true,
+      cleared: false,
+      attemptedSources: [],
+    })
+  })
+
   it('skips external cleanup for providers without a mapped external cli source', async () => {
     const runCommand = vi.fn()
 

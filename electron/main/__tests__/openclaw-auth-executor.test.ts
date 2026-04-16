@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import type { OpenClawCapabilities } from '../openclaw-capabilities'
 import type { OpenClawAuthMethodDescriptor } from '../openclaw-auth-registry'
 import { executeAuthRoute } from '../openclaw-auth-executor'
 import { createOpenClawAuthRegistry } from '../openclaw-auth-registry'
@@ -151,6 +152,48 @@ const unsupportedMethod: OpenClawAuthMethodDescriptor = {
   route: {
     kind: 'unsupported',
   },
+}
+
+function createOnboardCapabilities(onboardFlags: string[]): OpenClawCapabilities {
+  return {
+    version: 'OpenClaw 2026.4.15',
+    discoveredAt: '2026-04-17T00:00:00.000Z',
+    authRegistry: createOpenClawAuthRegistry({
+      source: 'openclaw-internal-registry',
+      providers: [],
+    }),
+    authRegistrySource: 'openclaw-internal-registry',
+    authChoices: [],
+    rootCommands: ['onboard', 'models'],
+    onboardFlags,
+    modelsCommands: ['auth', 'list', 'status'],
+    modelsAuthCommands: ['login'],
+    pluginsCommands: [],
+    commandFlags: {
+      onboard: onboardFlags,
+    },
+    supports: {
+      onboard: true,
+      plugins: false,
+      pluginsInstall: false,
+      pluginsEnable: false,
+      chatAgentModelFlag: false,
+      chatGatewaySendModel: false,
+      chatInThreadModelSwitch: false,
+      modelsListAllJson: false,
+      modelsStatusJson: false,
+      modelsAuthLogin: false,
+      modelsAuthAdd: false,
+      modelsAuthPasteToken: false,
+      modelsAuthSetupToken: false,
+      modelsAuthOrder: false,
+      modelsAuthLoginGitHubCopilot: false,
+      aliases: false,
+      fallbacks: false,
+      imageFallbacks: false,
+      modelsScan: false,
+    },
+  }
 }
 
 describe('executeAuthRoute', () => {
@@ -518,6 +561,65 @@ describe('executeAuthRoute', () => {
       expect.any(Number)
     )
     expect(result.ok).toBe(true)
+  })
+
+  it('refreshes onboard capabilities once before failing for missing required flags', async () => {
+    const staleCapabilities = createOnboardCapabilities(['--openai-api-key'])
+    const freshCapabilities = createOnboardCapabilities([
+      '--non-interactive',
+      '--auth-choice',
+      '--accept-risk',
+      '--no-install-daemon',
+      '--skip-channels',
+      '--skip-health',
+      '--skip-skills',
+      '--skip-ui',
+      '--openai-api-key',
+    ])
+    const reloadCapabilities = vi.fn(async () => freshCapabilities)
+    const runCommand = vi.fn(async () => ({ ok: true, stdout: 'configured', stderr: '', code: 0 }))
+    const readConfig = vi.fn().mockResolvedValue({
+      gateway: {
+        auth: {
+          token: 'same-token',
+        },
+      },
+    })
+
+    const result = await executeAuthRoute(
+      {
+        method: openaiApiKeyMethod,
+        providerId: 'openai',
+        methodId: 'openai-api-key',
+        secret: 'sk-live-123',
+      },
+      {
+        capabilities: staleCapabilities,
+        reloadCapabilities,
+        runCommand,
+        readConfig,
+      } as any
+    )
+
+    expect(result.ok).toBe(true)
+    expect(reloadCapabilities).toHaveBeenCalledTimes(1)
+    expect(runCommand).toHaveBeenCalledWith(
+      [
+        'onboard',
+        '--non-interactive',
+        '--auth-choice',
+        'openai-api-key',
+        '--openai-api-key',
+        'sk-live-123',
+        '--accept-risk',
+        '--no-install-daemon',
+        '--skip-channels',
+        '--skip-health',
+        '--skip-skills',
+        '--skip-ui',
+      ],
+      expect.any(Number)
+    )
   })
 
   it('pins onboard api key routes to the main agent auth store when env injection is available', async () => {

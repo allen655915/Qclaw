@@ -728,6 +728,68 @@ describe('clearModelAuthProfilesByProvider', () => {
       'minimax-portal': 'minimax-portal:default',
     })
   })
+
+  it('removes only exact openai-codex profiles in exact mode', async () => {
+    let writtenPath = ''
+    const written = { value: null as Record<string, any> | null }
+
+    const readFileSpy = vi.fn(async () =>
+      JSON.stringify({
+        version: 1,
+        profiles: {
+          'openai:default': {
+            type: 'api_key',
+            provider: 'openai',
+          },
+          'openai-codex:default': {
+            type: 'oauth',
+            provider: 'openai-codex',
+          },
+        },
+        lastGood: {
+          openai: 'openai-codex:default',
+          anthropic: 'anthropic:default',
+        },
+      })
+    )
+    const writeJsonSpy = vi.fn(async (filePath: unknown, value: unknown) => {
+      writtenPath = String(filePath || '')
+      written.value = value as Record<string, any>
+    })
+
+    const result = await clearModelAuthProfilesByProvider(
+      {
+        providerIds: ['openai-codex'],
+        matchMode: 'exact',
+        authStorePath: '/tmp/openclaw/profiles/team-a/agents/main/agent/auth-profiles.json',
+      } as any,
+      {
+        readFileFn: readFileSpy as any,
+        writeJsonFn: writeJsonSpy as any,
+      }
+    )
+
+    expect(result).toMatchObject({
+      ok: true,
+      removed: 1,
+      removedProfileIds: ['openai-codex:default'],
+      authStorePath: '/tmp/openclaw/profiles/team-a/agents/main/agent/auth-profiles.json',
+      clearedLastGoodKeys: ['openai'],
+    })
+    expect(writeJsonSpy).toHaveBeenCalledTimes(1)
+    expect(writtenPath).toBe('/tmp/openclaw/profiles/team-a/agents/main/agent/auth-profiles.json')
+
+    if (!written.value) throw new Error('expected writeJsonFn to receive a JSON payload')
+    expect(written.value.profiles).toEqual({
+      'openai:default': {
+        type: 'api_key',
+        provider: 'openai',
+      },
+    })
+    expect(written.value.lastGood).toEqual({
+      anthropic: 'anthropic:default',
+    })
+  })
 })
 
 describe('inspectModelAuthProfilesByProvider', () => {
@@ -757,6 +819,47 @@ describe('inspectModelAuthProfilesByProvider', () => {
         providerIds: ['openai'],
         authStorePath: '/tmp/openclaw/profiles/team-a/agents/main/agent/auth-profiles.json',
       },
+      {
+        readFileFn: readFileSpy as any,
+      }
+    )
+
+    expect(result).toEqual({
+      ok: true,
+      present: true,
+      matchedProfileIds: ['openai-codex:default'],
+      matchedLastGoodKeys: ['openai'],
+      authStorePath: '/tmp/openclaw/profiles/team-a/agents/main/agent/auth-profiles.json',
+    })
+  })
+
+  it('inspects only exact openai-codex residues in exact mode', async () => {
+    const readFileSpy = vi.fn(async () =>
+      JSON.stringify({
+        version: 1,
+        profiles: {
+          'openai:default': {
+            type: 'api_key',
+            provider: 'openai',
+          },
+          'openai-codex:default': {
+            type: 'oauth',
+            provider: 'openai-codex',
+          },
+        },
+        lastGood: {
+          openai: 'openai-codex:default',
+          anthropic: 'anthropic:default',
+        },
+      })
+    )
+
+    const result = await inspectModelAuthProfilesByProvider(
+      {
+        providerIds: ['openai-codex'],
+        matchMode: 'exact',
+        authStorePath: '/tmp/openclaw/profiles/team-a/agents/main/agent/auth-profiles.json',
+      } as any,
       {
         readFileFn: readFileSpy as any,
       }

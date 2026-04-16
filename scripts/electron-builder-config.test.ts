@@ -25,6 +25,7 @@ describe('electron-builder mac dmg config', () => {
 
 describe('electron-builder windows update config', () => {
   const expectedPublishUrl = 'https://qclaw-lite.oss-cn-shenzhen.aliyuncs.com/beta/current/'
+  const expectedWindowsIconPath = 'build/icon.ico'
 
   it('keeps Windows packaging on NSIS x64 so electron-updater can consume latest.yml metadata', () => {
     const config = readElectronBuilderConfig()
@@ -39,6 +40,13 @@ describe('electron-builder windows update config', () => {
         }),
       ])
     )
+  })
+
+  it('pins the Windows app icon to the Qclaw logo asset', () => {
+    const config = readElectronBuilderConfig()
+    const win = (config.win ?? {}) as Record<string, unknown>
+
+    expect(String(win.icon).trim()).toBe(expectedWindowsIconPath)
   })
 
   it('keeps the publish provider on generic so packaged apps can read app-update.yml consistently', () => {

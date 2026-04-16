@@ -7,6 +7,7 @@ const fs = process.getBuiltinModule('node:fs/promises') as typeof import('node:f
 const path = process.getBuiltinModule('node:path') as typeof import('node:path')
 
 const { createHash } = crypto
+const WINDOWS_NODE_DOWNLOAD_MIRROR_BASE_URL = 'https://npmmirror.com/mirrors/node'
 
 export type WindowsPrivateNodeInstallPlan = NodeInstallPlan
 
@@ -102,6 +103,44 @@ function buildExtractedNodeFolderName(plan: WindowsPrivateNodeInstallPlan): stri
   return `node-${plan.version}-win-${plan.installerArch}`
 }
 
+function trimTrailingSlashes(value: string): string {
+  return trim(value).replace(/\/+$/, '')
+}
+
+function buildVersionedNodeArtifactUrl(baseUrl: string, version: string, filename: string): string {
+  return `${trimTrailingSlashes(baseUrl)}/${trim(version)}/${trim(filename)}`
+}
+
+function buildMirrorFirstDownloadUrls(preferredUrl: string, fallbackUrl: string): string[] {
+  return Array.from(
+    new Set([trim(preferredUrl), trim(fallbackUrl)].filter(Boolean))
+  )
+}
+
+async function downloadWithFallback(options: {
+  downloadFile: EnsureWindowsPrivateNodeRuntimeOptions['downloadFile']
+  destPath: string
+  fallbackUrl: string
+  preferredUrl: string
+  resourceLabel: string
+}): Promise<void> {
+  const attemptErrors: string[] = []
+
+  for (const url of buildMirrorFirstDownloadUrls(options.preferredUrl, options.fallbackUrl)) {
+    try {
+      await options.downloadFile(url, options.destPath)
+      return
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      attemptErrors.push(`${url} -> ${message}`)
+    }
+  }
+
+  throw new Error(
+    `Failed to download ${options.resourceLabel}. Attempts: ${attemptErrors.join(' | ')}`
+  )
+}
+
 async function runPowerShellExpandArchive(
   runPowerShell: EnsureWindowsPrivateNodeRuntimeOptions['runPowerShell'],
   zipPath: string,
@@ -171,11 +210,32 @@ export async function ensureWindowsPrivateNodeRuntime(
     await mkdir(paths.downloadDir, { recursive: true })
     await mkdir(paths.zipStagingDir, { recursive: true })
 
-    await options.downloadFile(options.plan.url, paths.zipPath)
-    await options.downloadFile(
-      `${options.plan.distBaseUrl}/${options.plan.version}/SHASUMS256.txt`,
-      paths.shaSumsPath
-    )
+    await downloadWithFallback({
+      downloadFile: options.downloadFile,
+      destPath: paths.zipPath,
+      fallbackUrl: options.plan.url,
+      preferredUrl: buildVersionedNodeArtifactUrl(
+        WINDOWS_NODE_DOWNLOAD_MIRROR_BASE_URL,
+        options.plan.version,
+        options.plan.filename
+      ),
+      resourceLabel: options.plan.filename,
+    })
+    await downloadWithFallback({
+      downloadFile: options.downloadFile,
+      destPath: paths.shaSumsPath,
+      fallbackUrl: buildVersionedNodeArtifactUrl(
+        options.plan.distBaseUrl,
+        options.plan.version,
+        'SHASUMS256.txt'
+      ),
+      preferredUrl: buildVersionedNodeArtifactUrl(
+        WINDOWS_NODE_DOWNLOAD_MIRROR_BASE_URL,
+        options.plan.version,
+        'SHASUMS256.txt'
+      ),
+      resourceLabel: 'SHASUMS256.txt',
+    })
 
     const [zipSha256, shaSumsText] = await Promise.all([
       sha256File(paths.zipPath),
