@@ -136,6 +136,136 @@ describe('openclaw config coordinator', () => {
     expect(runCliMock).not.toHaveBeenCalled()
   })
 
+  it('merges concurrent agent and binding additions by identity when Feishu bots are added in parallel', async () => {
+    readConfigMock.mockResolvedValue({
+      agents: {
+        list: [
+          { id: 'feishu-default', workspace: '~/.openclaw/workspace-feishu-default' },
+          { id: 'feishu-work', workspace: '~/.openclaw/workspace-feishu-work' },
+        ],
+      },
+      bindings: [
+        { agentId: 'feishu-default', match: { channel: 'feishu', accountId: 'default' } },
+        { agentId: 'feishu-work', match: { channel: 'feishu', accountId: 'work' } },
+      ],
+    })
+    guardedWriteConfigMock.mockResolvedValue({
+      ok: true,
+      blocked: false,
+      wrote: true,
+      target: 'config',
+      snapshotCreated: false,
+      snapshot: null,
+      changedJsonPaths: ['$.agents.list[2]', '$.bindings[2]'],
+      ownershipSummary: null,
+      message: 'ok',
+    })
+
+    await applyConfigPatchGuarded(
+      {
+        beforeConfig: {
+          agents: {
+            list: [
+              { id: 'feishu-default', workspace: '~/.openclaw/workspace-feishu-default' },
+            ],
+          },
+          bindings: [
+            { agentId: 'feishu-default', match: { channel: 'feishu', accountId: 'default' } },
+          ],
+        },
+        afterConfig: {
+          agents: {
+            list: [
+              { id: 'feishu-default', workspace: '~/.openclaw/workspace-feishu-default' },
+              { id: 'feishu-support', workspace: '~/.openclaw/workspace-feishu-support' },
+            ],
+          },
+          bindings: [
+            { agentId: 'feishu-default', match: { channel: 'feishu', accountId: 'default' } },
+            { agentId: 'feishu-support', match: { channel: 'feishu', accountId: 'support' } },
+          ],
+        },
+        reason: 'channel-connect-feishu-finish-create',
+      },
+      undefined,
+      {
+        applyGatewayPolicy: false,
+      }
+    )
+
+    expect(guardedWriteConfigMock).toHaveBeenCalledWith(
+      {
+        config: {
+          agents: {
+            list: [
+              { id: 'feishu-default', workspace: '~/.openclaw/workspace-feishu-default' },
+              { id: 'feishu-work', workspace: '~/.openclaw/workspace-feishu-work' },
+              { id: 'feishu-support', workspace: '~/.openclaw/workspace-feishu-support' },
+            ],
+          },
+          bindings: [
+            { agentId: 'feishu-default', match: { channel: 'feishu', accountId: 'default' } },
+            { agentId: 'feishu-work', match: { channel: 'feishu', accountId: 'work' } },
+            { agentId: 'feishu-support', match: { channel: 'feishu', accountId: 'support' } },
+          ],
+        },
+        reason: 'channel-connect-feishu-finish-create',
+      },
+      undefined
+    )
+  })
+
+  it('merges concurrent plugin allow-list additions instead of dropping one side', async () => {
+    readConfigMock.mockResolvedValue({
+      plugins: {
+        allow: ['openclaw-weixin', 'wecom-openclaw-plugin'],
+      },
+    })
+    guardedWriteConfigMock.mockResolvedValue({
+      ok: true,
+      blocked: false,
+      wrote: true,
+      target: 'config',
+      snapshotCreated: false,
+      snapshot: null,
+      changedJsonPaths: ['$.plugins.allow[2]'],
+      ownershipSummary: null,
+      message: 'ok',
+    })
+
+    await applyConfigPatchGuarded(
+      {
+        beforeConfig: {
+          plugins: {
+            allow: ['openclaw-weixin'],
+          },
+        },
+        afterConfig: {
+          plugins: {
+            allow: ['openclaw-weixin', 'openclaw-lark'],
+          },
+        },
+        reason: 'channel-connect-configure',
+      },
+      undefined,
+      {
+        applyGatewayPolicy: false,
+      }
+    )
+
+    expect(guardedWriteConfigMock).toHaveBeenCalledWith(
+      {
+        config: {
+          plugins: {
+            allow: ['openclaw-weixin', 'wecom-openclaw-plugin', 'openclaw-lark'],
+          },
+        },
+        reason: 'channel-connect-configure',
+      },
+      undefined
+    )
+  })
+
   it('keeps the legacy fallback-to-empty latest config behavior unless strictRead is enabled', async () => {
     readConfigMock.mockResolvedValue(null)
     guardedWriteConfigMock.mockResolvedValue({

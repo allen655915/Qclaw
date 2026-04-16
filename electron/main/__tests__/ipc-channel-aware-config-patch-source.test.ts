@@ -15,15 +15,18 @@ describe('ipc channel-aware config patch source', () => {
     expect(source).toContain('applyChannelAwareConfigPatchGuarded(request, candidate)')
   })
 
-  it('classifies renderer full config writes through the channel-aware wrapper before writing', () => {
+  it('routes renderer full config writes through channel-aware patching with strict reads for existing configs', () => {
     const guardedWriteIndex = source.indexOf("ipcMain.handle('openclaw:config:guarded-write'")
     const applyIndex = source.indexOf('applyChannelAwareConfigPatchGuarded(', guardedWriteIndex)
-    const readIndex = source.indexOf('const beforeConfig = await readConfig().catch(() => null)', guardedWriteIndex)
-    const writeIndex = source.indexOf('guardedWriteConfig(request, preferredCandidate)', guardedWriteIndex)
+    const configPathIndex = source.indexOf("const configPath = String(candidate?.configPath || resolveOpenClawPaths().configFile || '').trim()", guardedWriteIndex)
+    const readIndex = source.indexOf('const [beforeConfig, configFileExists] = await Promise.all([', guardedWriteIndex)
+    const strictReadIndex = source.indexOf('strictRead: configFileExists', guardedWriteIndex)
 
     expect(guardedWriteIndex).toBeGreaterThan(-1)
-    expect(readIndex).toBeGreaterThan(guardedWriteIndex)
+    expect(configPathIndex).toBeGreaterThan(guardedWriteIndex)
+    expect(readIndex).toBeGreaterThan(configPathIndex)
     expect(applyIndex).toBeGreaterThan(readIndex)
-    expect(writeIndex).toBeGreaterThan(applyIndex)
+    expect(strictReadIndex).toBeGreaterThan(applyIndex)
+    expect(source).not.toContain('guardedWriteConfig(request, preferredCandidate)')
   })
 })

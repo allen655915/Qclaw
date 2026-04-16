@@ -103,7 +103,6 @@ import {
 import {
   getDataGuardSummary,
   getOwnershipDetails,
-  guardedWriteConfig,
   listOwnershipDetailChanges,
   prepareManagedConfigWrite,
 } from './openclaw-config-guard'
@@ -232,11 +231,22 @@ import { removeManagedSkillLocally, removeSkillDirectoryLocally } from './skills
 import { withExclusiveSkillMutation } from './skill-mutation-guard'
 
 const { randomUUID } = process.getBuiltinModule('node:crypto') as typeof import('node:crypto')
-const { appendFile, readFile, rm } = process.getBuiltinModule('node:fs/promises') as typeof import('node:fs/promises')
+const { access, appendFile, readFile, rm } = process.getBuiltinModule('node:fs/promises') as typeof import('node:fs/promises')
 
 function resolveGatewayRequestId(requestId?: string): string {
   const normalized = String(requestId || '').trim()
   return normalized || randomUUID()
+}
+
+async function pathExists(targetPath: string): Promise<boolean> {
+  const normalized = String(targetPath || '').trim()
+  if (!normalized) return false
+  try {
+    await access(normalized)
+    return true
+  } catch {
+    return false
+  }
 }
 
 const DEFAULT_CANCEL_DOMAINS = [
@@ -628,7 +638,11 @@ export function registerIpcHandlers() {
   ipcMain.handle('openclaw:data-guard:get', (_e, candidate) => getDataGuardSummary(candidate))
   ipcMain.handle('openclaw:config:prepare', (_e, candidate) => prepareManagedConfigWrite(candidate))
   ipcMain.handle('openclaw:config:guarded-write', async (_e, request, candidate) => {
-    const beforeConfig = await readConfig().catch(() => null)
+    const configPath = String(candidate?.configPath || resolveOpenClawPaths().configFile || '').trim()
+    const [beforeConfig, configFileExists] = await Promise.all([
+      readConfig(configPath ? { configPath } : undefined).catch(() => null),
+      pathExists(configPath),
+    ])
     return applyChannelAwareConfigPatchGuarded(
       {
         beforeConfig,
@@ -636,9 +650,10 @@ export function registerIpcHandlers() {
         reason: request?.reason,
       },
       candidate,
+      {},
       {
-        applyConfigPatchGuardedImpl: (_patchRequest, preferredCandidate) =>
-          guardedWriteConfig(request, preferredCandidate),
+        strictRead: configFileExists,
+        configPath: configPath || null,
       }
     )
   })

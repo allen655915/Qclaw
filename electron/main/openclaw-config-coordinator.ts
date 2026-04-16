@@ -38,6 +38,10 @@ function cloneJsonValue<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T
 }
 
+function normalizeIdentityText(value: unknown): string {
+  return String(value || '').trim().toLowerCase()
+}
+
 function normalizeConfig(config: Record<string, any> | null | undefined): Record<string, any> {
   if (!isPlainObject(config)) return {}
   return cloneJsonValue(config)
@@ -68,13 +72,193 @@ function isDeepEqual(left: unknown, right: unknown): boolean {
   return false
 }
 
+function isScalarJsonValue(value: unknown): value is string | number | boolean | null {
+  return value === null || ['string', 'number', 'boolean'].includes(typeof value)
+}
+
+function stableSerialize(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => stableSerialize(item)).join(',')}]`
+  }
+
+  if (isPlainObject(value)) {
+    return `{${Object.keys(value)
+      .sort((left, right) => left.localeCompare(right))
+      .map((key) => `${JSON.stringify(key)}:${stableSerialize(value[key])}`)
+      .join(',')}}`
+  }
+
+  return JSON.stringify(value)
+}
+
+function canMergeScalarArrayAtPath(currentPath: string): boolean {
+  return (
+    currentPath === '$.plugins.allow'
+    || currentPath.endsWith('.allowFrom')
+    || currentPath.endsWith('.groupAllowFrom')
+  )
+}
+
+function rebaseScalarArray(
+  base: unknown[],
+  desired: unknown[],
+  latest: unknown[],
+): unknown[] | null {
+  if (![base, desired, latest].every((value) => value.every((item) => isScalarJsonValue(item)))) {
+    return null
+  }
+
+  const desiredKeys = new Set(desired.map((item) => stableSerialize(item)))
+  const baseKeys = new Set(base.map((item) => stableSerialize(item)))
+  const additions = desired.filter((item) => !baseKeys.has(stableSerialize(item)))
+  const removals = new Set(
+    base
+      .filter((item) => !desiredKeys.has(stableSerialize(item)))
+      .map((item) => stableSerialize(item))
+  )
+
+  const result: unknown[] = []
+  const seen = new Set<string>()
+  for (const item of latest) {
+    const key = stableSerialize(item)
+    if (removals.has(key) || seen.has(key)) continue
+    result.push(cloneJsonValue(item))
+    seen.add(key)
+  }
+
+  for (const item of additions) {
+    const key = stableSerialize(item)
+    if (seen.has(key)) continue
+    result.push(cloneJsonValue(item))
+    seen.add(key)
+  }
+
+  return result
+}
+
+function getObjectArrayIdentity(currentPath: string, item: unknown): string | null {
+  if (!isPlainObject(item)) return null
+
+  const normalizedId = normalizeIdentityText(item.id)
+  if (normalizedId) return `id:${normalizedId}`
+
+  if (currentPath === '$.bindings') {
+    const agentId = normalizeIdentityText(item.agentId)
+    const matchKey = isPlainObject(item.match) ? stableSerialize(item.match) : ''
+    if (agentId || matchKey) {
+      return `binding:${agentId}:${matchKey}`
+    }
+  }
+
+  return null
+}
+
+function buildObjectArrayMap(
+  currentPath: string,
+  values: unknown[]
+): Map<string, unknown> | null {
+  const result = new Map<string, unknown>()
+  for (const item of values) {
+    const identity = getObjectArrayIdentity(currentPath, item)
+    if (!identity || result.has(identity)) return null
+    result.set(identity, item)
+  }
+  return result
+}
+
+function rebaseObjectArray(
+  base: unknown[],
+  desired: unknown[],
+  latest: unknown[],
+  currentPath: string
+): unknown[] | null {
+  const [baseMap, desiredMap, latestMap] = [
+    buildObjectArrayMap(currentPath, base),
+    buildObjectArrayMap(currentPath, desired),
+    buildObjectArrayMap(currentPath, latest),
+  ]
+
+  if (!baseMap || !desiredMap || !latestMap) {
+    return null
+  }
+
+  const resultIds: string[] = []
+  const result = new Map<string, unknown>()
+
+  for (const [identity, latestItem] of latestMap.entries()) {
+    const hasBase = baseMap.has(identity)
+    const hasDesired = desiredMap.has(identity)
+
+    if (!hasDesired && hasBase) {
+      continue
+    }
+
+    if (!hasDesired) {
+      result.set(identity, cloneJsonValue(latestItem))
+      resultIds.push(identity)
+      continue
+    }
+
+    const desiredItem = desiredMap.get(identity)
+    if (!hasBase) {
+      result.set(
+        identity,
+        rebaseConfigValue({}, desiredItem, latestItem, `${currentPath}[${identity}]`)
+      )
+      resultIds.push(identity)
+      continue
+    }
+
+    const baseItem = baseMap.get(identity)
+    result.set(
+      identity,
+      isDeepEqual(baseItem, desiredItem)
+        ? cloneJsonValue(latestItem)
+        : rebaseConfigValue(baseItem, desiredItem, latestItem, `${currentPath}[${identity}]`)
+    )
+    resultIds.push(identity)
+  }
+
+  for (const [identity, desiredItem] of desiredMap.entries()) {
+    if (result.has(identity)) continue
+
+    if (!baseMap.has(identity)) {
+      result.set(identity, cloneJsonValue(desiredItem))
+      resultIds.push(identity)
+      continue
+    }
+
+    const baseItem = baseMap.get(identity)
+    if (isDeepEqual(baseItem, desiredItem)) continue
+
+    result.set(identity, cloneJsonValue(desiredItem))
+    resultIds.push(identity)
+  }
+
+  return resultIds.map((identity) => result.get(identity))
+}
+
 /**
  * Rebase renderer-side config edits (before -> after) onto the latest config snapshot.
  * Unchanged fields keep latest values to reduce concurrent overwrite risk.
  */
-function rebaseConfigValue(base: unknown, desired: unknown, latest: unknown): unknown {
+function rebaseConfigValue(base: unknown, desired: unknown, latest: unknown, currentPath = '$'): unknown {
   if (isDeepEqual(base, desired)) {
     return cloneJsonValue(latest)
+  }
+
+  if (Array.isArray(base) && Array.isArray(desired)) {
+    const latestArray = Array.isArray(latest) ? latest : []
+
+    if (canMergeScalarArrayAtPath(currentPath)) {
+      const mergedScalarArray = rebaseScalarArray(base, desired, latestArray)
+      if (mergedScalarArray) return mergedScalarArray
+    }
+
+    const mergedObjectArray = rebaseObjectArray(base, desired, latestArray, currentPath)
+    if (mergedObjectArray) return mergedObjectArray
+
+    return cloneJsonValue(desired)
   }
 
   if (isPlainObject(base) && isPlainObject(desired)) {
@@ -104,9 +288,13 @@ function rebaseConfigValue(base: unknown, desired: unknown, latest: unknown): un
         continue
       }
 
-      if (isPlainObject(baseValue) && isPlainObject(desiredValue)) {
+      if (
+        (isPlainObject(baseValue) && isPlainObject(desiredValue))
+        || (Array.isArray(baseValue) && Array.isArray(desiredValue))
+      ) {
         const latestValue = Object.prototype.hasOwnProperty.call(result, key) ? result[key] : undefined
-        result[key] = rebaseConfigValue(baseValue, desiredValue, latestValue)
+        const nextPath = currentPath === '$' ? `$.${key}` : `${currentPath}.${key}`
+        result[key] = rebaseConfigValue(baseValue, desiredValue, latestValue, nextPath)
         continue
       }
 

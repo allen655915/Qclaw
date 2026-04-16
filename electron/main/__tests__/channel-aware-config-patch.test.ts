@@ -280,6 +280,69 @@ describe('channel-aware config patch', () => {
     ])
   })
 
+  it('forwards patch coordinator options when provided', async () => {
+    const applyConfigPatchGuardedImpl = vi.fn(async () => createOkWriteResult(['$.channels.feishu.enabled']))
+
+    await applyChannelAwareConfigPatchGuarded(
+      {
+        beforeConfig: {
+          channels: {
+            feishu: {
+              enabled: true,
+            },
+          },
+        },
+        afterConfig: {
+          channels: {
+            feishu: {
+              enabled: false,
+            },
+          },
+        },
+        reason: 'channel-connect-configure',
+      },
+      undefined,
+      {
+        applyConfigPatchGuardedImpl,
+        tryAcquireManagedOperationLeasesImpl: () => [
+          {
+            key: 'managed-channel-plugin:feishu',
+            release: () => undefined,
+          },
+        ],
+      },
+      {
+        strictRead: true,
+        configPath: 'C:/Users/demo/.openclaw/openclaw.json',
+      }
+    )
+
+    expect(applyConfigPatchGuardedImpl).toHaveBeenCalledWith(
+      {
+        beforeConfig: {
+          channels: {
+            feishu: {
+              enabled: true,
+            },
+          },
+        },
+        afterConfig: {
+          channels: {
+            feishu: {
+              enabled: false,
+            },
+          },
+        },
+        reason: 'channel-connect-configure',
+      },
+      undefined,
+      {
+        strictRead: true,
+        configPath: 'C:/Users/demo/.openclaw/openclaw.json',
+      }
+    )
+  })
+
   it('returns busy without writing when a managed channel lock is already held', async () => {
     const applyConfigPatchGuardedImpl = vi.fn(async () => createOkWriteResult(['$.plugins.allow[0]']))
 

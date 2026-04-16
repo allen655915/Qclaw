@@ -219,12 +219,17 @@ function releaseManagedOperationLeases(leases: ManagedOperationLease[]): void {
 export async function applyChannelAwareConfigPatchGuarded(
   request: OpenClawConfigPatchWriteRequest,
   preferredCandidate?: OpenClawInstallCandidate | null,
-  dependencies: ChannelAwareConfigPatchDependencies = {}
+  dependencies: ChannelAwareConfigPatchDependencies = {},
+  applyConfigPatchOptions?: Parameters<typeof applyConfigPatchGuarded>[2]
 ): Promise<OpenClawGuardedWriteResult> {
   const classification = classifyManagedChannelConfigPatch(request)
   const applyImpl = dependencies.applyConfigPatchGuardedImpl || applyConfigPatchGuarded
+  const applyPatch = () =>
+    applyConfigPatchOptions === undefined
+      ? applyImpl(request, preferredCandidate)
+      : applyImpl(request, preferredCandidate, applyConfigPatchOptions)
   if (classification.targets.length === 0) {
-    return applyImpl(request, preferredCandidate)
+    return applyPatch()
   }
 
   const lockKeys = classification.targets.map((target) => target.lockKey).sort()
@@ -234,7 +239,7 @@ export async function applyChannelAwareConfigPatchGuarded(
   }
 
   try {
-    return await applyImpl(request, preferredCandidate)
+    return await applyPatch()
   } finally {
     releaseManagedOperationLeases(leases)
   }
