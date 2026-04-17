@@ -36,7 +36,28 @@ const MANAGED_INSTALLER_ENV_DROP_PREFIXES = [
   'asdf_',
 ] as const
 
-export function shouldDropManagedInstallerEnvKey(key: string): boolean {
+const WINDOWS_MANAGED_INSTALLER_ENV_KEEP_PREFIXES = [
+  'NVM_',
+  'nvm_',
+] as const
+
+interface ManagedInstallerEnvOptions {
+  platform?: NodeJS.Platform
+}
+
+export function shouldDropManagedInstallerEnvKey(
+  key: string,
+  options: ManagedInstallerEnvOptions = {}
+): boolean {
+  const platform = options.platform || process.platform
+  if (platform === 'win32') {
+    for (const prefix of WINDOWS_MANAGED_INSTALLER_ENV_KEEP_PREFIXES) {
+      if (key.startsWith(prefix)) {
+        return false
+      }
+    }
+  }
+
   if (MANAGED_INSTALLER_ENV_DROP_EXACT.has(key)) return true
   for (const prefix of MANAGED_INSTALLER_ENV_DROP_PREFIXES) {
     if (key.startsWith(prefix)) return true
@@ -44,10 +65,13 @@ export function shouldDropManagedInstallerEnvKey(key: string): boolean {
   return false
 }
 
-export function sanitizeManagedInstallerEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+export function sanitizeManagedInstallerEnv(
+  env: NodeJS.ProcessEnv,
+  options: ManagedInstallerEnvOptions = {}
+): NodeJS.ProcessEnv {
   const cloned: NodeJS.ProcessEnv = { ...env }
   for (const key of Object.keys(cloned)) {
-    if (shouldDropManagedInstallerEnvKey(key)) {
+    if (shouldDropManagedInstallerEnvKey(key, options)) {
       delete cloned[key]
     }
   }

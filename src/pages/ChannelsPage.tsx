@@ -21,6 +21,7 @@ import {
   applyAgentPrimaryModelWithGatewayReload,
   extractPrimaryModelFromModelStatusPayload,
 } from '../shared/model-config-gateway'
+import { getFeishuOfficialPluginStateReady } from '../lib/feishu-official-plugin-auto-sync'
 import {
   ensureModelSelectOption,
   loadReadyModelSelectOptions,
@@ -200,11 +201,16 @@ export default function ChannelsPage() {
 
     try {
       setError('')
-      const [config, feishuPluginState, weixinAccounts] = await Promise.all([
-        window.api.readConfig(),
-        window.api.getFeishuOfficialPluginState().catch(() => null),
+      let feishuConfigRepairError = ''
+      const [feishuPluginStateResult, weixinAccounts] = await Promise.all([
+        getFeishuOfficialPluginStateReady(window.api).catch((reason) => {
+          feishuConfigRepairError = reason instanceof Error ? reason.message : String(reason || '')
+          return null
+        }),
         window.api.listWeixinAccounts().catch(() => []),
       ])
+      const feishuPluginState = feishuPluginStateResult?.state || null
+      const config = await window.api.readConfig()
       if (!config) {
         setChannels([])
         setLegacyFeishuAgentIds([])
@@ -230,8 +236,8 @@ export default function ChannelsPage() {
         .catch(() => ({} as FeishuRuntimeStatusRecord))
 
       const normalizedConfig = feishuPluginState?.normalizedConfig || sanitizeFeishuPluginConfig(config)
-      if (feishuPluginState?.configChanged && feishuPluginState.configAvailable !== false) {
-        setChannelConfigNotice('检测到飞书官方插件配置需要同步。请打开飞书渠道执行显式修复或重新完成配置；本页不会在后台静默写入 managed channel 配置。')
+      if (feishuConfigRepairError) {
+        setChannelConfigNotice(`Qclaw 自动修复飞书配置失败：${feishuConfigRepairError}`)
       } else {
         setChannelConfigNotice('')
       }
@@ -806,7 +812,7 @@ export default function ChannelsPage() {
       )}
 
       {channelConfigNotice && (
-        <Alert color="yellow" title="需要显式同步飞书配置" onClose={() => setChannelConfigNotice('')}>
+        <Alert color="yellow" title="飞书配置修复失败" onClose={() => setChannelConfigNotice('')}>
           {channelConfigNotice}
         </Alert>
       )}

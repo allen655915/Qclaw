@@ -16,6 +16,7 @@ export type WindowsPluginHostRuntimeBridgeFailureKind =
   | 'missing_active_runtime'
   | 'invalid_host_package'
   | 'version_mismatch'
+  | 'version_probe_failed'
   | 'bridge_path_outside_home'
   | 'unsafe_existing_bridge_path'
 

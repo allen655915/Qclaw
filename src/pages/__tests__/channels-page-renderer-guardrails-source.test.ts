@@ -4,17 +4,19 @@ const fs = process.getBuiltinModule('node:fs') as typeof import('node:fs')
 const path = process.getBuiltinModule('node:path') as typeof import('node:path')
 
 describe('ChannelsPage renderer guardrails', () => {
-  it('does not write Feishu normalized config from the channel list refresh path', () => {
+  it('auto syncs Feishu normalized config before rebuilding the channel list', () => {
     const source = fs.readFileSync(
       path.join(process.cwd(), 'src', 'pages', 'ChannelsPage.tsx'),
       'utf8'
     )
 
     expect(source).toContain('const [channelConfigNotice, setChannelConfigNotice] = useState')
-    expect(source).toContain('需要显式同步飞书配置')
-    expect(source).toContain('本页不会在后台静默写入 managed channel 配置')
-    expect(source).not.toContain('Keep listing channels even if the background healing write fails.')
-    expect(source).not.toContain('afterConfig: normalizedConfig')
+    expect(source).toContain("import { getFeishuOfficialPluginStateReady } from '../lib/feishu-official-plugin-auto-sync'")
+    expect(source).toContain('getFeishuOfficialPluginStateReady(window.api).catch((reason) => {')
+    expect(source).toContain('Qclaw 自动修复飞书配置失败：${feishuConfigRepairError}')
+    expect(source).toContain('title="飞书配置修复失败"')
+    expect(source).not.toContain('需要显式同步飞书配置')
+    expect(source).not.toContain('本页不会在后台静默写入 managed channel 配置')
   })
 
   it('removes personal Weixin account state only after the guarded config write succeeds', () => {

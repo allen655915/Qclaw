@@ -222,6 +222,10 @@ export interface EnsureFeishuOfficialPluginReadyOptions {
   runtimeContext?: FeishuOfficialPluginRuntimeContext | null
 }
 
+interface ApplyNormalizedConfigIfNeededOptions {
+  applyGatewayPolicy?: boolean
+}
+
 function normalizeRuntimeContext(
   context: FeishuOfficialPluginRuntimeContext | null | undefined
 ): { configPath: string; homeDir: string } {
@@ -231,10 +235,14 @@ function normalizeRuntimeContext(
   }
 }
 
-async function applyNormalizedConfigIfNeeded(state: FeishuOfficialPluginState): Promise<{
+async function applyNormalizedConfigIfNeeded(
+  state: FeishuOfficialPluginState,
+  options: ApplyNormalizedConfigIfNeededOptions = {}
+): Promise<{
   applied: boolean
   gatewayApplied: boolean
 }> {
+  const applyGatewayPolicy = options.applyGatewayPolicy !== false
   if (!state.configChanged) {
     return {
       applied: false,
@@ -263,7 +271,7 @@ async function applyNormalizedConfigIfNeeded(state: FeishuOfficialPluginState): 
       },
       scope: 'plugins-only',
       apply: true,
-      applyGatewayPolicy: true,
+      applyGatewayPolicy,
     },
   )
   if (!reconcileResult.ok) {
@@ -271,7 +279,115 @@ async function applyNormalizedConfigIfNeeded(state: FeishuOfficialPluginState): 
   }
   return {
     applied: reconcileResult.written || reconcileResult.changed,
-    gatewayApplied: reconcileResult.writeResult?.gatewayApply?.ok === true,
+    gatewayApplied: applyGatewayPolicy && reconcileResult.writeResult?.gatewayApply?.ok === true,
+  }
+}
+
+export interface PrepareFeishuOfficialPluginForInstallerResult {
+  ok: boolean
+  state: FeishuOfficialPluginState
+  stdout: string
+  stderr: string
+  code: number | null
+  message?: string
+  pluginReady: boolean
+}
+
+export async function prepareFeishuOfficialPluginForInstaller(
+  options: EnsureFeishuOfficialPluginReadyOptions = {}
+): Promise<PrepareFeishuOfficialPluginForInstallerResult> {
+  const pinnedRuntimeContext = normalizeRuntimeContext(options.runtimeContext)
+  const runtimeContextOption = pinnedRuntimeContext.homeDir || pinnedRuntimeContext.configPath
+    ? {
+        runtimeContext: {
+          ...(pinnedRuntimeContext.homeDir ? { homeDir: pinnedRuntimeContext.homeDir } : {}),
+          ...(pinnedRuntimeContext.configPath ? { configPath: pinnedRuntimeContext.configPath } : {}),
+        },
+      }
+    : {}
+  let state = await getFeishuOfficialPluginState(options)
+
+  try {
+    if (!state.configAvailable) {
+      throw new Error('当前 OpenClaw 配置读取失败，无法安全同步飞书官方插件配置')
+    }
+    const applyBeforeLaunchResult = await applyNormalizedConfigIfNeeded(state, {
+      applyGatewayPolicy: false,
+    })
+    if (applyBeforeLaunchResult.applied) {
+      state = await getFeishuOfficialPluginState(options)
+    }
+  } catch (error) {
+    return {
+      ok: false,
+      state,
+      stdout: '',
+      stderr: error instanceof Error ? error.message : String(error),
+      code: 1,
+      message: '飞书插件预检查失败',
+      pluginReady: false,
+    }
+  }
+
+  const repairResult = await repairIncompatibleExtensionPlugins({
+    scopePluginIds: FEISHU_PLUGIN_REPAIR_SCOPE,
+    quarantineOfficialManagedPlugins: true,
+    ...runtimeContextOption,
+  })
+  if (!repairResult.ok) {
+    return {
+      ok: false,
+      state,
+      stdout: '',
+      stderr: repairResult.stderr,
+      code: 1,
+      message: repairResult.summary || '飞书官方插件兼容修复失败',
+      pluginReady: false,
+    }
+  }
+
+  if (repairResult.repaired) {
+    state = await getFeishuOfficialPluginState(options)
+    if (!state.configAvailable) {
+      return {
+        ok: false,
+        state,
+        stdout: '',
+        stderr: '当前 OpenClaw 配置读取失败，无法安全同步飞书官方插件配置',
+        code: 1,
+        message: '飞书插件预检查失败',
+        pluginReady: false,
+      }
+    }
+
+    try {
+      const applyAfterRepairResult = await applyNormalizedConfigIfNeeded(state, {
+        applyGatewayPolicy: false,
+      })
+      if (applyAfterRepairResult.applied) {
+        state = await getFeishuOfficialPluginState(options)
+      }
+    } catch (error) {
+      return {
+        ok: false,
+        state,
+        stdout: '',
+        stderr: error instanceof Error ? error.message : String(error),
+        code: 1,
+        message: '飞书插件预检查失败',
+        pluginReady: false,
+      }
+    }
+  }
+
+  return {
+    ok: true,
+    state,
+    stdout: '',
+    stderr: '',
+    code: 0,
+    message: '已完成飞书安装器预检查',
+    pluginReady: isStateReady(state),
   }
 }
 

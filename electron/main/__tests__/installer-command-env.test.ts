@@ -67,4 +67,36 @@ describe('buildInstallerCommandEnv', () => {
     expect(entries).toContain('E:\\QclawRuntime\\npm')
     expect(entries).toContain('E:\\QclawRuntime\\node')
   })
+
+  it('clears stale OpenClaw runtime env and binds the installer to the selected Windows runtime', () => {
+    const snapshot = buildWindowsActiveRuntimeSnapshot({
+      openclawExecutable: 'E:\\QclawRuntime\\npm\\openclaw.cmd',
+      nodeExecutable: 'E:\\QclawRuntime\\node\\node.exe',
+      npmPrefix: 'E:\\QclawRuntime\\npm',
+      configPath: 'E:\\QclawState\\openclaw.json',
+      stateDir: 'E:\\QclawState',
+      extensionsDir: 'E:\\QclawState\\extensions',
+    })
+
+    const env = buildInstallerCommandEnv({
+      platform: 'win32',
+      activeRuntimeSnapshot: snapshot,
+      env: buildTestEnv({
+        PATH: 'C:\\Windows\\System32',
+        OPENCLAW_HOME: 'D:\\OldState',
+        OPENCLAW_STATE_DIR: 'D:\\OldState',
+        OPENCLAW_CONFIG_PATH: 'D:\\OldState\\openclaw.json',
+        CLAWDBOT_STATE_DIR: 'D:\\LegacyState',
+        MOLTBOT_CONFIG_PATH: 'D:\\LegacyState\\openclaw.json',
+        npm_config_prefix: 'D:\\BadPrefix',
+      }),
+    })
+
+    expect(env.OPENCLAW_HOME).toBe('E:\\QclawState')
+    expect(env.OPENCLAW_STATE_DIR).toBe('E:\\QclawState')
+    expect(env.OPENCLAW_CONFIG_PATH).toBe('E:\\QclawState\\openclaw.json')
+    expect(env.CLAWDBOT_STATE_DIR).toBeUndefined()
+    expect(env.MOLTBOT_CONFIG_PATH).toBeUndefined()
+    expect(env.npm_config_prefix).toBeUndefined()
+  })
 })

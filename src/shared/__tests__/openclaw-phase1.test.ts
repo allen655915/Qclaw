@@ -131,6 +131,7 @@ describe('classifyOpenClawPhase1', () => {
     })
 
     expect(result.versionStatus).toBe('outdated')
+    expect(result.canContinue).toBe(false)
     expect(result.canUpgradeInPlace).toBe(true)
   })
 
@@ -144,8 +145,21 @@ describe('classifyOpenClawPhase1', () => {
     })
 
     expect(result.versionStatus).toBe('latest-unknown')
+    expect(result.canContinue).toBe(false)
     expect(result.warnings).toContain('最新版本检查失败，可以先继续使用，稍后再重试。')
     expect(result.warnings.join(' ')).not.toContain('timeout')
+  })
+
+  it('blocks continue when installed version is newer than the detected latest version', () => {
+    const result = classifyOpenClawPhase1(createDiscovery({ version: '2026.5.1' }), {
+      ok: true,
+      latestVersion: '2026.4.12',
+      checkedAt: new Date().toISOString(),
+      source: 'npm-registry',
+    })
+
+    expect(result.versionStatus).toBe('newer')
+    expect(result.canContinue).toBe(false)
   })
 })
 

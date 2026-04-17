@@ -33,6 +33,7 @@ import {
   shouldDisableFeishuInstallerManualInput,
 } from '../shared/feishu-installer-session'
 import { resolveChannelInstallerGuardrailView } from '../lib/channel-installer-guardrail'
+import { getFeishuOfficialPluginStateReady } from '../lib/feishu-official-plugin-auto-sync'
 import type { ChannelInstallerGuardrailStatus } from '../shared/channel-installer-session'
 
 interface FeishuBotManagerModalProps {
@@ -241,13 +242,10 @@ export default function FeishuBotManagerModal({
   )
 
   const refreshFeishuBotsFromConfig = useCallback(async () => {
-    const pluginState = await window.api.getFeishuOfficialPluginState()
+    const pluginStateResult = await getFeishuOfficialPluginStateReady(window.api)
+    const pluginState = pluginStateResult.state
     const normalizedConfig = pluginState.normalizedConfig
-    if (pluginState.configChanged && pluginState.configAvailable !== false) {
-      setFeishuConfigNotice('检测到飞书官方插件配置需要同步。请使用“修复隔离配置”或重新运行新建机器人流程完成显式修复。')
-    } else {
-      setFeishuConfigNotice('')
-    }
+    setFeishuConfigNotice('')
 
     const bots = listFeishuBots(normalizedConfig)
     const drift = detectFeishuIsolationDrift(normalizedConfig)
@@ -1019,7 +1017,7 @@ export default function FeishuBotManagerModal({
         </div>
 
         {feishuConfigNotice && (
-          <Alert color="yellow" variant="light" styles={{ title: { fontSize: 'var(--mantine-font-size-xs)' } }} title="需要显式同步飞书配置">
+          <Alert color="yellow" variant="light" styles={{ title: { fontSize: 'var(--mantine-font-size-xs)' } }} title="飞书配置修复失败">
             <Text size="xs">{feishuConfigNotice}</Text>
           </Alert>
         )}

@@ -82,4 +82,60 @@ describe('installer session command env behavior', () => {
       fs.rmSync(nodeBinDir, { recursive: true, force: true })
     }
   })
+
+  it('prefers the explicit runtime snapshot over a stale selected snapshot on Windows', async () => {
+    const staleRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'qclaw-installer-stale-runtime-'))
+    const freshRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'qclaw-installer-fresh-runtime-'))
+    const staleNpmPrefix = path.join(staleRoot, 'npm')
+    const freshNpmPrefix = path.join(freshRoot, 'npm')
+    const staleNodeDir = path.join(staleRoot, 'node')
+    const freshNodeDir = path.join(freshRoot, 'node')
+    fs.mkdirSync(staleNpmPrefix, { recursive: true })
+    fs.mkdirSync(freshNpmPrefix, { recursive: true })
+    fs.mkdirSync(staleNodeDir, { recursive: true })
+    fs.mkdirSync(freshNodeDir, { recursive: true })
+
+    const staleNpxPath = path.join(staleNpmPrefix, 'npx.cmd')
+    const freshNpxPath = path.join(freshNpmPrefix, 'npx.cmd')
+    fs.writeFileSync(staleNpxPath, '@echo off\r\necho stale\r\n')
+    fs.writeFileSync(freshNpxPath, '@echo off\r\necho fresh\r\n')
+
+    setSelectedWindowsActiveRuntimeSnapshot(
+      buildWindowsActiveRuntimeSnapshot({
+        openclawExecutable: path.join(staleNpmPrefix, 'openclaw.cmd'),
+        nodeExecutable: path.join(staleNodeDir, 'node.exe'),
+        npmPrefix: staleNpmPrefix,
+        configPath: 'C:\\Users\\alice\\.openclaw\\stale.json',
+        stateDir: 'C:\\Users\\alice\\.openclaw-stale',
+        extensionsDir: 'C:\\Users\\alice\\.openclaw-stale\\extensions',
+      })
+    )
+
+    try {
+      const env = buildInstallerCommandEnv({
+        activeRuntimeSnapshot: buildWindowsActiveRuntimeSnapshot({
+          openclawExecutable: path.join(freshNpmPrefix, 'openclaw.cmd'),
+          nodeExecutable: path.join(freshNodeDir, 'node.exe'),
+          npmPrefix: freshNpmPrefix,
+          configPath: 'C:\\Users\\alice\\.openclaw\\fresh.json',
+          stateDir: 'C:\\Users\\alice\\.openclaw-fresh',
+          extensionsDir: 'C:\\Users\\alice\\.openclaw-fresh\\extensions',
+        }),
+        platform: 'win32',
+        env: buildTestEnv({ PATH: 'C:\\Windows\\System32' }),
+      })
+
+      const capability = await probePlatformCommandCapability('npx', {
+        platform: 'win32',
+        env,
+      })
+
+      expect(capability.available).toBe(true)
+      expect(capability.resolvedPath?.toLowerCase()).toBe(freshNpxPath.toLowerCase())
+      expect(capability.resolvedPath?.toLowerCase()).not.toBe(staleNpxPath.toLowerCase())
+    } finally {
+      fs.rmSync(staleRoot, { recursive: true, force: true })
+      fs.rmSync(freshRoot, { recursive: true, force: true })
+    }
+  })
 })

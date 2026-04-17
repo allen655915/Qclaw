@@ -22,6 +22,11 @@ import {
   setActiveProcess,
 } from './command-control'
 import { buildFeishuInstallerPromptHookScript } from './feishu-installer-prompt-hook'
+import {
+  cleanupFeishuInstallerRuntimeBinding,
+  prepareFeishuInstallerRuntimeBinding,
+  type FeishuInstallerRuntimeBinding,
+} from './feishu-installer-runtime-binding'
 import { probePlatformCommandCapability } from './command-capabilities'
 import { ensureFeishuOfficialPluginReady } from './feishu-official-plugin-state'
 import { buildInstallerCommandEnv } from './installer-command-env'
@@ -265,6 +270,30 @@ function buildManagedChannelBusySnapshot(): FeishuInstallerSessionSnapshot {
   })
 }
 
+function normalizeRuntimeSnapshotValue(value: string | null | undefined): string {
+  const normalized = String(value || '').trim()
+  return process.platform === 'win32' ? normalized.toLowerCase() : normalized
+}
+
+function areRuntimeSnapshotsEquivalent(
+  left?: WindowsActiveRuntimeSnapshot | null,
+  right?: WindowsActiveRuntimeSnapshot | null
+): boolean {
+  if (!left && !right) return true
+  if (!left || !right) return false
+
+  return (
+    normalizeRuntimeSnapshotValue(left.configPath) === normalizeRuntimeSnapshotValue(right.configPath) &&
+    normalizeRuntimeSnapshotValue(left.hostPackageRoot) ===
+      normalizeRuntimeSnapshotValue(right.hostPackageRoot) &&
+    normalizeRuntimeSnapshotValue(left.nodePath) === normalizeRuntimeSnapshotValue(right.nodePath) &&
+    normalizeRuntimeSnapshotValue(left.npmPrefix) === normalizeRuntimeSnapshotValue(right.npmPrefix) &&
+    normalizeRuntimeSnapshotValue(left.openclawPath) ===
+      normalizeRuntimeSnapshotValue(right.openclawPath) &&
+    normalizeRuntimeSnapshotValue(left.stateDir) === normalizeRuntimeSnapshotValue(right.stateDir)
+  )
+}
+
 async function resolveFeishuInstallerRuntimeSnapshotPureFailure(): Promise<{
   message: string | null
   snapshot: WindowsActiveRuntimeSnapshot | null
@@ -312,6 +341,10 @@ async function resolveFeishuInstallerPreflightRuntimeContext(
   if (process.platform !== 'win32') {
     return {
       ok: true,
+      pluginReady: false,
+      state: {
+        installedOnDisk: false,
+      },
       guardrail: createFeishuInstallerGuardrail({
         preflight: { state: 'running' },
         runtime: {
@@ -364,6 +397,11 @@ async function resolveFeishuInstallerPreflightRuntimeContext(
 
   return {
     ok: true,
+    pluginReady: false,
+    runtimeSnapshot: runtimeResult.context.snapshot,
+    state: {
+      installedOnDisk: false,
+    },
     guardrail: createFeishuInstallerGuardrail({
       preflight: { state: 'running' },
       runtime: {
@@ -398,54 +436,20 @@ async function runFeishuInstallerPreflight(
     return runtimeContextResult
   }
 
-  const readyResult = await ensureFeishuOfficialPluginReady({
-    runtimeContext: runtimeContextResult.runtimeContext,
-  })
-  if (!readyResult.ok) {
-    const details = [readyResult.message, readyResult.stderr, readyResult.stdout]
-      .map((value) => String(value || '').trim())
-      .filter(Boolean)
-      .join('\n\n')
-    const output = details || '飞书官方插件预检查失败，已阻止启动安装器以避免旧插件或旧配置导致新建机器人失败。'
-    await appendFeishuInstallerDiag('preflight-failed', {
-      reason: 'official-plugin-ready',
-      code: readyResult.code ?? 1,
-      message: readyResult.message || null,
-    })
-    return {
-      ok: false,
-      code: readyResult.code ?? 1,
-      guardrail: mergeChannelInstallerGuardrailStatus(runtimeContextResult.guardrail, {
-        preflight: {
-          state: 'failed',
-          code: 'plugin-preflight-failed',
-          message: output,
-        },
-        config: {
-          state: 'failed',
-          code: 'plugin-preflight-failed',
-          message: output,
-        },
-        failure: {
-          code: 'plugin-preflight-failed',
-          message: output,
-          step: 'config',
-        },
-      }),
-      output,
-    }
-  }
-
   await appendFeishuInstallerDiag('preflight-ok', {
-    installedThisRun: readyResult.installedThisRun,
+    pluginPrepareSkipped: true,
   })
   return {
     ...runtimeContextResult,
+    pluginReady: false,
+    state: {
+      installedOnDisk: false,
+    },
     guardrail: mergeChannelInstallerGuardrailStatus(runtimeContextResult.guardrail, {
       preflight: { state: 'ok' },
       config: {
-        state: 'ok',
-        message: readyResult.message,
+        state: 'skipped',
+        message: '已跳过启动前插件预修复，安装器退出后执行最终同步。',
       },
     }),
   }
@@ -496,6 +500,7 @@ interface ActiveFeishuInstallerSession {
   pendingPromptSocket: Socket | null
   promptBridgeServer: Server | null
   promptSessionToken: string
+  runtimeBinding: FeishuInstallerRuntimeBinding | null
   managedOperationLease: ManagedOperationLease
   gatewayRecoveryAttempted: boolean
   gatewayRecoveryResult: GatewayRecoveryResult | null
@@ -507,6 +512,11 @@ type FeishuInstallerPreflightResult =
   | {
       ok: true
       guardrail: ChannelInstallerGuardrailStatus
+      pluginReady: boolean
+      runtimeSnapshot?: WindowsActiveRuntimeSnapshot | null
+      state: {
+        installedOnDisk: boolean
+      }
       runtimeContext?: {
         configPath?: string
         homeDir?: string
@@ -945,46 +955,6 @@ export async function startFeishuInstallerSession(
     })
   }
 
-  let commandEnv: NodeJS.ProcessEnv
-  try {
-    commandEnv = buildInstallerCommandEnv({
-      activeRuntimeSnapshot: runtimeSnapshotCheck.snapshot || undefined,
-    })
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error)
-    return buildExitedSnapshot({
-      guardrail: failChannelInstallerGuardrailStatus({
-        channelId: FEISHU_MANAGED_CHANNEL_ID,
-        step: 'environment',
-        code: 'env-build-failed',
-        message,
-      }),
-      output: message,
-      command: [...buildFeishuInstallerCommand().command],
-    })
-  }
-
-  const capability = await probePlatformCommandCapability('npx', {
-    platform: process.platform,
-    env: commandEnv,
-  })
-  if (!capability.available) {
-    const message = capability.message || 'npx 命令不可用，无法启动飞书官方安装器。'
-    return buildExitedSnapshot({
-      guardrail: failChannelInstallerGuardrailStatus({
-        channelId: FEISHU_MANAGED_CHANNEL_ID,
-        step: 'command',
-        code: 'command-unavailable',
-        message,
-        patch: {
-          environment: { state: 'ok' },
-        },
-      }),
-      output: message,
-      command: [...buildFeishuInstallerCommand().command],
-    })
-  }
-
   const operationLease = tryAcquireManagedOperationLease(FEISHU_MANAGED_CHANNEL_LOCK_KEY)
   if (!operationLease) {
     return buildManagedChannelBusySnapshot()
@@ -995,8 +965,80 @@ export async function startFeishuInstallerSession(
       return buildSnapshot()
     }
 
-    const preflightResult = await runFeishuInstallerPreflight(runtimeSnapshotCheck.snapshot)
+    let commandEnv: NodeJS.ProcessEnv
+    try {
+      commandEnv = buildInstallerCommandEnv({
+        activeRuntimeSnapshot: runtimeSnapshotCheck.snapshot || undefined,
+      })
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      return buildExitedSnapshot({
+        guardrail: failChannelInstallerGuardrailStatus({
+          channelId: FEISHU_MANAGED_CHANNEL_ID,
+          step: 'environment',
+          code: 'env-build-failed',
+          message,
+          patch: {
+            environment: {
+              state: 'failed',
+              code: 'env-build-failed',
+              message,
+            },
+            lock: {
+              state: 'ok',
+              key: FEISHU_MANAGED_CHANNEL_LOCK_KEY,
+            },
+          },
+        }),
+        output: message,
+        command: [...buildFeishuInstallerCommand().command],
+      })
+    }
+
+    const sessionToken = randomUUID()
+    let runtimeBinding: FeishuInstallerRuntimeBinding
+    try {
+      runtimeBinding = await prepareFeishuInstallerRuntimeBinding({
+        activeRuntimeSnapshot: runtimeSnapshotCheck.snapshot || undefined,
+        baseEnv: commandEnv,
+        platform: process.platform,
+        sessionToken,
+      })
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      return buildExitedSnapshot({
+        guardrail: failChannelInstallerGuardrailStatus({
+          channelId: FEISHU_MANAGED_CHANNEL_ID,
+          step: 'environment',
+          code: 'env-build-failed',
+          message,
+          patch: {
+            environment: {
+              state: 'failed',
+              code: 'env-build-failed',
+              message,
+            },
+            lock: {
+              state: 'ok',
+              key: FEISHU_MANAGED_CHANNEL_LOCK_KEY,
+            },
+          },
+        }),
+        output: message,
+        command: [...buildFeishuInstallerCommand().command],
+      })
+    }
+    const preflightPromise = runFeishuInstallerPreflight(runtimeSnapshotCheck.snapshot)
+    const capabilityPromise = probePlatformCommandCapability('npx', {
+      platform: process.platform,
+      env: runtimeBinding.env,
+    })
+    const [preflightResult, initialCapability] = await Promise.all([
+      preflightPromise,
+      capabilityPromise,
+    ])
     if (!preflightResult.ok) {
+      await cleanupFeishuInstallerRuntimeBinding(runtimeBinding).catch(() => undefined)
       return buildExitedSnapshot({
         code: preflightResult.code ?? 1,
         guardrail: mergeChannelInstallerGuardrailStatus(preflightResult.guardrail, {
@@ -1008,6 +1050,101 @@ export async function startFeishuInstallerSession(
           },
         }),
         output: preflightResult.output,
+        command: [...buildFeishuInstallerCommand().command],
+      })
+    }
+
+    const effectiveRuntimeSnapshot =
+      preflightResult.runtimeSnapshot || runtimeSnapshotCheck.snapshot || undefined
+    let capability = initialCapability
+    if (!areRuntimeSnapshotsEquivalent(effectiveRuntimeSnapshot, runtimeSnapshotCheck.snapshot)) {
+      await cleanupFeishuInstallerRuntimeBinding(runtimeBinding).catch(() => undefined)
+      try {
+        commandEnv = buildInstallerCommandEnv({
+          activeRuntimeSnapshot: effectiveRuntimeSnapshot,
+        })
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        return buildExitedSnapshot({
+          guardrail: mergeChannelInstallerGuardrailStatus(preflightResult.guardrail, {
+            environment: {
+              state: 'failed',
+              code: 'env-build-failed',
+              message,
+            },
+            lock: {
+              state: 'ok',
+              key: FEISHU_MANAGED_CHANNEL_LOCK_KEY,
+            },
+            failure: {
+              code: 'env-build-failed',
+              message,
+              step: 'environment',
+            },
+          }),
+          output: message,
+          command: [...buildFeishuInstallerCommand().command],
+        })
+      }
+
+      try {
+        runtimeBinding = await prepareFeishuInstallerRuntimeBinding({
+          activeRuntimeSnapshot: effectiveRuntimeSnapshot,
+          baseEnv: commandEnv,
+          platform: process.platform,
+          sessionToken,
+        })
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        return buildExitedSnapshot({
+          guardrail: mergeChannelInstallerGuardrailStatus(preflightResult.guardrail, {
+            environment: {
+              state: 'failed',
+              code: 'env-build-failed',
+              message,
+            },
+            lock: {
+              state: 'ok',
+              key: FEISHU_MANAGED_CHANNEL_LOCK_KEY,
+            },
+            failure: {
+              code: 'env-build-failed',
+              message,
+              step: 'environment',
+            },
+          }),
+          output: message,
+          command: [...buildFeishuInstallerCommand().command],
+        })
+      }
+      capability = await probePlatformCommandCapability('npx', {
+        platform: process.platform,
+        env: runtimeBinding.env,
+      })
+    }
+
+    if (!capability.available) {
+      await cleanupFeishuInstallerRuntimeBinding(runtimeBinding).catch(() => undefined)
+      const message = capability.message || 'npx 命令不可用，无法启动飞书官方安装器。'
+      return buildExitedSnapshot({
+        guardrail: mergeChannelInstallerGuardrailStatus(preflightResult.guardrail, {
+          environment: { state: 'ok' },
+          command: {
+            state: 'failed',
+            code: 'command-unavailable',
+            message,
+          },
+          lock: {
+            state: 'ok',
+            key: FEISHU_MANAGED_CHANNEL_LOCK_KEY,
+          },
+          failure: {
+            code: 'command-unavailable',
+            message,
+            step: 'command',
+          },
+        }),
+        output: message,
         command: [...buildFeishuInstallerCommand().command],
       })
     }
@@ -1048,6 +1185,7 @@ export async function startFeishuInstallerSession(
           }),
     })
     if (!stopGatewayResult.ok) {
+      await cleanupFeishuInstallerRuntimeBinding(runtimeBinding).catch(() => undefined)
       return buildExitedSnapshot({
         guardrail: guardrailAfterGatewayStop,
         output: stopGatewayResult.stopResult?.stderr
@@ -1058,7 +1196,6 @@ export async function startFeishuInstallerSession(
       })
     }
 
-    const sessionToken = randomUUID()
     let isolatedNpmCache: Awaited<ReturnType<typeof createIsolatedNpmCacheEnv>> | null = null
     let promptBridgeServer: Server | null = null
 
@@ -1066,23 +1203,28 @@ export async function startFeishuInstallerSession(
       const npmCacheDir = resolveFeishuInstallerNpmCacheDir()
       isolatedNpmCache = await createIsolatedNpmCacheEnv(npmCacheDir)
       const commandResolution = buildFeishuInstallerCommand()
+      const resolvedInstallerCommandPath =
+        capability.resolvedPath || runtimeBinding.npxCommandPath || commandResolution.command[0]
       const promptHookPath = await ensureFeishuInstallerPromptHookFile()
       promptBridgeServer = await createPromptBridgeServer(sessionToken)
       const promptBridgePort = resolvePromptBridgePort(promptBridgeServer)
       const sessionId = randomUUID()
       const diagEnabled = isFeishuInstallerDiagEnabled()
       const diagLogPath = diagEnabled ? await resolveFeishuInstallerDiagLogPath() : ''
+      const installerLaunchNotice = !preflightResult.pluginReady && !preflightResult.state.installedOnDisk
+        ? '[Qclaw] 已跳过启动前插件预修复，安装器已直接启动，退出后会执行最终同步。\n'
+        : ''
 
-      const proc = spawn(commandResolution.command[0], commandResolution.command.slice(1), {
+      const proc = spawn(resolvedInstallerCommandPath, commandResolution.command.slice(1), {
         cwd: resolveSafeWorkingDirectory({
-          env: process.env,
+          env: runtimeBinding.env,
           platform: process.platform,
         }),
         env: {
-          ...commandEnv,
+          ...runtimeBinding.env,
           NO_COLOR: '1',
           FORCE_COLOR: '0',
-          NODE_OPTIONS: appendNodeRequireOption(process.env.NODE_OPTIONS, promptHookPath),
+          NODE_OPTIONS: appendNodeRequireOption(runtimeBinding.env.NODE_OPTIONS, promptHookPath),
           QCLAW_FEISHU_PROMPT_PORT: String(promptBridgePort),
           QCLAW_FEISHU_PROMPT_SESSION_TOKEN: sessionToken,
           ...(diagEnabled
@@ -1102,9 +1244,12 @@ export async function startFeishuInstallerSession(
         id: sessionId,
         process: proc,
         phase: 'running',
-        output: commandResolution.bundledPackagePath
-          ? `[Qclaw] 使用应用内预置飞书安装器包: ${commandResolution.bundledPackagePath}\n`
-          : '',
+        output: [
+          commandResolution.bundledPackagePath
+            ? `[Qclaw] 使用应用内预置飞书安装器包: ${commandResolution.bundledPackagePath}\n`
+            : '',
+          installerLaunchNotice,
+        ].join(''),
         code: null,
         ok: false,
         canceled: false,
@@ -1119,6 +1264,7 @@ export async function startFeishuInstallerSession(
         pendingPromptSocket: null,
         promptBridgeServer,
         promptSessionToken: sessionToken,
+        runtimeBinding,
         managedOperationLease: operationLease,
         gatewayRecoveryAttempted: false,
         gatewayRecoveryResult: null,
@@ -1141,6 +1287,10 @@ export async function startFeishuInstallerSession(
         command: [...commandResolution.command],
         promptBridgePort,
         diagLogPath,
+        boundOpenclawPath: runtimeBinding.shimDir
+          ? path.join(runtimeBinding.shimDir, 'openclaw.cmd')
+          : effectiveRuntimeSnapshot?.openclawPath || runtimeSnapshotCheck.snapshot?.openclawPath || null,
+        runtimeBindingDir: runtimeBinding.cleanupDir || null,
         npmCacheDir: isolatedNpmCache.cacheDir,
         gatewayStoppedForInstall: stopGatewayResult.stopped,
       })
@@ -1235,6 +1385,7 @@ export async function startFeishuInstallerSession(
           gatewayRecoveryOk: recoveryResult.ok,
         })
         releaseSessionManagedOperationLease(session)
+        void cleanupFeishuInstallerRuntimeBinding(session.runtimeBinding)
         void cleanupIsolatedNpmCacheEnv(npmCacheDirForCleanup)
       })
 
@@ -1277,6 +1428,7 @@ export async function startFeishuInstallerSession(
           gatewayRecoveryOk: recoveryResult.ok,
         })
         releaseSessionManagedOperationLease(session)
+        void cleanupFeishuInstallerRuntimeBinding(session.runtimeBinding)
         void cleanupIsolatedNpmCacheEnv(npmCacheDirForCleanup)
       })
 
@@ -1285,6 +1437,7 @@ export async function startFeishuInstallerSession(
       if (promptBridgeServer) {
         promptBridgeServer.close()
       }
+      await cleanupFeishuInstallerRuntimeBinding(runtimeBinding).catch(() => undefined)
       if (isolatedNpmCache) {
         void cleanupIsolatedNpmCacheEnv(isolatedNpmCache.cacheDir)
       }

@@ -13,6 +13,8 @@ describe('managed-installer-env', () => {
     expect(shouldDropManagedInstallerEnvKey('YARN_CACHE_FOLDER')).toBe(true)
     expect(shouldDropManagedInstallerEnvKey('VOLTA_HOME')).toBe(true)
     expect(shouldDropManagedInstallerEnvKey('ASDF_DIR')).toBe(true)
+    expect(shouldDropManagedInstallerEnvKey('NVM_HOME', { platform: 'darwin' })).toBe(true)
+    expect(shouldDropManagedInstallerEnvKey('NVM_HOME', { platform: 'win32' })).toBe(false)
   })
 
   it('keeps network proxy variables while removing installer pollution', () => {
@@ -39,5 +41,27 @@ describe('managed-installer-env', () => {
     expect(sanitized.npm_config_registry).toBeUndefined()
     expect(sanitized.NPM_CONFIG_CACHE).toBeUndefined()
     expect(sanitized.YARN_CACHE_FOLDER).toBeUndefined()
+  })
+
+  it('preserves nvm-windows environment on Windows while still removing package manager pollution', () => {
+    const sanitized = sanitizeManagedInstallerEnv(
+      buildTestEnv({
+        PATH: 'D:\\Programs\\nodejs;C:\\Windows\\System32',
+        NVM_HOME: 'D:\\Programs\\nvm',
+        NVM_SYMLINK: 'D:\\Programs\\nodejs',
+        NVM_NODEJS_ORG_MIRROR: 'https://npmmirror.com/mirrors/node/',
+        npm_config_registry: 'https://bad.example.com',
+        NPM_CONFIG_PREFIX: 'D:\\bad-prefix',
+      }),
+      {
+        platform: 'win32',
+      }
+    )
+
+    expect(sanitized.NVM_HOME).toBe('D:\\Programs\\nvm')
+    expect(sanitized.NVM_SYMLINK).toBe('D:\\Programs\\nodejs')
+    expect(sanitized.NVM_NODEJS_ORG_MIRROR).toBe('https://npmmirror.com/mirrors/node/')
+    expect(sanitized.npm_config_registry).toBeUndefined()
+    expect(sanitized.NPM_CONFIG_PREFIX).toBeUndefined()
   })
 })

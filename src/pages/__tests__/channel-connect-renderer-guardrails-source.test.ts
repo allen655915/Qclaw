@@ -27,14 +27,15 @@ describe('ChannelConnect renderer guardrails', () => {
     expect(source).toContain('setWeixinInstallerGuardrail(payload.guardrail || null)')
   })
 
-  it('does not silently heal Feishu config from background refresh paths', () => {
+  it('auto syncs Feishu config drift before surfacing refresh state', () => {
     const source = readChannelConnectSource()
 
-    expect(source).not.toContain('channel-connect-feishu-sync-config')
-    expect(source).not.toContain('channel-connect-feishu-auto-recovery-heal')
-    expect(source).not.toContain('Keep using the normalized in-memory state even if self-healing writes fail.')
-    expect(source).toContain('不会在后台静默写入 managed channel 配置')
-    expect(source).toContain('需要显式同步')
+    expect(source).toContain("import { getFeishuOfficialPluginStateReady } from '../lib/feishu-official-plugin-auto-sync'")
+    expect(source).toContain('const syncResult = await getFeishuOfficialPluginStateReady(window.api)')
+    expect(source).toContain('autoSyncBlockedByInstaller: syncResult.blockedByActiveInstaller')
+    expect(source).toContain('当前飞书安装流程仍在运行，Qclaw 会在流程结束后自动同步配置。')
+    expect(source).not.toContain('不会在后台静默写入 managed channel 配置')
+    expect(source).not.toContain('需要显式同步')
   })
 
   it('lets the Weixin backend installer own managed plugin preflight state', () => {

@@ -31,6 +31,7 @@ import {
   extractFirstHttpUrl,
   FEISHU_OFFICIAL_GUIDE_URL,
 } from '../lib/feishu-installer'
+import { getFeishuOfficialPluginStateReady } from '../lib/feishu-official-plugin-auto-sync'
 import {
   buildFeishuCreateBotConfirmationMessage,
   isFeishuCreateBotConfirmationPrompt,
@@ -1862,14 +1863,9 @@ export default function ChannelConnect({
     []
   )
 
-  const loadFeishuSetupState = useCallback(async (options?: { syncConfig?: boolean }) => {
-    const pluginState = await window.api.getFeishuOfficialPluginState()
-    if (options?.syncConfig && pluginState.configChanged && pluginState.configAvailable !== false) {
-      setFeishuInstallerNotice((current) =>
-        current || '检测到飞书官方插件配置需要同步。Qclaw 不会在后台静默写入 managed channel 配置；请继续完成当前配置流程或重新运行修复。'
-      )
-    }
-
+  const loadFeishuSetupState = useCallback(async () => {
+    const syncResult = await getFeishuOfficialPluginStateReady(window.api)
+    const pluginState = syncResult.state
     const normalizedConfig = pluginState.normalizedConfig
     const bots = listFeishuBots(normalizedConfig)
     setFeishuOfficialPluginInstalled(pluginState.installedOnDisk)
@@ -1878,23 +1874,38 @@ export default function ChannelConnect({
     if (bots.length === 0) {
       setPairingStatusByBot({})
       setCanSkip(false)
-      return { pluginState, bots }
+      return {
+        pluginState,
+        bots,
+        configSynced: syncResult.synced,
+        autoSyncBlockedByInstaller: syncResult.blockedByActiveInstaller,
+      }
     }
 
     const pairingStatus = await window.api.pairingFeishuStatus(bots.map((bot) => bot.accountId)).catch(() => null)
     if (!pairingStatus) {
       setPairingStatusByBot({})
       setCanSkip(false)
-      return { pluginState, bots }
+      return {
+        pluginState,
+        bots,
+        configSynced: syncResult.synced,
+        autoSyncBlockedByInstaller: syncResult.blockedByActiveInstaller,
+      }
     }
 
     setPairingStatusByBot(pairingStatus)
     setCanSkip(shouldShowSkipButtonForFeishuPairing(pairingStatus))
-    return { pluginState, bots }
+    return {
+      pluginState,
+      bots,
+      configSynced: syncResult.synced,
+      autoSyncBlockedByInstaller: syncResult.blockedByActiveInstaller,
+    }
   }, [])
 
   const refreshFeishuBotsFromConfig = useCallback(async () => {
-    return loadFeishuSetupState({ syncConfig: true })
+    return loadFeishuSetupState()
   }, [loadFeishuSetupState])
 
   const hydrateFeishuPairingAllowFromConfig = useCallback(async (config: Record<string, any>) => {
@@ -1971,7 +1982,7 @@ export default function ChannelConnect({
       setRefreshingFeishuState(true)
       try {
         const [setupState, installerSnapshot] = await Promise.all([
-          loadFeishuSetupState({ syncConfig: true }),
+          loadFeishuSetupState(),
           window.api.getFeishuInstallerState().catch(() => null),
         ])
 
@@ -2040,9 +2051,9 @@ export default function ChannelConnect({
             }
           } else if (recoveryTarget === 'heal-config') {
             setConfigRecoveredFeishuCreateReady(false)
-            setFeishuInstallerNotice(
-              '检测到飞书官方插件配置需要显式同步。请点击“关联已有机器人”完成同步，或重新运行新建流程。'
-            )
+            if (setupState.autoSyncBlockedByInstaller) {
+              setFeishuInstallerNotice('当前飞书安装流程仍在运行，Qclaw 会在流程结束后自动同步配置。')
+            }
           } else if (setupState.pluginState.installedOnDisk) {
             setConfigRecoveredFeishuCreateReady(false)
             setFeishuInstallerNotice(
@@ -2098,7 +2109,7 @@ export default function ChannelConnect({
             applyFeishuInstallerSnapshot(installerSnapshot)
           }
 
-          let setupState = await loadFeishuSetupState({ syncConfig: false })
+          let setupState = await loadFeishuSetupState()
           let recoveryTarget = resolveFeishuAutoRecoveryTarget({
             setupMode,
             pluginState: setupState.pluginState,
@@ -2108,9 +2119,6 @@ export default function ChannelConnect({
           })
 
           if (recoveryTarget === 'heal-config') {
-            setFeishuInstallerNotice((current) =>
-              current || '检测到飞书官方插件配置需要显式同步。请点击“完成配置”或重新运行新建流程。'
-            )
             recoveryTarget = 'wait'
           }
 
@@ -2770,7 +2778,7 @@ export default function ChannelConnect({
           ? 'channel-connect-feishu-finish-create'
           : 'channel-connect-feishu-finish-link'
       )
-      await loadFeishuSetupState({ syncConfig: false })
+      await loadFeishuSetupState()
 
       if (!pairingTarget && feishuBotSetupMode === 'create') {
         pairingTarget = resolveFeishuPairingTarget({
@@ -2847,7 +2855,7 @@ export default function ChannelConnect({
         )
       }
 
-      await loadFeishuSetupState({ syncConfig: false })
+      await loadFeishuSetupState()
       onNext({
         channelId: 'feishu',
         accountId: pairingTarget?.accountId,

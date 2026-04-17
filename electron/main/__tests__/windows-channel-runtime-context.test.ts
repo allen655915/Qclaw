@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 
 import { resolveWindowsChannelRuntimeContext } from '../platforms/windows/windows-channel-runtime-context'
 import { buildWindowsActiveRuntimeSnapshot } from '../platforms/windows/windows-runtime-policy'
+import { PINNED_OPENCLAW_VERSION } from '../../../src/shared/openclaw-version-policy'
 import {
   clearSelectedWindowsActiveRuntimeSnapshot,
   setSelectedWindowsActiveRuntimeSnapshot,
@@ -66,6 +67,7 @@ describe('resolveWindowsChannelRuntimeContext', () => {
     const result = await resolveWindowsChannelRuntimeContext({
       caller: 'channel-preflight',
       platform: 'win32',
+      probeOpenClawVersion: async () => PINNED_OPENCLAW_VERSION,
     })
 
     expect(result.ok).toBe(true)
@@ -110,16 +112,148 @@ describe('resolveWindowsChannelRuntimeContext', () => {
       caller: 'channel-preflight',
       platform: 'win32',
       snapshot,
+      runVersionAutoRepair: async () => ({
+        ok: false,
+        message: 'upgrade unavailable in test',
+      }),
     })
 
     expect(result).toMatchObject({
       ok: false,
       context: null,
+      message: 'upgrade unavailable in test',
       bridge: {
         ok: false,
         diagnosticSeverity: 'error',
         failureKind: 'version_mismatch',
+        message: 'upgrade unavailable in test',
         packageVersion: '2026.3.24',
+      },
+    })
+  })
+
+  itOnWindows('auto-repairs when the selected openclaw executable version is stale', async () => {
+    const stateDir = await createTempDir('qclaw-win-runtime-context-repair-')
+    const hostRootParent = await createTempDir('qclaw-win-runtime-context-host-repair-')
+    const hostPackageRoot = path.join(hostRootParent, 'node_modules', 'openclaw')
+    await writeHostOpenClawPackage(hostPackageRoot, PINNED_OPENCLAW_VERSION)
+
+    const snapshot = buildWindowsActiveRuntimeSnapshot({
+      configPath: path.join(stateDir, 'openclaw.json'),
+      extensionsDir: path.join(stateDir, 'extensions'),
+      hostPackageRoot,
+      nodeExecutable: 'C:\\Users\\alice\\AppData\\Local\\Qclaw\\runtime\\win32\\node\\v24.14.1\\node.exe',
+      npmPrefix: 'C:\\Users\\alice\\AppData\\Local\\Qclaw\\runtime\\win32\\node\\v24.14.1',
+      openclawExecutable: 'C:\\Users\\alice\\AppData\\Local\\Qclaw\\runtime\\win32\\node\\v24.14.1\\openclaw.cmd',
+      stateDir,
+    })
+
+    let repairAttempts = 0
+    let probeAttempts = 0
+    const result = await resolveWindowsChannelRuntimeContext({
+      caller: 'channel-preflight',
+      platform: 'win32',
+      snapshot,
+      probeOpenClawVersion: async () => {
+        probeAttempts += 1
+        return probeAttempts === 1 ? '2026.2.21' : PINNED_OPENCLAW_VERSION
+      },
+      runVersionAutoRepair: async () => {
+        repairAttempts += 1
+        return { ok: true }
+      },
+      refreshSnapshotAfterRepair: async () => snapshot,
+    })
+
+    expect(repairAttempts).toBe(1)
+    expect(probeAttempts).toBe(2)
+    expect(result.ok).toBe(true)
+    if (!result.ok) throw new Error(result.message)
+    expect(result.context.openclawVersion).toBe(PINNED_OPENCLAW_VERSION)
+    expect(result.context.bridge).toMatchObject({
+      ok: true,
+      packageVersion: PINNED_OPENCLAW_VERSION,
+    })
+  })
+
+  itOnWindows('surfaces a hard failure when automatic version repair cannot fix a stale executable', async () => {
+    const stateDir = await createTempDir('qclaw-win-runtime-context-stale-fail-')
+    const hostRootParent = await createTempDir('qclaw-win-runtime-context-host-stale-fail-')
+    const hostPackageRoot = path.join(hostRootParent, 'node_modules', 'openclaw')
+    await writeHostOpenClawPackage(hostPackageRoot, PINNED_OPENCLAW_VERSION)
+
+    const snapshot = buildWindowsActiveRuntimeSnapshot({
+      configPath: path.join(stateDir, 'openclaw.json'),
+      extensionsDir: path.join(stateDir, 'extensions'),
+      hostPackageRoot,
+      nodeExecutable: 'C:\\Users\\alice\\AppData\\Local\\Qclaw\\runtime\\win32\\node\\v24.14.1\\node.exe',
+      npmPrefix: 'C:\\Users\\alice\\AppData\\Local\\Qclaw\\runtime\\win32\\node\\v24.14.1',
+      openclawExecutable: 'C:\\Users\\alice\\AppData\\Local\\Qclaw\\runtime\\win32\\node\\v24.14.1\\openclaw.cmd',
+      stateDir,
+    })
+
+    const result = await resolveWindowsChannelRuntimeContext({
+      caller: 'channel-preflight',
+      platform: 'win32',
+      snapshot,
+      probeOpenClawVersion: async () => '2026.2.21',
+      runVersionAutoRepair: async () => ({
+        ok: false,
+        message: 'upgrade failed',
+      }),
+    })
+
+    expect(result).toMatchObject({
+      ok: false,
+      context: null,
+      message: 'upgrade failed',
+      bridge: {
+        ok: false,
+        diagnosticSeverity: 'error',
+        failureKind: 'version_mismatch',
+        message: 'upgrade failed',
+        packageVersion: '2026.2.21',
+      },
+    })
+  })
+
+  itOnWindows('fails closed when the selected openclaw executable version cannot be determined', async () => {
+    const stateDir = await createTempDir('qclaw-win-runtime-context-probe-fail-')
+    const hostRootParent = await createTempDir('qclaw-win-runtime-context-host-probe-fail-')
+    const hostPackageRoot = path.join(hostRootParent, 'node_modules', 'openclaw')
+    await writeHostOpenClawPackage(hostPackageRoot, PINNED_OPENCLAW_VERSION)
+
+    const snapshot = buildWindowsActiveRuntimeSnapshot({
+      configPath: path.join(stateDir, 'openclaw.json'),
+      extensionsDir: path.join(stateDir, 'extensions'),
+      hostPackageRoot,
+      nodeExecutable: 'C:\\Users\\alice\\AppData\\Local\\Qclaw\\runtime\\win32\\node\\v24.14.1\\node.exe',
+      npmPrefix: 'C:\\Users\\alice\\AppData\\Local\\Qclaw\\runtime\\win32\\node\\v24.14.1',
+      openclawExecutable: 'C:\\Users\\alice\\AppData\\Local\\Qclaw\\runtime\\win32\\node\\v24.14.1\\openclaw.cmd',
+      stateDir,
+    })
+
+    const result = await resolveWindowsChannelRuntimeContext({
+      caller: 'channel-preflight',
+      platform: 'win32',
+      snapshot,
+      probeOpenClawVersion: async () => null,
+      runVersionAutoRepair: async () => ({
+        ok: false,
+        message: 'version probe failed',
+      }),
+    })
+
+    expect(result).toMatchObject({
+      ok: false,
+      context: null,
+      message: 'version probe failed',
+      bridge: {
+        ok: false,
+        diagnosticSeverity: 'error',
+        failureKind: 'version_probe_failed',
+        message: 'version probe failed',
+        packageVersion: PINNED_OPENCLAW_VERSION,
       },
     })
   })

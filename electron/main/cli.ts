@@ -179,6 +179,7 @@ import {
 } from './openclaw-elevated-lifecycle-transaction'
 import { sanitizeManagedInstallerEnv } from './managed-installer-env'
 import { cleanupIsolatedNpmCacheEnv, createIsolatedNpmCacheEnv } from './npm-cache-env'
+import { buildNodeDownloadUrlCandidates } from './node-download-sources'
 import { pollWithBackoff } from '../../src/shared/polling'
 import { PINNED_OPENCLAW_VERSION, resolveOpenClawVersionEnforcement } from '../../src/shared/openclaw-version-policy'
 import { runPluginRepairPreflight } from './plugin-repair-preflight'
@@ -3746,42 +3747,64 @@ export async function resolveNodeInstallPlan(): Promise<NodeInstallPlan> {
 }
 
 async function downloadFile(url: string, destPath: string): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const file = createWriteStream(destPath)
-    const request = https.get(url, (response) => {
-      // Handle redirects
-      if (response.statusCode === 302 || response.statusCode === 301) {
-        const redirectUrl = response.headers.location
-        if (redirectUrl) {
+  const attempts: string[] = []
+  let lastError: Error | null = null
+
+  const downloadFileOnce = async (candidateUrl: string): Promise<void> =>
+    new Promise((resolve, reject) => {
+      const file = createWriteStream(destPath)
+      const request = https.get(candidateUrl, (response) => {
+        // Handle redirects
+        if (response.statusCode === 302 || response.statusCode === 301) {
+          const redirectUrl = response.headers.location
+          if (redirectUrl) {
+            file.close()
+            downloadFile(redirectUrl, destPath).then(resolve).catch(reject)
+            return
+          }
+        }
+
+        if (response.statusCode !== 200) {
           file.close()
-          downloadFile(redirectUrl, destPath).then(resolve).catch(reject)
+          reject(new Error(`Download failed with status ${response.statusCode}`))
           return
         }
-      }
 
-      if (response.statusCode !== 200) {
-        file.close()
-        reject(new Error(`Download failed with status ${response.statusCode}`))
-        return
-      }
+        response.pipe(file)
+        file.on('finish', () => {
+          file.close()
+          resolve()
+        })
+      })
 
-      response.pipe(file)
-      file.on('finish', () => {
+      request.on('error', (err) => {
         file.close()
-        resolve()
+        reject(err)
+      })
+
+      request.setTimeout(MAIN_RUNTIME_POLICY.node.installerDownloadTimeoutMs, () => {
+        request.destroy()
+        reject(new Error('Download timeout'))
       })
     })
 
-    request.on('error', (err) => {
-      file.close()
-      reject(err)
-    })
+  for (const candidateUrl of buildNodeDownloadUrlCandidates(url)) {
+    try {
+      await unlink(destPath).catch(() => undefined)
+      await downloadFileOnce(candidateUrl)
+      return
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      attempts.push(`${candidateUrl} -> ${message}`)
+      lastError = error instanceof Error ? error : new Error(message)
+    }
+  }
 
-    request.setTimeout(MAIN_RUNTIME_POLICY.node.installerDownloadTimeoutMs, () => {
-      request.destroy()
-      reject(new Error('Download timeout'))
-    })
-  })
+  if (attempts.length > 1) {
+    throw new Error(`Download failed across mirrors:\n${attempts.join('\n')}`)
+  }
+
+  throw lastError || new Error('Download failed')
 }
 
 async function installNodeWithAdmin(installerPath: string): Promise<CliResult> {

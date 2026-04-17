@@ -350,6 +350,54 @@ describe('getFeishuOfficialPluginState', () => {
     }
   })
 
+  it('skips preinstalling the official plugin when the installer preflight only needs a safe launch state', async () => {
+    getOpenClawPathsMock.mockResolvedValue({
+      homeDir: '/Users/alice/.openclaw',
+    })
+    readConfigMock.mockResolvedValue({
+      channels: {
+        feishu: {
+          enabled: true,
+          appId: 'cli_default',
+          appSecret: 'secret-default',
+        },
+      },
+      plugins: {
+        allow: ['feishu'],
+      },
+    })
+
+    const fs = process.getBuiltinModule('node:fs') as typeof import('node:fs')
+    const accessSpy = vi
+      .spyOn(fs.promises, 'access')
+      .mockRejectedValue(new Error('missing'))
+
+    try {
+      const { prepareFeishuOfficialPluginForInstaller } = await import('../feishu-official-plugin-state')
+      const result = await prepareFeishuOfficialPluginForInstaller()
+
+      expect(result.ok).toBe(true)
+      expect(result.pluginReady).toBe(false)
+      expect(result.state.installedOnDisk).toBe(false)
+      expect(repairIncompatibleExtensionPluginsMock).toHaveBeenCalledWith({
+        scopePluginIds: ['openclaw-lark', 'feishu', 'feishu-openclaw-plugin'],
+        quarantineOfficialManagedPlugins: true,
+      })
+      expect(reconcileManagedPluginConfigMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          channelId: 'feishu',
+          apply: true,
+          applyGatewayPolicy: false,
+          scope: 'plugins-only',
+        })
+      )
+      expect(installPluginNpxMock).not.toHaveBeenCalled()
+      expect(reloadGatewayForConfigChangeMock).not.toHaveBeenCalled()
+    } finally {
+      accessSpy.mockRestore()
+    }
+  })
+
   it('installs the official plugin on demand when it is missing for link preparation', async () => {
     getOpenClawPathsMock.mockResolvedValue({
       homeDir: '/Users/alice/.openclaw',

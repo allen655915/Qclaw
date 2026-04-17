@@ -4,20 +4,21 @@ const fs = process.getBuiltinModule('node:fs') as typeof import('node:fs')
 const path = process.getBuiltinModule('node:path') as typeof import('node:path')
 
 describe('FeishuBotManagerModal renderer guardrails', () => {
-  it('renders installer guardrails and avoids background config healing writes', () => {
+  it('renders installer guardrails and auto syncs Feishu config before listing bots', () => {
     const source = fs.readFileSync(
       path.join(process.cwd(), 'src', 'components', 'FeishuBotManagerModal.tsx'),
       'utf8'
     )
 
     expect(source).toContain("import { resolveChannelInstallerGuardrailView } from '../lib/channel-installer-guardrail'")
+    expect(source).toContain("import { getFeishuOfficialPluginStateReady } from '../lib/feishu-official-plugin-auto-sync'")
     expect(source).toContain('const [feishuConfigNotice, setFeishuConfigNotice] = useState')
     expect(source).toContain('const [feishuInstallerGuardrail, setFeishuInstallerGuardrail]')
     expect(source).toContain('setFeishuInstallerGuardrail(snapshot.guardrail || null)')
     expect(source).toContain('setFeishuInstallerGuardrail(payload.guardrail || null)')
-    expect(source).toContain('需要显式同步飞书配置')
-    expect(source).not.toContain('Keep the in-memory list even if background healing fails')
-    expect(source).not.toContain('background healing')
+    expect(source).toContain('const pluginStateResult = await getFeishuOfficialPluginStateReady(window.api)')
+    expect(source).toContain('title="飞书配置修复失败"')
+    expect(source).not.toContain('需要显式同步飞书配置')
   })
 
   it('retains owned successful exits long enough to finalize on reopen while still clearing unrelated stale sessions', () => {

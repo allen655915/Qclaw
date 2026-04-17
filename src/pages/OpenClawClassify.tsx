@@ -8,8 +8,10 @@ import type {
 } from '../shared/openclaw-phase1'
 import {
   classifyOpenClawPhase1,
+  compareLooseVersions,
   shouldRouteToSetupAfterPhase1,
 } from '../shared/openclaw-phase1'
+import { PINNED_OPENCLAW_VERSION } from '../shared/openclaw-version-policy'
 
 export default function OpenClawClassify({
   discovery,
@@ -58,6 +60,11 @@ export default function OpenClawClassify({
   const setupRequired = shouldRouteToSetupAfterPhase1(envSummary)
 
   const activeCandidate = classification.activeCandidate
+  const matchesPinnedVersion = Boolean(
+    activeCandidate &&
+    compareLooseVersions(activeCandidate.version, PINNED_OPENCLAW_VERSION) === 0
+  )
+  const canEnterDashboard = !setupRequired && matchesPinnedVersion
   const handleRefreshLatestVersion = () => {
     if (!discovery.activeCandidateId || checkingLatest) return
     setLatestCheckAttempt((current) => current + 1)
@@ -139,9 +146,9 @@ export default function OpenClawClassify({
             继续配置
           </Button>
         </div>
-      ) : classification.versionStatus === 'equal' ? (
+      ) : classification.versionStatus === 'equal' && canEnterDashboard ? (
         <div className="mt-5 rounded-xl border border-emerald-500/30 bg-emerald-500/10 p-4">
-          <Title order={3} size="sm" fw={500} c="var(--mantine-color-success-3)">当前 OpenClaw 已与最新版本一致</Title>
+          <Title order={3} size="sm" fw={500} c="var(--mantine-color-success-3)">当前 OpenClaw 已与固定支持版本一致</Title>
           <Text size="sm" lh="1.625" mt="xs" style={{ color: 'rgba(167, 243, 208, 0.85)' }}>
             Qclaw 不会改写你现有的安装，只会作为监控与控制面板使用。
           </Text>
@@ -155,42 +162,25 @@ export default function OpenClawClassify({
           </Button>
         </div>
       ) : classification.versionStatus === 'outdated' ? (
-        <div className="mt-5 grid gap-4 md:grid-cols-2">
-          <div className="rounded-xl border app-border app-bg-tertiary p-4">
-            <Title order={3} size="sm" fw={500} c="var(--app-text-primary)">选项 1：仅接管，不升级</Title>
-            <Text size="sm" lh="1.625" mt="xs" c="var(--app-text-tertiary)">
-              保留当前版本，可以先进入控制面板查看和使用，稍后再决定是否升级。
-            </Text>
-            <Button
-              onClick={() => onProceed('dashboard')}
-              variant="default"
-              mt="md"
-              size="sm"
-            >
-              仅接管当前版本
-            </Button>
-          </div>
-
-          <div className="rounded-xl border border-amber-500/30 bg-amber-500/10 p-4">
-            <Title order={3} size="sm" fw={500} c="warning.3">选项 2：升级现有安装</Title>
-            <Text size="sm" lh="1.625" mt="xs" style={{ color: 'rgba(254, 243, 199, 0.85)' }}>
-              升级会保留原位置、原配置和原记忆数据，不会新装第二份 OpenClaw。若当前来源无法安全自动升级，升级中心会明确告诉你原因。
-            </Text>
-            <Button
-              onClick={() => onProceed('dashboard', { openUpdateCenter: true })}
-              color="warning"
-              mt="md"
-              size="sm"
-            >
-              升级当前安装
-            </Button>
-          </div>
+        <div className="mt-5 rounded-xl border border-amber-500/30 bg-amber-500/10 p-4">
+          <Title order={3} size="sm" fw={500} c="warning.3">当前 OpenClaw 尚未达到固定支持版本</Title>
+          <Text size="sm" lh="1.625" mt="xs" style={{ color: 'rgba(254, 243, 199, 0.85)' }}>
+            Qclaw 目前只允许 OpenClaw {PINNED_OPENCLAW_VERSION} 进入控制面板。请先完成升级，再继续后续流程。
+          </Text>
+          <Button
+            onClick={() => onProceed('setup')}
+            color="warning"
+            mt="md"
+            size="sm"
+          >
+            继续配置
+          </Button>
         </div>
       ) : classification.versionStatus === 'latest-unknown' ? (
         <div className="mt-5 rounded-xl border border-amber-500/30 bg-amber-500/10 p-4">
           <Title order={3} size="sm" fw={500} c="warning.3">已检测到 OpenClaw，但最新版本暂时未知</Title>
           <Text size="sm" lh="1.625" mt="xs" style={{ color: 'rgba(254, 243, 199, 0.85)' }}>
-            目前暂时无法确认最新版本，可能是网络连接异常。可以先进入控制面板，后续再检查更新。
+            当前还不能确认本机 OpenClaw 是否为 {PINNED_OPENCLAW_VERSION}，因此暂不允许进入控制面板。请先刷新版本信息并完成升级确认。
           </Text>
           <div className="mt-4 flex flex-wrap gap-3">
             <Button
@@ -204,12 +194,12 @@ export default function OpenClawClassify({
               {checkingLatest ? '正在重新检测...' : '刷新版本信息'}
             </Button>
             <Button
-              onClick={() => onProceed('dashboard')}
+              onClick={() => onProceed('setup')}
               color="warning"
               size="sm"
               mt="md"
             >
-              继续进入控制面板
+              继续配置
             </Button>
           </div>
         </div>
@@ -217,10 +207,10 @@ export default function OpenClawClassify({
         <div className="mt-5 rounded-xl border app-border app-bg-tertiary p-4">
           <Title order={3} size="sm" fw={500} c="var(--app-text-primary)">下一步</Title>
           <Text size="sm" lh="1.625" mt="xs" c="var(--app-text-tertiary)">
-            当前状态不影响继续使用，可以先进入控制面板，后续再处理升级或修复。
+            当前版本还没有通过固定版本校验，需先处理升级或修复后再继续。
           </Text>
           <Button
-            onClick={() => onProceed(activeCandidate ? 'dashboard' : 'setup')}
+            onClick={() => onProceed('setup')}
             color="success"
             mt="md"
             size="sm"

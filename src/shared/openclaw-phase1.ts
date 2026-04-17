@@ -375,7 +375,7 @@ export function classifyOpenClawPhase1(
       versionStatus: 'latest-unknown',
       activeCandidate,
       latestVersion: null,
-      canContinue: true,
+      canContinue: false,
       canUpgradeInPlace: false,
       warnings: [
         ...discovery.warnings,
@@ -392,7 +392,7 @@ export function classifyOpenClawPhase1(
     versionStatus,
     activeCandidate,
     latestVersion: latestCheck.latestVersion,
-    canContinue: true,
+    canContinue: versionStatus === 'equal',
     canUpgradeInPlace: versionStatus === 'outdated' && isUpgradeableInstallSource(activeCandidate.installSource),
     warnings: [...discovery.warnings],
   }
