@@ -1429,6 +1429,185 @@ export function joinModelCenterNonBlockingMessages(...messages: Array<string | n
     .join('；另外')
 }
 
+interface PostAuthDefaultModelApplyLikeResult {
+  ok?: boolean
+  modelApplied?: boolean
+  message?: string
+}
+
+interface PostAuthGatewayEnsureLikeResult {
+  ok?: boolean
+  running?: boolean
+  stateCode?: string
+  summary?: string
+  stderr?: string
+  reasonDetail?: {
+    code?: string
+    message?: string
+  } | null
+}
+
+export const POST_AUTH_GATEWAY_PENDING_MESSAGE =
+  '认证已完成，模型配置已保存，但网关仍在启动或确认最新配置，请稍后重试或点击刷新后继续。'
+const POST_AUTH_INITIAL_MODEL_APPLY_WAIT_MESSAGE =
+  '首次配置模型需要 4-5 分钟，请耐心等待。 弹出黑色的命令行窗口是正常的，配置完成后重启电脑通常可以解决。'
+
+const POST_AUTH_GATEWAY_NON_TIMEOUT_STATE_CODES = new Set([
+  'service_missing',
+  'service_install_failed',
+  'service_loaded_but_stale',
+  'gateway_not_running',
+  'port_conflict_same_gateway',
+  'port_conflict_foreign_process',
+  'token_mismatch',
+  'websocket_1006',
+  'auth_missing',
+  'plugin_allowlist_warning',
+  'plugin_load_failure',
+  'config_invalid',
+  'network_blocked',
+])
+
+function sleep(ms: number): Promise<void> {
+  if (!(ms > 0)) return Promise.resolve()
+  return new Promise<void>((resolve) => setTimeout(resolve, ms))
+}
+
+function isPostAuthGatewayEnsureTimeoutLike(
+  result: PostAuthGatewayEnsureLikeResult | null | undefined
+): boolean {
+  if (!result || result.ok === true || result.running === true) return false
+
+  const stateCode = String(result.stateCode || '').trim().toLowerCase()
+  if (stateCode && POST_AUTH_GATEWAY_NON_TIMEOUT_STATE_CODES.has(stateCode)) {
+    return false
+  }
+  if (stateCode && stateCode !== 'unknown_runtime_failure') {
+    return false
+  }
+
+  const reasonCode = String(result.reasonDetail?.code || '').trim()
+  if (reasonCode) return false
+
+  const corpus = [result.summary, result.stderr]
+    .map((value) => String(value || '').trim())
+    .filter(Boolean)
+    .join('\n')
+
+  return /尚未完成就绪确认|仍未确认|仍在启动|确认最新配置/.test(corpus)
+}
+
+function resolvePostAuthGatewayEnsureErrorMessage(
+  result: PostAuthGatewayEnsureLikeResult | null | undefined
+): string {
+  const reasonMessage = String(result?.reasonDetail?.message || '').trim()
+  if (reasonMessage) return reasonMessage
+
+  const summary = String(result?.summary || '').trim()
+  if (summary) return summary
+
+  const stderr = String(result?.stderr || '').trim()
+  if (stderr) return stderr
+
+  return POST_AUTH_GATEWAY_PENDING_MESSAGE
+}
+
+function formatPostAuthGatewayRetryStatus(attempt: number): string {
+  if (attempt <= 1) {
+    return POST_AUTH_INITIAL_MODEL_APPLY_WAIT_MESSAGE
+  }
+
+  return `${POST_AUTH_INITIAL_MODEL_APPLY_WAIT_MESSAGE}（第 ${attempt} 次重试）`
+}
+
+export async function resolvePostAuthDefaultModelApplyRecovery(params: {
+  applyResult: PostAuthDefaultModelApplyLikeResult | null | undefined
+  ensureGatewayRunning?: (options?: {
+    skipRuntimePrecheck?: boolean
+  }) => Promise<PostAuthGatewayEnsureLikeResult>
+  shouldAbort?: () => boolean
+  onRetryAttempt?: (attempt: number) => void
+  retryDelayMs?: number
+}): Promise<{
+  canContinue: boolean
+  errorMessage: string
+}> {
+  const applyResult = params.applyResult
+  if (applyResult?.ok) {
+    return {
+      canContinue: true,
+      errorMessage: '',
+    }
+  }
+
+  if (applyResult?.modelApplied !== true) {
+    const applyFailureMessage = String(applyResult?.message || '').trim()
+    return {
+      canContinue: false,
+      errorMessage: applyFailureMessage || toUserFacingCliFailureMessage({
+          stderr: applyResult?.message,
+          fallback: '认证已完成，但默认模型尚未完全生效，请稍后重试或点击刷新后继续。',
+        }),
+    }
+  }
+
+  if (!params.ensureGatewayRunning) {
+    return {
+      canContinue: false,
+      errorMessage: POST_AUTH_GATEWAY_PENDING_MESSAGE,
+    }
+  }
+
+  let attempt = 0
+  while (true) {
+    if (params.shouldAbort?.()) {
+      return {
+        canContinue: false,
+        errorMessage: POST_AUTH_GATEWAY_PENDING_MESSAGE,
+      }
+    }
+
+    let ensureResult: PostAuthGatewayEnsureLikeResult | null | undefined
+    try {
+      ensureResult = await params.ensureGatewayRunning({
+        skipRuntimePrecheck: true,
+      })
+    } catch (error) {
+      console.error('post-auth gateway ensure failed', error)
+      return {
+        canContinue: false,
+        errorMessage: toUserFacingUnknownErrorMessage(error, POST_AUTH_GATEWAY_PENDING_MESSAGE),
+      }
+    }
+
+    if (ensureResult?.ok && ensureResult.running === true) {
+      return {
+        canContinue: true,
+        errorMessage: '',
+      }
+    }
+
+    if (!isPostAuthGatewayEnsureTimeoutLike(ensureResult)) {
+      return {
+        canContinue: false,
+        errorMessage: resolvePostAuthGatewayEnsureErrorMessage(ensureResult),
+      }
+    }
+
+    attempt += 1
+    params.onRetryAttempt?.(attempt)
+
+    if (params.shouldAbort?.()) {
+      return {
+        canContinue: false,
+        errorMessage: POST_AUTH_GATEWAY_PENDING_MESSAGE,
+      }
+    }
+
+    await sleep(params.retryDelayMs ?? 1_500)
+  }
+}
+
 async function tryResolveDefaultModelForProvider(providerCandidates: string[]): Promise<string> {
   return resolveDefaultModelForProviderCandidates(providerCandidates, {
     getModelUpstreamState: () => window.api.getModelUpstreamState(),
@@ -2378,6 +2557,11 @@ export default function ModelCenter({
       setStatusText('')
       setError(appendRetryRefreshHint(message))
     }
+    const applyPostAuthFailureState = (message: string) => {
+      setPhase(getPhaseAfterAuthFailure())
+      setStatusText('')
+      setError(message)
+    }
 
     try {
       setStatusText(
@@ -2493,25 +2677,38 @@ export default function ModelCenter({
         preferredModelKey &&
         !cancelRequestedRef.current
       ) {
-        setStatusText('正在应用默认模型...')
-        const applyResult = await withTimeout(
-          applyDefaultModelWithGatewayReload({
-            model: preferredModelKey,
-            readConfig: () => window.api.readConfig(),
-            readUpstreamState: () => window.api.getModelUpstreamState(),
-            applyUpstreamModelWrite: (request) => window.api.applyModelConfigViaUpstream(request),
-            applyConfigPatchGuarded: (request) => window.api.applyConfigPatchGuarded(request),
-            getModelStatus: () => window.api.getModelStatus(),
-            reloadGatewayAfterModelChange: () => window.api.reloadGatewayAfterModelChange(),
-          }),
-          DEFAULT_MODEL_APPLY_TIMEOUT_MS
-        )
-        if (!applyResult?.ok) {
-          gatewayReloadWarning = toUserFacingCliFailureMessage({
-            stderr: applyResult?.message,
-            fallback: '认证已完成，但默认模型尚未完全生效。',
-          })
-          setStatusText(gatewayReloadWarning)
+        setStatusText(POST_AUTH_INITIAL_MODEL_APPLY_WAIT_MESSAGE)
+        const applyResult = await applyDefaultModelWithGatewayReload({
+          model: preferredModelKey,
+          readConfig: () => window.api.readConfig(),
+          readUpstreamState: () => window.api.getModelUpstreamState(),
+          applyUpstreamModelWrite: (request) => window.api.applyModelConfigViaUpstream(request),
+          applyConfigPatchGuarded: (request) => window.api.applyConfigPatchGuarded(request),
+          getModelStatus: () => window.api.getModelStatus(),
+          reloadGatewayAfterModelChange: () => window.api.reloadGatewayAfterModelChange(),
+        })
+        if (!applyResult?.ok && applyResult?.modelApplied) {
+          setStatusText('认证已完成，正在确认网关状态...')
+        }
+        const postAuthModelApplyRecovery = await resolvePostAuthDefaultModelApplyRecovery({
+          applyResult,
+          ensureGatewayRunning: (options) => window.api.ensureGatewayRunning(options),
+          shouldAbort: () =>
+            cancelRequestedRef.current
+            || !mountedRef.current
+            || authAttemptIdRef.current !== authAttemptId,
+          onRetryAttempt: (attempt) => setStatusText(formatPostAuthGatewayRetryStatus(attempt)),
+        })
+        if (!postAuthModelApplyRecovery.canContinue) {
+          if (cancelRequestedRef.current) {
+            applyCanceledState()
+            return
+          }
+          if (!mountedRef.current || authAttemptIdRef.current !== authAttemptId) {
+            return
+          }
+          applyPostAuthFailureState(postAuthModelApplyRecovery.errorMessage)
+          return
         }
       }
       if (shouldRepairLegacyMiniMaxAliases && !cancelRequestedRef.current) {

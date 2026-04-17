@@ -46,4 +46,15 @@ describe('runDirect permission auto repair wiring', () => {
 
     expect(source).toContain("windowsHide: process.platform === 'win32'")
   })
+
+  it('routes explicit Windows .cmd paths through cmd.exe quoting instead of implicit shell splitting', async () => {
+    const cliSource = await readFile(path.join(process.cwd(), 'electron/main/cli.ts'), 'utf8')
+    const source = extractRunShellAndDirectSource(cliSource)
+
+    expect(source).toContain('buildWindowsCmdExeInvocation(')
+    expect(source).toContain("const forceOpenShell = resolvedCommand.endsWith('.cmd') && process.platform === 'win32'")
+    expect(source).toContain('const shouldWrapWindowsCmdPath = forceOpenShell && /[\\\\/]/.test(resolvedCommand)')
+    expect(source).toContain("shell: shouldWrapWindowsCmdPath ? false : forceOpenShell ? true : useShell")
+    expect(source).toContain("args: ['/d', '/c', command, ...args]")
+  })
 })

@@ -98,13 +98,25 @@ async function loadRendererWindow(browserWindow: BrowserWindow) {
   await browserWindow.loadFile(indexHtml)
 }
 
-function createWindow() {
-  process.env.QCLAW_USER_DATA_DIR = app.getPath('userData')
-  process.env.QCLAW_SAFE_WORK_DIR = path.join(process.env.QCLAW_USER_DATA_DIR, 'runtime')
+function initializeQclawProcessPaths(): { safeWorkDir: string; userDataDir: string } {
+  const userDataDir = app.getPath('userData')
+  const safeWorkDir = path.join(userDataDir, 'runtime')
+
+  process.env.QCLAW_USER_DATA_DIR = userDataDir
+  process.env.QCLAW_SAFE_WORK_DIR = safeWorkDir
   tryNormalizeProcessCwd()
+
+  return {
+    userDataDir,
+    safeWorkDir,
+  }
+}
+
+function createWindow() {
+  const { safeWorkDir, userDataDir } = initializeQclawProcessPaths()
   void appendEnvCheckDiagnostic('main-create-window', {
-    userDataDir: process.env.QCLAW_USER_DATA_DIR,
-    safeWorkDir: process.env.QCLAW_SAFE_WORK_DIR,
+    userDataDir,
+    safeWorkDir,
   })
 
   const workAreaSize = screen.getPrimaryDisplay().workAreaSize
@@ -294,9 +306,10 @@ function createTray() {
 }
 
 app.whenReady().then(async () => {
+  const { userDataDir } = initializeQclawProcessPaths()
   registerIpcHandlers()
   void appendEnvCheckDiagnostic('main-ipc-handlers-registered', {
-    userDataDir: app.getPath('userData'),
+    userDataDir,
   })
   if (process.platform === 'win32') {
     await healMissingManagedRuntimeMarker().catch(() => undefined)

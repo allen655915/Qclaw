@@ -2741,12 +2741,16 @@ async function runShellOnce(
   const runOnce = (env: NodeJS.ProcessEnv): Promise<CliResult> =>
     new Promise((resolve) => {
       const forceOpenShell = resolvedCommand.endsWith('.cmd') && process.platform === 'win32'
+      const shouldWrapWindowsCmdPath = forceOpenShell && /[\\/]/.test(resolvedCommand)
+      const windowsCmdInvocation = shouldWrapWindowsCmdPath
+        ? buildWindowsCmdExeInvocation(resolvedCommand, args, env)
+        : null
       let proc: ChildProcess
       try {
-        proc = spawn(resolvedCommand, args, {
+        proc = spawn(windowsCmdInvocation?.command || resolvedCommand, windowsCmdInvocation?.args || args, {
           env,
           cwd: normalizedOptions.cwd || resolveManagedSpawnCwd(),
-          shell: forceOpenShell ? true : useShell,
+          shell: shouldWrapWindowsCmdPath ? false : forceOpenShell ? true : useShell,
           timeout,
           windowsHide: process.platform === 'win32',
         })
@@ -2813,6 +2817,25 @@ async function runShellOnce(
   return {
     ...retryResult,
     stderr: [firstResult.stderr, retryResult.stderr].filter(Boolean).join('\n\n'),
+  }
+}
+
+function resolveWindowsSystemShellPathForSpawn(env: NodeJS.ProcessEnv): string {
+  const configuredComSpec = String(env.ComSpec || env.COMSPEC || '').trim()
+  if (configuredComSpec) return configuredComSpec
+
+  const systemRoot = String(env.SystemRoot || env.SYSTEMROOT || '').trim() || 'C:\\Windows'
+  return join(systemRoot, 'System32', 'cmd.exe')
+}
+
+function buildWindowsCmdExeInvocation(
+  command: string,
+  args: string[],
+  env: NodeJS.ProcessEnv
+): { command: string; args: string[] } {
+  return {
+    command: resolveWindowsSystemShellPathForSpawn(env),
+    args: ['/d', '/c', command, ...args],
   }
 }
 

@@ -24,6 +24,7 @@ import {
   resolveChannelConnectBindingStrategy,
   resolveFeishuAutoRecoveryTarget,
   resolveFeishuInstallerAutoPairOpenId,
+  resolveFeishuManualBindingEnsureReadyOutcome,
   resolveFeishuManualBindingPreparationCopy,
   resolveFeishuPairingTarget,
   resolveFeishuCreateModeFinishStrategy,
@@ -615,6 +616,66 @@ describe('shouldAllowFeishuLinkPairingAfterGatewayFailure', () => {
         })
       ).toBe(false)
     }
+  })
+})
+
+describe('resolveFeishuManualBindingEnsureReadyOutcome', () => {
+  it('allows manual binding to continue when ensure fails after the plugin is already ready', () => {
+    expect(
+      resolveFeishuManualBindingEnsureReadyOutcome({
+        ok: false,
+        installedThisRun: true,
+        message: '飞书官方插件已就绪，但网关重载失败',
+        stderr: 'gateway reload failed',
+        stdout: '',
+        state: {
+          installedOnDisk: true,
+          officialPluginConfigured: true,
+        },
+      })
+    ).toEqual({
+      proceed: true,
+      notice: '飞书官方插件已就绪，但网关重载失败',
+    })
+  })
+
+  it('falls back to a non-blocking notice when the plugin is ready but ensure does not return a message', () => {
+    expect(
+      resolveFeishuManualBindingEnsureReadyOutcome({
+        ok: false,
+        installedThisRun: false,
+        message: '',
+        stderr: 'websocket 1006',
+        stdout: '',
+        state: {
+          installedOnDisk: true,
+          officialPluginConfigured: true,
+        },
+      })
+    ).toEqual({
+      proceed: true,
+      notice: '飞书官方插件已就绪，但网关刷新失败。现在可以继续关联已有机器人；若后续收发异常，请刷新状态或重启网关后重试。',
+    })
+  })
+
+  it('keeps the original hard failure path when the plugin is still not ready', () => {
+    expect(
+      resolveFeishuManualBindingEnsureReadyOutcome({
+        ok: false,
+        installedThisRun: false,
+        message: '飞书官方插件尚未就绪',
+        stderr: 'missing plugin',
+        stdout: '',
+        state: {
+          installedOnDisk: false,
+          officialPluginConfigured: false,
+        },
+      })
+    ).toEqual({
+      proceed: false,
+      notice: '',
+      errorMessage: '飞书官方插件尚未就绪',
+    })
   })
 })
 

@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest'
 import {
   AUTH_RETRY_HINT,
   DEFAULT_PROVIDER_CONFIG_EXPANDED,
+  POST_AUTH_GATEWAY_PENDING_MESSAGE,
   appendRetryRefreshHint,
   type OpenClawCapabilities,
   buildLocalProviderEnvUpdatesForSubmit,
@@ -31,6 +32,7 @@ import {
   resolveModelCenterProviderDisplayCopy,
   resolveDefaultModelForProviderCandidates,
   findConfiguredCustomProviderId,
+  resolvePostAuthDefaultModelApplyRecovery,
   resolveProviderVerificationSnapshot,
   shouldRenderProviderConfigContent,
   shouldShowCredentialProbeControl,
@@ -410,6 +412,23 @@ describe('ModelCenter source copy cleanup', () => {
     expect(modelCenterSource).not.toMatch(/\{selectedProvider\?\.hint && <Text/)
     expect(modelCenterSource).not.toMatch(/\{selectedMethod\?\.hint && <Text/)
     expect(modelCenterSource).not.toMatch(/\.extraOptions\.find\(\(option\) => normalizeMethodId\(option\.id\) === normalizeMethodId\(selectedExtraOption\)\)\s*\?\.hint/)
+  })
+})
+
+describe('ModelCenter post-auth default model source guards', () => {
+  it('shows the first-run long wait copy while applying the default model after auth', () => {
+    expect(modelCenterSource).toContain(
+      '首次配置模型需要 4-5 分钟，请耐心等待。 弹出黑色的命令行窗口是正常的，配置完成后重启电脑通常可以解决。'
+    )
+  })
+
+  it('does not wrap the immediate post-auth default model apply in the 6s renderer timeout', () => {
+    const immediateApplySnippet = modelCenterSource.match(
+      /setStatusText\(POST_AUTH_INITIAL_MODEL_APPLY_WAIT_MESSAGE\)([\s\S]*?)const postAuthModelApplyRecovery = await resolvePostAuthDefaultModelApplyRecovery/
+    )
+
+    expect(immediateApplySnippet?.[1]).toContain('const applyResult = await applyDefaultModelWithGatewayReload({')
+    expect(immediateApplySnippet?.[1]).not.toContain('const applyResult = await withTimeout(')
   })
 })
 
@@ -1796,6 +1815,116 @@ describe('joinModelCenterNonBlockingMessages', () => {
   })
 })
 
+describe('resolvePostAuthDefaultModelApplyRecovery', () => {
+  it('continues when gateway ensure confirms readiness after the model was saved', async () => {
+    const ensureGatewayRunning = vi.fn(async () => ({
+      ok: true,
+      running: true,
+    }))
+
+    await expect(
+      resolvePostAuthDefaultModelApplyRecovery({
+        applyResult: {
+          ok: false,
+          modelApplied: true,
+          message: '默认模型已保存，但运行状态尚未确认生效',
+        },
+        ensureGatewayRunning,
+      })
+    ).resolves.toEqual({
+      canContinue: true,
+      errorMessage: '',
+    })
+
+    expect(ensureGatewayRunning).toHaveBeenCalledWith({
+      skipRuntimePrecheck: true,
+    })
+  })
+
+  it('retries timeout-like gateway ensure results until readiness is confirmed', async () => {
+    const ensureGatewayRunning = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: false,
+        running: false,
+        stateCode: 'unknown_runtime_failure',
+        summary: '网关尚未完成就绪确认',
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        running: true,
+      })
+    const onRetryAttempt = vi.fn()
+
+    await expect(
+      resolvePostAuthDefaultModelApplyRecovery({
+        applyResult: {
+          ok: false,
+          modelApplied: true,
+          message: '默认模型已保存，但运行状态尚未确认生效',
+        },
+        ensureGatewayRunning,
+        onRetryAttempt,
+        retryDelayMs: 0,
+      })
+    ).resolves.toEqual({
+      canContinue: true,
+      errorMessage: '',
+    })
+
+    expect(ensureGatewayRunning).toHaveBeenCalledTimes(2)
+    expect(onRetryAttempt).toHaveBeenCalledWith(1)
+  })
+
+  it('surfaces explicit gateway errors without retrying', async () => {
+    const ensureGatewayRunning = vi.fn(async () => ({
+      ok: false,
+      running: false,
+      stateCode: 'auth_missing',
+      summary: '当前机器缺少可用的模型认证信息',
+    }))
+    const onRetryAttempt = vi.fn()
+
+    const result = await resolvePostAuthDefaultModelApplyRecovery({
+      applyResult: {
+        ok: false,
+        modelApplied: true,
+        message: '默认模型已保存，但运行状态尚未确认生效',
+      },
+      ensureGatewayRunning,
+      onRetryAttempt,
+      retryDelayMs: 0,
+    })
+
+    expect(result).toEqual({
+      canContinue: false,
+      errorMessage: '当前机器缺少可用的模型认证信息',
+    })
+    expect(ensureGatewayRunning).toHaveBeenCalledTimes(1)
+    expect(onRetryAttempt).not.toHaveBeenCalled()
+  })
+
+  it('blocks when the default model was not applied at all', async () => {
+    const ensureGatewayRunning = vi.fn()
+
+    await expect(
+      resolvePostAuthDefaultModelApplyRecovery({
+        applyResult: {
+          ok: false,
+          modelApplied: false,
+          message: '设置默认模型失败',
+        },
+        ensureGatewayRunning,
+      })
+    ).resolves.toEqual({
+      canContinue: false,
+      errorMessage: '设置默认模型失败',
+    })
+
+    expect(ensureGatewayRunning).not.toHaveBeenCalled()
+  })
+})
+
 describe('formatElapsedSeconds', () => {
   it('formats elapsed seconds as mm:ss', () => {
     expect(formatElapsedSeconds(0)).toBe('00:00')
@@ -1984,6 +2113,15 @@ describe('phase helpers', () => {
 
   it('catches setup callback failures before leaving the onboarding auth flow', () => {
     expect(modelCenterSource).toContain("void Promise.resolve(onConfigured(context)).catch((callbackError: any) => {")
+  })
+
+  it('keeps explicit auth submission failures mapped to the auth failure copy', () => {
+    expect(modelCenterSource).toContain("fallback: '认证失败，请检查 API Key 或认证配置。'")
+  })
+
+  it('rechecks gateway readiness after saving a default model before advancing setup', () => {
+    expect(modelCenterSource).toContain("setStatusText('认证已完成，正在确认网关状态...')")
+    expect(modelCenterSource).toContain('resolvePostAuthDefaultModelApplyRecovery({')
   })
 })
 

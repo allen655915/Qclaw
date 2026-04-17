@@ -1023,6 +1023,20 @@ interface FeishuManualBindingPluginStateLike {
   configAvailable?: boolean
 }
 
+interface FeishuManualBindingEnsureReadyStateLike {
+  installedOnDisk: boolean
+  officialPluginConfigured: boolean
+}
+
+interface FeishuManualBindingEnsureReadyResultLike {
+  ok: boolean
+  installedThisRun: boolean
+  message?: string
+  stderr?: string
+  stdout?: string
+  state: FeishuManualBindingEnsureReadyStateLike
+}
+
 export function isFeishuManualBindingReady(
   state: Pick<FeishuManualBindingPluginStateLike, 'installedOnDisk' | 'officialPluginConfigured'>
 ): boolean {
@@ -1033,6 +1047,45 @@ export function canPrepareFeishuManualBindingWithoutInstall(
   state: FeishuManualBindingPluginStateLike
 ): boolean {
   return state.configAvailable !== false && state.installedOnDisk && (state.officialPluginConfigured || state.configChanged)
+}
+
+const FEISHU_MANUAL_BINDING_GATEWAY_WARNING =
+  '飞书官方插件已就绪，但网关刷新失败。现在可以继续关联已有机器人；若后续收发异常，请刷新状态或重启网关后重试。'
+
+export function resolveFeishuManualBindingEnsureReadyOutcome(
+  ensureResult: FeishuManualBindingEnsureReadyResultLike
+): {
+  proceed: boolean
+  notice: string
+  errorMessage?: string
+} {
+  if (isFeishuManualBindingReady(ensureResult.state)) {
+    if (ensureResult.ok) {
+      return {
+        proceed: true,
+        notice: ensureResult.installedThisRun
+          ? '已自动补装飞书官方插件，现在可以手动绑定已有机器人。'
+          : '已确认飞书官方插件可用，现在可以手动绑定已有机器人。',
+      }
+    }
+
+    return {
+      proceed: true,
+      notice: String(ensureResult.message || '').trim() || FEISHU_MANUAL_BINDING_GATEWAY_WARNING,
+    }
+  }
+
+  return {
+    proceed: false,
+    notice: '',
+    errorMessage:
+      String(ensureResult.message || '').trim() ||
+      toUserFacingCliFailureMessage({
+        stderr: ensureResult.stderr,
+        stdout: ensureResult.stdout,
+        fallback: '飞书官方插件尚未就绪',
+      }),
+  }
 }
 
 const FEISHU_MANUAL_BINDING_OPENCLAW_HOT_RELOAD_INITIAL_SETTLE_MS = 700
@@ -2644,24 +2697,14 @@ export default function ChannelConnect({
       setFeishuManualBindingPreparePhase('installing')
       const ensureResult = await window.api.ensureFeishuOfficialPluginReady()
       if (feishuManualBindingRequestVersionRef.current !== requestVersion) return
-      if (!ensureResult.ok || !ensureResult.state.installedOnDisk) {
-        throw new Error(
-          ensureResult.message ||
-            toUserFacingCliFailureMessage({
-              stderr: ensureResult.stderr,
-              stdout: ensureResult.stdout,
-              fallback: '飞书官方插件尚未就绪',
-            })
-        )
+      const ensureOutcome = resolveFeishuManualBindingEnsureReadyOutcome(ensureResult)
+      if (!ensureOutcome.proceed) {
+        throw new Error(ensureOutcome.errorMessage || '飞书官方插件尚未就绪')
       }
 
       setFeishuManualBindingPreparePhase('verifying')
       setFeishuBotSetupMode('link')
-      setFeishuInstallerNotice(
-        ensureResult.installedThisRun
-          ? '已自动补装飞书官方插件，现在可以手动绑定已有机器人。'
-          : '已确认飞书官方插件可用，现在可以手动绑定已有机器人。'
-      )
+      setFeishuInstallerNotice(ensureOutcome.notice)
       void refreshFeishuBotsFromConfig().catch(() => {
         // Keep the manual binding form available even if background refresh fails.
       })

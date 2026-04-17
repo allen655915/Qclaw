@@ -183,6 +183,48 @@ describe('getFeishuOfficialPluginState', () => {
     }
   })
 
+  it('reloads config after resolving runtime paths when the initial implicit read fails', async () => {
+    getOpenClawPathsMock.mockResolvedValue({
+      homeDir: '/Users/alice/.openclaw',
+      configFile: '/Users/alice/.openclaw/openclaw.json',
+    })
+    readConfigMock.mockImplementation(async (options?: { configPath?: string }) => {
+      if (!options?.configPath) {
+        throw new Error('runtime path unresolved')
+      }
+
+      return {
+        plugins: {
+          allow: ['openclaw-lark'],
+          entries: {
+            feishu: { enabled: false },
+            'openclaw-lark': { enabled: true },
+          },
+        },
+      }
+    })
+
+    const fs = process.getBuiltinModule('node:fs') as typeof import('node:fs')
+    const accessSpy = vi.spyOn(fs.promises, 'access').mockResolvedValue(undefined)
+
+    try {
+      const { getFeishuOfficialPluginState } = await import('../feishu-official-plugin-state')
+      const result = await getFeishuOfficialPluginState()
+
+      expect(readConfigMock).toHaveBeenCalledTimes(2)
+      expect(readConfigMock).toHaveBeenNthCalledWith(1, undefined)
+      expect(readConfigMock).toHaveBeenNthCalledWith(2, {
+        configPath: '/Users/alice/.openclaw/openclaw.json',
+      })
+      expect(result.configAvailable).toBe(true)
+      expect(result.officialPluginConfigured).toBe(true)
+      expect(result.configChanged).toBe(true)
+      expect(result.normalizedConfig.session.dmScope).toBe('per-account-channel-peer')
+    } finally {
+      accessSpy.mockRestore()
+    }
+  })
+
   it('keeps official plugin config when the plugin is installed on disk while still removing legacy residue', async () => {
     getOpenClawPathsMock.mockResolvedValue({
       homeDir: '/Users/alice/.openclaw',

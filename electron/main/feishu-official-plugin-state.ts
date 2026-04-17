@@ -402,7 +402,7 @@ export async function getFeishuOfficialPluginState(
   options: EnsureFeishuOfficialPluginReadyOptions = {}
 ): Promise<FeishuOfficialPluginState> {
   const pinnedRuntimeContext = normalizeRuntimeContext(options.runtimeContext)
-  const [config, openClawPaths] = await Promise.all([
+  const [initialConfig, openClawPaths] = await Promise.all([
     readConfig(
       pinnedRuntimeContext.configPath
         ? { configPath: pinnedRuntimeContext.configPath }
@@ -415,6 +415,11 @@ export async function getFeishuOfficialPluginState(
 
   const homeDir = pinnedRuntimeContext.homeDir || String(openClawPaths?.homeDir || '').trim()
   const configPath = pinnedRuntimeContext.configPath || String(openClawPaths?.configFile || '').trim()
+  const config = hasOwnRecord(initialConfig)
+    ? initialConfig
+    : configPath
+      ? await readConfig({ configPath }).catch(() => null)
+      : initialConfig
   const installPath = homeDir ? path.join(homeDir, 'extensions', FEISHU_OFFICIAL_PLUGIN_ID) : ''
   const installedOnDisk = await isFeishuOfficialPluginInstalledOnDisk(homeDir)
 

@@ -34,7 +34,7 @@ const DEFAULT_MODEL_UI_SNAPSHOT_TIMEOUTS = Object.freeze({
   configMs: 6_000,
   envMs: 6_000,
   statusMs: 22_000,
-  catalogMs: 25_000,
+  catalogMs: 60_000,
 })
 
 const CONFIG_TIMEOUT_WARNING = '配置快照读取超时，当前先按空配置继续。'

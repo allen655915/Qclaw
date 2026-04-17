@@ -104,7 +104,7 @@ describe('ensureWindowsPrivateNodeRuntime', () => {
   })
 
   it('does not retry duplicate download sources when the plan already uses the mirror base URL', async () => {
-    const downloadFile = vi.fn(async () => undefined)
+    const downloadFile = vi.fn(async (_url: string, _destPath: string) => undefined)
     const runPowerShell = vi.fn(async () => ({
       ok: true,
       stdout: '',

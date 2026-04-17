@@ -3,7 +3,8 @@ import { describe, expect, it, vi } from 'vitest'
 import { getModelUiSnapshot } from '../model-ui-snapshot'
 
 const DEFAULT_STATUS_BUDGET_MS = 22_000
-const DEFAULT_CATALOG_BUDGET_MS = 25_000
+const LEGACY_CATALOG_BUDGET_MS = 25_000
+const DEFAULT_CATALOG_BUDGET_MS = 60_000
 
 describe('getModelUiSnapshot', () => {
   it('returns a bounded partial snapshot when config, env, or status reads never settle', async () => {
@@ -220,7 +221,10 @@ describe('getModelUiSnapshot', () => {
     await vi.advanceTimersByTimeAsync(DEFAULT_STATUS_BUDGET_MS - 6_001)
     expect(settled).toBe(false)
 
-    await vi.advanceTimersByTimeAsync(DEFAULT_CATALOG_BUDGET_MS - DEFAULT_STATUS_BUDGET_MS)
+    await vi.advanceTimersByTimeAsync(LEGACY_CATALOG_BUDGET_MS - DEFAULT_STATUS_BUDGET_MS)
+    expect(settled).toBe(false)
+
+    await vi.advanceTimersByTimeAsync(DEFAULT_CATALOG_BUDGET_MS - LEGACY_CATALOG_BUDGET_MS)
 
     const result = await resultPromise
     expect(result.warnings).toContain(statusWarning)
