@@ -14,6 +14,10 @@ import {
 } from '../../src/shared/desktop-window-policy'
 import { clearDevRendererCache } from './dev-renderer-cache'
 import { tryNormalizeProcessCwd } from './runtime-working-directory'
+import {
+  resolveMainWindowIconPath,
+  resolveRuntimeAppIconPath as resolveRuntimeAppIconAssetPath,
+} from './window-icon'
 import { revealWindow, showOrCreateWindow } from './window-lifecycle'
 import { reloadGatewayForConfigChange } from './gateway-lifecycle-controller'
 import { sanitizeNodeOptionsForElectron } from './node-options'
@@ -63,9 +67,11 @@ const focusApp = process.platform === 'darwin'
   ? (options: { steal: boolean }) => app.focus(options)
   : undefined
 function resolveRuntimeAppIconPath() {
-  return app.isPackaged
-    ? path.join(process.resourcesPath, 'app-icon.png')
-    : path.join(process.env.APP_ROOT!, 'src', 'assets', 'logo.png')
+  return resolveRuntimeAppIconAssetPath({
+    appRoot: process.env.APP_ROOT!,
+    isPackaged: app.isPackaged,
+    resourcesPath: process.resourcesPath,
+  })
 }
 
 function loadRuntimeAppIcon() {
@@ -123,9 +129,13 @@ function createWindow() {
   const mainWindowBounds = resolveMainWindowBounds(workAreaSize, process.platform)
   const mainWindowBrowserWindowOptions = resolveMainWindowBrowserWindowOptions(process.platform)
 
-  const appIcon = process.platform === 'win32'
-    ? path.join(process.env.VITE_PUBLIC!, 'favicon.ico')
-    : path.join(process.env.VITE_PUBLIC!, 'tray@2x.png')
+  const appIcon = resolveMainWindowIconPath({
+    appRoot: process.env.APP_ROOT!,
+    isPackaged: app.isPackaged,
+    platform: process.platform,
+    publicPath: process.env.VITE_PUBLIC!,
+    resourcesPath: process.resourcesPath,
+  })
 
   if (process.platform === 'darwin') {
     const dockIcon = loadRuntimeAppIcon()
