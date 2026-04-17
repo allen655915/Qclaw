@@ -184,7 +184,7 @@ export const api = {
   validateFeishuCredentials: (appId: string, appSecret: string, domain?: string) =>
     ipcRenderer.invoke('feishu:credentials:validate', appId, appSecret, domain),
   getFeishuInstallerState: () => ipcRenderer.invoke('feishu:installer:state:get'),
-  startFeishuInstaller: () => ipcRenderer.invoke('feishu:installer:start'),
+  startFeishuInstaller: (requestToken?: string) => ipcRenderer.invoke('feishu:installer:start', requestToken),
   listenFeishuBotDiagnosticActivity: (
     accountId?: FeishuBotDiagnosticListenRequest['accountId'],
     timeoutMs?: FeishuBotDiagnosticListenRequest['timeoutMs'],

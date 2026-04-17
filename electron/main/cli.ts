@@ -229,6 +229,10 @@ function clearSelectedWindowsRuntimeSnapshot(): void {
   clearCachedWindowsChannelRuntimeSnapshot()
 }
 
+export function clearSelectedWindowsOpenClawRuntimeSelection(): void {
+  clearSelectedWindowsRuntimeSnapshot()
+}
+
 function rememberDetectedNodeBinDir(nextBinDir: string | null | undefined): string | null {
   const normalizedNext = String(nextBinDir || '').trim() || null
   if (detectedNodeBinDirChanged(normalizedNext)) {

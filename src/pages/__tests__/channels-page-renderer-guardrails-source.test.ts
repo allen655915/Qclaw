@@ -15,6 +15,8 @@ describe('ChannelsPage renderer guardrails', () => {
     expect(source).toContain('getFeishuOfficialPluginStateReady(window.api).catch((reason) => {')
     expect(source).toContain('Qclaw 自动修复飞书配置失败：${feishuConfigRepairError}')
     expect(source).toContain('title="飞书配置修复失败"')
+    expect(source).toContain('withChannelsPageTimeoutFallback(')
+    expect(source).toContain('读取渠道配置超时，请点击“刷新”重试。')
     expect(source).not.toContain('需要显式同步飞书配置')
     expect(source).not.toContain('本页不会在后台静默写入 managed channel 配置')
   })

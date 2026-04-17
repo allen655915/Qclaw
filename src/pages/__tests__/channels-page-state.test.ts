@@ -5,6 +5,7 @@ import {
   shouldReuseModelOptionsCache,
   shouldShowFeishuPluginRepairAction,
   shouldShowPluginStatus,
+  withChannelsPageTimeoutFallback,
 } from '../ChannelsPage'
 
 const fs = process.getBuiltinModule('node:fs') as typeof import('node:fs')
@@ -93,6 +94,19 @@ describe('channels page state helpers', () => {
     expect(shouldReuseModelOptionsCache({ mode: 'available' })).toBe(true)
     expect(shouldReuseModelOptionsCache({ mode: 'all' })).toBe(false)
     expect(shouldReuseModelOptionsCache({ forceRefresh: true })).toBe(false)
+  })
+
+  it('times out slow channel-page fetches so the page does not spin forever', async () => {
+    const result = await withChannelsPageTimeoutFallback(
+      new Promise<string>(() => {}),
+      'fallback',
+      10
+    )
+
+    expect(result).toEqual({
+      timedOut: true,
+      value: 'fallback',
+    })
   })
 
   it('reuses the shared model catalog path for feishu model config instead of forcing a refresh', () => {

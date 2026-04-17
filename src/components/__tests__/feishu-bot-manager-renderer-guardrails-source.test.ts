@@ -32,9 +32,16 @@ describe('FeishuBotManagerModal renderer guardrails', () => {
     expect(source).toContain('isOwnedFeishuManagerCreateSession')
     expect(source).toContain('snapshotMatchesOwnedSession')
     expect(source).toContain('if (snapshot.active && snapshotSessionId)')
+    expect(source).toContain('feishuCreateStartConfigSnapshotKnown')
+    expect(source).toContain('feishuCreateRuntimeSessionId')
+    expect(source).toContain('shouldAdoptFeishuCreateSession(snapshot.sessionId, snapshot.active, snapshot.requestToken)')
+    expect(source).toContain('shouldAdoptFeishuCreateSession(payload.sessionId, true, payload.requestToken)')
+    expect(source).toContain('rememberFeishuCreateRuntimeSession')
+    expect(source).toContain('clearOwnedFeishuCreateSessionMarkers')
     expect(source).toContain('shouldRetainExitedOwnedFeishuManagerCreateSession')
     expect(source).toContain('shouldRetainOwnedFeishuManagerCreateSessionWhileHidden')
     expect(source).toContain('showOwnedFeishuCreateSessionSurface')
+    expect(source).toContain('showFeishuCreateRuntimeSurface')
     expect(source).toContain('当前没有正在进行的飞书新建会话')
   })
 
@@ -52,5 +59,23 @@ describe('FeishuBotManagerModal renderer guardrails', () => {
     expect(source).toContain("window.api.pairingAddAllowFrom(")
     expect(source).toContain("ensureGatewayReadyForChannelConnect(window.api")
     expect(source).toContain('handledOwnedFeishuCreateSessionIdRef')
+  })
+
+  it('keeps Feishu create startup on lightweight installer polling instead of refreshing plugin-ready state', () => {
+    const source = fs.readFileSync(
+      path.join(process.cwd(), 'src', 'components', 'FeishuBotManagerModal.tsx'),
+      'utf8'
+    )
+
+    expect(source).toContain('waitForFeishuManagerInstallerActivation')
+    expect(source).toContain('feishuInstallerActivationWaitSeqRef')
+    expect(source).toContain('feishuCreateRequestTokenRef')
+    expect(source).toContain("setFeishuInstallerNotice('正在启动飞书官方安装器并等待二维码，请稍候...')")
+    expect(source).toContain("setFeishuInstallerNotice(\n            '检测到已有飞书安装器正在运行。为避免误接管其他新建流程，请等待原流程完成，或先停止后重新开始。'")
+    expect(source).toContain('shouldWaitForFeishuInstallerActivation')
+    expect(source).toContain('resolveFeishuInstallerStartFailureMessage')
+    expect(source).toContain("setBotError(toUserFacingUnknownErrorMessage(e, '启动飞书官方安装器失败'))")
+    expect(source).not.toContain("setFeishuInstallerNotice('飞书安装器正在启动，Qclaw 正在继续等待二维码。')")
+    expect(source).not.toContain("setFeishuInstallerNotice('正在检测飞书安装器状态，请稍候...')")
   })
 })

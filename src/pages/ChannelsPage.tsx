@@ -74,6 +74,8 @@ type FeishuRuntimeStatusRecord = Record<
   }
 >
 
+const CHANNELS_PAGE_ASYNC_TIMEOUT_MS = 8000
+
 function getRuntimeBadgeColor(state: FeishuRuntimeStatusState | undefined): string {
   if (state === 'online') return 'teal'
   if (state === 'degraded') return 'yellow'
@@ -113,6 +115,26 @@ export function shouldReuseModelOptionsCache(options?: {
   mode?: 'available' | 'all'
 }): boolean {
   return !options?.forceRefresh && options?.mode !== 'all'
+}
+
+export async function withChannelsPageTimeoutFallback<T>(
+  promise: Promise<T>,
+  fallbackValue: T,
+  timeoutMs: number
+): Promise<{ timedOut: boolean; value: T }> {
+  let timer: ReturnType<typeof setTimeout> | null = null
+  try {
+    return await Promise.race([
+      promise.then((value) => ({ timedOut: false, value })),
+      new Promise<{ timedOut: true; value: T }>((resolve) => {
+        timer = setTimeout(() => resolve({ timedOut: true, value: fallbackValue }), timeoutMs)
+      }),
+    ])
+  } finally {
+    if (timer) {
+      clearTimeout(timer)
+    }
+  }
 }
 
 const CHANNELS_PAGE_CACHE_TTL_MS = 60 * 1000
@@ -195,22 +217,48 @@ export default function ChannelsPage() {
 
   const fetchChannels = async (options?: { background?: boolean }) => {
     const background = Boolean(options?.background)
+    let loadTimeout: ReturnType<typeof setTimeout> | null = null
     if (!background) {
       setLoading(true)
+      loadTimeout = setTimeout(() => {
+        setLoading(false)
+        setError((current) => current || '读取渠道状态超时，请点击“刷新”重试。')
+      }, CHANNELS_PAGE_ASYNC_TIMEOUT_MS)
     }
 
     try {
       setError('')
       let feishuConfigRepairError = ''
-      const [feishuPluginStateResult, weixinAccounts] = await Promise.all([
-        getFeishuOfficialPluginStateReady(window.api).catch((reason) => {
-          feishuConfigRepairError = reason instanceof Error ? reason.message : String(reason || '')
-          return null
-        }),
-        window.api.listWeixinAccounts().catch(() => []),
+      const [feishuPluginStateReadyResult, weixinAccountsResult] = await Promise.all([
+        withChannelsPageTimeoutFallback(
+          getFeishuOfficialPluginStateReady(window.api).catch((reason) => {
+            feishuConfigRepairError = reason instanceof Error ? reason.message : String(reason || '')
+            return null
+          }),
+          null,
+          CHANNELS_PAGE_ASYNC_TIMEOUT_MS
+        ),
+        withChannelsPageTimeoutFallback(
+          window.api.listWeixinAccounts().catch(() => []),
+          [] as Awaited<ReturnType<typeof window.api.listWeixinAccounts>>,
+          CHANNELS_PAGE_ASYNC_TIMEOUT_MS
+        ),
       ])
-      const feishuPluginState = feishuPluginStateResult?.state || null
-      const config = await window.api.readConfig()
+      const feishuPluginState = feishuPluginStateReadyResult.value?.state || null
+      const weixinAccounts = weixinAccountsResult.value
+      if (feishuPluginStateReadyResult.timedOut) {
+        feishuConfigRepairError = feishuConfigRepairError || '读取飞书官方插件状态超时，当前按本地配置继续展示。'
+      }
+
+      const configResult = await withChannelsPageTimeoutFallback(
+        window.api.readConfig(),
+        null,
+        CHANNELS_PAGE_ASYNC_TIMEOUT_MS
+      )
+      if (configResult.timedOut) {
+        throw new Error('读取渠道配置超时，请点击“刷新”重试。')
+      }
+      const config = configResult.value
       if (!config) {
         setChannels([])
         setLegacyFeishuAgentIds([])
@@ -227,13 +275,23 @@ export default function ChannelsPage() {
           return pluginStatusCache[channelId] ?? null
         }
 
-        const status = await window.api.getManagedChannelPluginStatus(channelId).catch(() => null)
+        const statusResult = await withChannelsPageTimeoutFallback(
+          window.api.getManagedChannelPluginStatus(channelId).catch(() => null),
+          null,
+          CHANNELS_PAGE_ASYNC_TIMEOUT_MS
+        )
+        const status = statusResult.value
         pluginStatusCache[channelId] = status
         return status
       }
-      const feishuRuntimeStatus: FeishuRuntimeStatusRecord = await window.api
-        .getFeishuRuntimeStatus()
-        .catch(() => ({} as FeishuRuntimeStatusRecord))
+      const feishuRuntimeStatusResult = await withChannelsPageTimeoutFallback(
+        window.api
+          .getFeishuRuntimeStatus()
+          .catch(() => ({} as FeishuRuntimeStatusRecord)),
+        {} as FeishuRuntimeStatusRecord,
+        CHANNELS_PAGE_ASYNC_TIMEOUT_MS
+      )
+      const feishuRuntimeStatus = feishuRuntimeStatusResult.value
 
       const normalizedConfig = feishuPluginState?.normalizedConfig || sanitizeFeishuPluginConfig(config)
       if (feishuConfigRepairError) {
@@ -246,8 +304,13 @@ export default function ChannelsPage() {
       if (normalizedConfig.channels?.feishu) {
         const feishuPluginStatus = await loadManagedPluginStatus('feishu')
         const feishuBots = listFeishuBots(normalizedConfig)
-        try {
-          const feishuPairingStatus = await window.api.pairingFeishuStatus(feishuBots.map((bot) => bot.accountId))
+        const feishuPairingStatusResult = await withChannelsPageTimeoutFallback(
+          window.api.pairingFeishuStatus(feishuBots.map((bot) => bot.accountId)).catch(() => null),
+          null,
+          CHANNELS_PAGE_ASYNC_TIMEOUT_MS
+        )
+        const feishuPairingStatus = feishuPairingStatusResult.value
+        if (feishuPairingStatus) {
           for (const bot of feishuBots) {
             const pairing = feishuPairingStatus[bot.accountId]
             const pairedCount = Number(pairing?.pairedCount || 0)
@@ -274,7 +337,7 @@ export default function ChannelsPage() {
               pluginStatus: feishuPluginStatus,
             })
           }
-        } catch {
+        } else {
           for (const bot of feishuBots) {
             channelList.push({
               id: `feishu:${bot.accountId}`,
@@ -395,6 +458,9 @@ export default function ChannelsPage() {
     } catch (e) {
       setError('读取配置失败: ' + (e as Error).message)
     } finally {
+      if (loadTimeout) {
+        clearTimeout(loadTimeout)
+      }
       if (!background) {
         setLoading(false)
       }

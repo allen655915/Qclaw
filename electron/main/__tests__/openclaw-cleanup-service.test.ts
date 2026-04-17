@@ -4,14 +4,18 @@ const os = process.getBuiltinModule('node:os') as typeof import('node:os')
 const path = process.getBuiltinModule('node:path') as typeof import('node:path')
 
 const {
+  clearSelectedWindowsOpenClawRuntimeSelectionMock,
   cleanupOpenClawStateAndDataMock,
+  getSelectedWindowsActiveRuntimeSnapshotMock,
   runShellMock,
   uninstallOpenClawNpmGlobalPackageMock,
   createManagedBackupArchiveMock,
   buildOpenClawCleanupPreviewMock,
   resolveOpenClawBinaryPathMock,
 } = vi.hoisted(() => ({
+  clearSelectedWindowsOpenClawRuntimeSelectionMock: vi.fn(),
   cleanupOpenClawStateAndDataMock: vi.fn(),
+  getSelectedWindowsActiveRuntimeSnapshotMock: vi.fn(),
   runShellMock: vi.fn(),
   uninstallOpenClawNpmGlobalPackageMock: vi.fn(),
   createManagedBackupArchiveMock: vi.fn(),
@@ -20,6 +24,7 @@ const {
 }))
 
 vi.mock('../cli', () => ({
+  clearSelectedWindowsOpenClawRuntimeSelection: clearSelectedWindowsOpenClawRuntimeSelectionMock,
   cleanupOpenClawStateAndData: cleanupOpenClawStateAndDataMock,
   runShell: runShellMock,
   uninstallOpenClawNpmGlobalPackage: uninstallOpenClawNpmGlobalPackageMock,
@@ -35,6 +40,10 @@ vi.mock('../openclaw-cleanup-planner', () => ({
 
 vi.mock('../openclaw-package', () => ({
   resolveOpenClawBinaryPath: resolveOpenClawBinaryPathMock,
+}))
+
+vi.mock('../windows-active-runtime', () => ({
+  getSelectedWindowsActiveRuntimeSnapshot: getSelectedWindowsActiveRuntimeSnapshotMock,
 }))
 
 import { runOpenClawCleanup } from '../openclaw-cleanup-service'
@@ -59,12 +68,35 @@ function buildCandidate(input: { id: string; source: string }) {
   } as const
 }
 
+function buildWindowsSelectedRuntimeSnapshot(input: {
+  configPath?: string
+  hostPackageRoot: string
+  openclawPath: string
+  stateDir?: string
+}) {
+  const stateDir = input.stateDir || path.dirname(String(input.configPath || '')) || 'C:\\Users\\test\\.openclaw'
+  return {
+    configPath: input.configPath || path.join(stateDir, 'openclaw.json'),
+    extensionsDir: path.join(stateDir, 'extensions'),
+    hostPackageRoot: input.hostPackageRoot,
+    logsDir: path.join(stateDir, 'logs'),
+    nodePath: path.join(path.dirname(input.openclawPath), 'node.exe'),
+    npmPrefix: path.dirname(input.openclawPath),
+    openclawPath: input.openclawPath,
+    stateDir,
+    tmpDir: path.join(stateDir, 'tmp'),
+  }
+}
+
 describe('openclaw cleanup service', () => {
   const tempDirs: string[] = []
   const originalBatchCleanupFlag = process.env.QCLAW_OPENCLAW_BATCH_CLEANUP_ENABLED
 
   beforeEach(() => {
+    clearSelectedWindowsOpenClawRuntimeSelectionMock.mockReset()
     cleanupOpenClawStateAndDataMock.mockReset()
+    getSelectedWindowsActiveRuntimeSnapshotMock.mockReset()
+    getSelectedWindowsActiveRuntimeSnapshotMock.mockReturnValue(null)
     runShellMock.mockReset()
     uninstallOpenClawNpmGlobalPackageMock.mockReset()
     createManagedBackupArchiveMock.mockReset()
@@ -321,6 +353,212 @@ describe('openclaw cleanup service', () => {
 
       expect(result.ok).toBe(true)
       expect(result.perCandidateResults?.[0]?.stateCleanup?.command).toBeUndefined()
+    } finally {
+      if (originalPlatformDescriptor) {
+        Object.defineProperty(process, 'platform', originalPlatformDescriptor)
+      }
+    }
+  })
+
+  it('removes qclaw-managed Windows program files without using global npm uninstall', async () => {
+    const tempRoot = makeTempDir()
+    const runtimeRoot = path.join(tempRoot, 'managed-runtime')
+    const packageRoot = path.join(runtimeRoot, 'node_modules', 'openclaw')
+    const binaryPath = path.join(runtimeRoot, 'openclaw.cmd')
+    const shimPath = path.join(runtimeRoot, 'openclaw')
+    const powershellShimPath = path.join(runtimeRoot, 'openclaw.ps1')
+    const candidate = {
+      ...buildCandidate({ id: 'candidate-managed', source: 'qclaw-managed' }),
+      binaryPath,
+      resolvedBinaryPath: binaryPath,
+      packageRoot,
+      stateRoot: path.join(tempRoot, 'missing-openclaw-home'),
+      configPath: path.join(tempRoot, 'missing-openclaw-home', 'openclaw.json'),
+      displayStateRoot: path.join(tempRoot, 'missing-openclaw-home'),
+    }
+    const originalPlatformDescriptor = Object.getOwnPropertyDescriptor(process, 'platform')
+
+    fs.mkdirSync(packageRoot, { recursive: true })
+    fs.writeFileSync(binaryPath, '@echo off\r\n')
+    fs.writeFileSync(shimPath, '#!/bin/sh\n')
+    fs.writeFileSync(powershellShimPath, 'Write-Output "openclaw"\n')
+    Object.defineProperty(process, 'platform', {
+      value: 'win32',
+    })
+    getSelectedWindowsActiveRuntimeSnapshotMock.mockReturnValue(
+      buildWindowsSelectedRuntimeSnapshot({
+        configPath: candidate.configPath,
+        hostPackageRoot: candidate.packageRoot,
+        openclawPath: candidate.binaryPath,
+        stateDir: candidate.stateRoot,
+      })
+    )
+
+    try {
+      buildOpenClawCleanupPreviewMock.mockResolvedValue({
+        ok: true,
+        canRun: true,
+        actionType: 'remove-openclaw',
+        activeCandidate: candidate,
+        availableCandidates: [candidate],
+        selectedCandidateIds: [candidate.candidateId],
+        deleteItems: [],
+        keepItems: [],
+        backupItems: [],
+        warnings: [],
+        blockedReasons: [],
+        backupDirectory: '/Users/test/Documents/Qclaw Lite Backups',
+      })
+      cleanupOpenClawStateAndDataMock.mockResolvedValue({
+        ok: true,
+        stdout: 'ok',
+        stderr: '',
+        code: 0,
+      })
+
+      const result = await runOpenClawCleanup({
+        actionType: 'remove-openclaw',
+        backupBeforeDelete: false,
+        selectedCandidateIds: [candidate.candidateId],
+      })
+
+      expect(result.ok).toBe(true)
+      expect(result.perCandidateResults?.[0]?.finalStatus).toBe('success')
+      expect(uninstallOpenClawNpmGlobalPackageMock).not.toHaveBeenCalled()
+      expect(clearSelectedWindowsOpenClawRuntimeSelectionMock).toHaveBeenCalledTimes(1)
+      expect(fs.existsSync(binaryPath)).toBe(false)
+      expect(fs.existsSync(shimPath)).toBe(false)
+      expect(fs.existsSync(powershellShimPath)).toBe(false)
+      expect(fs.existsSync(packageRoot)).toBe(false)
+    } finally {
+      if (originalPlatformDescriptor) {
+        Object.defineProperty(process, 'platform', originalPlatformDescriptor)
+      }
+    }
+  })
+
+  it('does not clear the selected Windows runtime when deleting an inactive owned candidate', async () => {
+    const tempRoot = makeTempDir()
+    const runtimeRoot = path.join(tempRoot, 'managed-runtime')
+    const packageRoot = path.join(runtimeRoot, 'node_modules', 'openclaw')
+    const binaryPath = path.join(runtimeRoot, 'openclaw.cmd')
+    const candidate = {
+      ...buildCandidate({ id: 'candidate-managed-inactive', source: 'qclaw-managed' }),
+      binaryPath,
+      resolvedBinaryPath: binaryPath,
+      packageRoot,
+      stateRoot: path.join(tempRoot, 'missing-openclaw-home'),
+      configPath: path.join(tempRoot, 'missing-openclaw-home', 'openclaw.json'),
+      displayStateRoot: path.join(tempRoot, 'missing-openclaw-home'),
+    }
+    const originalPlatformDescriptor = Object.getOwnPropertyDescriptor(process, 'platform')
+
+    fs.mkdirSync(packageRoot, { recursive: true })
+    fs.writeFileSync(binaryPath, '@echo off\r\n')
+    Object.defineProperty(process, 'platform', {
+      value: 'win32',
+    })
+    getSelectedWindowsActiveRuntimeSnapshotMock.mockReturnValue(
+      buildWindowsSelectedRuntimeSnapshot({
+        hostPackageRoot: path.join(tempRoot, 'other-runtime', 'node_modules', 'openclaw'),
+        openclawPath: path.join(tempRoot, 'other-runtime', 'openclaw.cmd'),
+        stateDir: path.join(tempRoot, 'other-state'),
+      })
+    )
+
+    try {
+      buildOpenClawCleanupPreviewMock.mockResolvedValue({
+        ok: true,
+        canRun: true,
+        actionType: 'remove-openclaw',
+        activeCandidate: candidate,
+        availableCandidates: [candidate],
+        selectedCandidateIds: [candidate.candidateId],
+        deleteItems: [],
+        keepItems: [],
+        backupItems: [],
+        warnings: [],
+        blockedReasons: [],
+        backupDirectory: '/Users/test/Documents/Qclaw Lite Backups',
+      })
+      cleanupOpenClawStateAndDataMock.mockResolvedValue({
+        ok: true,
+        stdout: 'ok',
+        stderr: '',
+        code: 0,
+      })
+
+      const result = await runOpenClawCleanup({
+        actionType: 'remove-openclaw',
+        backupBeforeDelete: false,
+        selectedCandidateIds: [candidate.candidateId],
+      })
+
+      expect(result.ok).toBe(true)
+      expect(clearSelectedWindowsOpenClawRuntimeSelectionMock).not.toHaveBeenCalled()
+    } finally {
+      if (originalPlatformDescriptor) {
+        Object.defineProperty(process, 'platform', originalPlatformDescriptor)
+      }
+    }
+  })
+
+  it('fails verification when openclaw still resolves to a leftover Windows sibling shim', async () => {
+    const tempRoot = makeTempDir()
+    const runtimeRoot = path.join(tempRoot, 'managed-runtime')
+    const packageRoot = path.join(runtimeRoot, 'node_modules', 'openclaw')
+    const binaryPath = path.join(runtimeRoot, 'openclaw.cmd')
+    const shimPath = path.join(runtimeRoot, 'openclaw')
+    const candidate = {
+      ...buildCandidate({ id: 'candidate-managed-shim', source: 'qclaw-managed' }),
+      binaryPath,
+      resolvedBinaryPath: binaryPath,
+      packageRoot,
+      stateRoot: path.join(tempRoot, 'missing-openclaw-home'),
+      configPath: path.join(tempRoot, 'missing-openclaw-home', 'openclaw.json'),
+      displayStateRoot: path.join(tempRoot, 'missing-openclaw-home'),
+    }
+    const originalPlatformDescriptor = Object.getOwnPropertyDescriptor(process, 'platform')
+
+    fs.mkdirSync(packageRoot, { recursive: true })
+    fs.writeFileSync(binaryPath, '@echo off\r\n')
+    fs.writeFileSync(shimPath, '#!/bin/sh\n')
+    Object.defineProperty(process, 'platform', {
+      value: 'win32',
+    })
+    resolveOpenClawBinaryPathMock.mockResolvedValue(shimPath)
+
+    try {
+      buildOpenClawCleanupPreviewMock.mockResolvedValue({
+        ok: true,
+        canRun: true,
+        actionType: 'remove-openclaw',
+        activeCandidate: candidate,
+        availableCandidates: [candidate],
+        selectedCandidateIds: [candidate.candidateId],
+        deleteItems: [],
+        keepItems: [],
+        backupItems: [],
+        warnings: [],
+        blockedReasons: [],
+        backupDirectory: '/Users/test/Documents/Qclaw Lite Backups',
+      })
+      cleanupOpenClawStateAndDataMock.mockResolvedValue({
+        ok: true,
+        stdout: 'ok',
+        stderr: '',
+        code: 0,
+      })
+
+      const result = await runOpenClawCleanup({
+        actionType: 'remove-openclaw',
+        backupBeforeDelete: false,
+        selectedCandidateIds: [candidate.candidateId],
+      })
+
+      expect(result.ok).toBe(false)
+      expect(result.perCandidateResults?.[0]?.verification?.commandPointsToTarget).toBe(true)
+      expect(result.perCandidateResults?.[0]?.errors.some((error) => error.includes('指向该实例路径'))).toBe(true)
     } finally {
       if (originalPlatformDescriptor) {
         Object.defineProperty(process, 'platform', originalPlatformDescriptor)

@@ -38,6 +38,8 @@ import {
   resolveManagedPluginInstallPreflight,
   resolveManagedPluginInstallStrategy,
   restoreCapturedFeishuBotConfig,
+  shouldAdoptPendingFeishuCreateSession,
+  shouldShowFeishuCreateRuntimeSurface,
   shouldAllowFeishuLinkPairingAfterGatewayFailure,
   shouldAutoFinishFeishuCreateMode,
   shouldShowFeishuCreateInstallerArtifacts,
@@ -68,6 +70,16 @@ describe('ChannelConnect source copy cleanup', () => {
   it('does not keep the redundant weixin helper paragraphs', () => {
     expect(channelConnectSource).not.toContain('点击“开始连接”后，Qclaw 会安装个人微信插件')
     expect(channelConnectSource).not.toContain('如果二维码过期，安装器会自动刷新；连接成功后')
+  })
+
+  it('keeps Feishu create startup on lightweight installer polling instead of plugin-ready refresh fallback', () => {
+    expect(channelConnectSource).toContain('const waitForFeishuInstallerActivation = useCallback(')
+    expect(channelConnectSource).toContain("setFeishuInstallerNotice('正在启动飞书官方安装器并等待二维码，请稍候...')")
+    expect(channelConnectSource).toContain('shouldWaitForFeishuInstallerActivation')
+    expect(channelConnectSource).toContain('extractFeishuInstallerStartFailureDetail')
+    expect(channelConnectSource).toContain("setError(toUserFacingUnknownErrorMessage(e, '启动飞书官方安装器失败'))")
+    expect(channelConnectSource).not.toContain("setFeishuInstallerNotice('飞书安装器正在启动，Qclaw 正在继续等待二维码。')")
+    expect(channelConnectSource).not.toContain("setFeishuInstallerNotice('正在检测飞书安装器状态，请稍候...')")
   })
 
   it('keeps personal weixin installer startup independent from local binding recovery', () => {
@@ -1390,6 +1402,16 @@ describe('shouldValidateFeishuManualCredentials', () => {
 })
 
 describe('Feishu create session ownership helpers', () => {
+  it('keeps the create runtime QR surface scoped to the session started by this page', () => {
+    expect(channelConnectSource).toContain('createRuntimeSessionId: feishuCreateRuntimeSessionId')
+    expect(channelConnectSource).toContain('runtimeSessionId === currentSessionId')
+    expect(channelConnectSource).toContain('ownership: feishuCreateSessionOwnership')
+    expect(channelConnectSource).toContain("rememberFeishuCreateSessionOwnership(payload.sessionId, 'started-here')")
+    expect(channelConnectSource).toContain('shouldAdoptCurrentFeishuCreateSession(payload.sessionId, true, payload.requestToken)')
+    expect(channelConnectSource).toContain('requestToken: feishuCreateRequestTokenRef.current')
+    expect(channelConnectSource).toContain('sessionRequestToken')
+  })
+
   it('treats only matching owned sessions as the current create flow', () => {
     expect(
       isOwnedFeishuCreateSession({
@@ -1525,12 +1547,123 @@ describe('Feishu create session ownership helpers', () => {
     ).toBe(false)
   })
 
-  it('shows create installer artifacts only for the owned Feishu create flow', () => {
+  it('shows the create runtime surface after this page captured a create start snapshot', () => {
+    expect(
+      shouldShowFeishuCreateRuntimeSurface({
+        selectedChannelId: 'feishu',
+        setupMode: 'create',
+        showOwnedCreateSessionSurface: true,
+        hasCapturedCreateStartSnapshot: false,
+        createRuntimeSessionId: '',
+        session: { sessionId: 'session-1', phase: 'running', active: true },
+      })
+    ).toBe(true)
+
+    expect(
+      shouldShowFeishuCreateRuntimeSurface({
+        selectedChannelId: 'feishu',
+        setupMode: 'create',
+        showOwnedCreateSessionSurface: false,
+        hasCapturedCreateStartSnapshot: true,
+        createRuntimeSessionId: 'session-1',
+        session: { sessionId: 'session-1', phase: 'running', active: true },
+      })
+    ).toBe(true)
+
+    expect(
+      shouldShowFeishuCreateRuntimeSurface({
+        selectedChannelId: 'feishu',
+        setupMode: 'link',
+        showOwnedCreateSessionSurface: true,
+        hasCapturedCreateStartSnapshot: true,
+        createRuntimeSessionId: 'session-1',
+        session: { sessionId: 'session-1', phase: 'running', active: true },
+      })
+    ).toBe(false)
+
+    expect(
+      shouldShowFeishuCreateRuntimeSurface({
+        selectedChannelId: 'weixin',
+        setupMode: 'create',
+        showOwnedCreateSessionSurface: true,
+        hasCapturedCreateStartSnapshot: true,
+        createRuntimeSessionId: 'session-1',
+        session: { sessionId: 'session-1', phase: 'running', active: true },
+      })
+    ).toBe(false)
+
+    expect(
+      shouldShowFeishuCreateRuntimeSurface({
+        selectedChannelId: 'feishu',
+        setupMode: 'create',
+        showOwnedCreateSessionSurface: false,
+        hasCapturedCreateStartSnapshot: true,
+        createRuntimeSessionId: 'session-owned-here',
+        session: { sessionId: 'session-started-elsewhere', phase: 'running', active: true },
+      })
+    ).toBe(false)
+
+    expect(
+      shouldShowFeishuCreateRuntimeSurface({
+        selectedChannelId: 'feishu',
+        setupMode: 'create',
+        showOwnedCreateSessionSurface: false,
+        hasCapturedCreateStartSnapshot: true,
+        createRuntimeSessionId: '',
+        session: { sessionId: 'session-1', phase: 'running', active: true },
+      })
+    ).toBe(false)
+  })
+
+  it('adopts only the pending or already-owned Feishu create session', () => {
+    expect(
+      shouldAdoptPendingFeishuCreateSession({
+        setupMode: 'create',
+        hasCapturedCreateStartSnapshot: true,
+        requestToken: 'req-1',
+        sessionRequestToken: 'req-1',
+        session: { sessionId: 'session-1', phase: 'running', active: true },
+      })
+    ).toBe(true)
+
+    expect(
+      shouldAdoptPendingFeishuCreateSession({
+        setupMode: 'create',
+        hasCapturedCreateStartSnapshot: true,
+        requestToken: 'req-1',
+        sessionRequestToken: 'req-2',
+        session: { sessionId: 'session-1', phase: 'running', active: true },
+      })
+    ).toBe(false)
+
+    expect(
+      shouldAdoptPendingFeishuCreateSession({
+        setupMode: 'create',
+        hasCapturedCreateStartSnapshot: true,
+        requestToken: 'req-owned-here',
+        sessionRequestToken: 'req-started-elsewhere',
+        session: { sessionId: 'session-started-elsewhere', phase: 'running', active: true },
+      })
+    ).toBe(false)
+
+    expect(
+      shouldAdoptPendingFeishuCreateSession({
+        setupMode: 'create',
+        hasCapturedCreateStartSnapshot: true,
+        requestToken: '',
+        ownership: { sessionId: 'session-1', source: 'started-here' },
+        sessionRequestToken: '',
+        session: { sessionId: 'session-1', phase: 'running', active: true },
+      })
+    ).toBe(true)
+  })
+
+  it('shows create installer artifacts when the Feishu create runtime surface is visible', () => {
     expect(
       shouldShowFeishuCreateInstallerArtifacts({
         selectedChannelId: 'feishu',
         setupMode: 'create',
-        showOwnedCreateSessionSurface: true,
+        showCreateRuntimeSurface: true,
       })
     ).toBe(true)
 
@@ -1538,7 +1671,7 @@ describe('Feishu create session ownership helpers', () => {
       shouldShowFeishuCreateInstallerArtifacts({
         selectedChannelId: 'feishu',
         setupMode: 'create',
-        showOwnedCreateSessionSurface: false,
+        showCreateRuntimeSurface: false,
       })
     ).toBe(false)
 
@@ -1546,19 +1679,19 @@ describe('Feishu create session ownership helpers', () => {
       shouldShowFeishuCreateInstallerArtifacts({
         selectedChannelId: 'feishu',
         setupMode: 'link',
-        showOwnedCreateSessionSurface: true,
+        showCreateRuntimeSurface: true,
       })
     ).toBe(false)
   })
 
-  it('auto-opens the Feishu QR modal only for an owned running create session', () => {
+  it('auto-opens the Feishu QR modal only for a visible running create runtime surface', () => {
     expect(
       shouldAutoOpenFeishuQrModal({
         selectedChannelId: 'feishu',
         setupMode: 'create',
-        showOwnedCreateSessionSurface: true,
+        showCreateRuntimeSurface: true,
         installerRunning: true,
-        asciiQr: '██ QR',
+        hasLiveQr: true,
       })
     ).toBe(true)
 
@@ -1566,9 +1699,9 @@ describe('Feishu create session ownership helpers', () => {
       shouldAutoOpenFeishuQrModal({
         selectedChannelId: 'feishu',
         setupMode: 'create',
-        showOwnedCreateSessionSurface: false,
+        showCreateRuntimeSurface: false,
         installerRunning: true,
-        asciiQr: '██ QR',
+        hasLiveQr: true,
       })
     ).toBe(false)
 
@@ -1576,9 +1709,19 @@ describe('Feishu create session ownership helpers', () => {
       shouldAutoOpenFeishuQrModal({
         selectedChannelId: 'feishu',
         setupMode: 'create',
-        showOwnedCreateSessionSurface: true,
+        showCreateRuntimeSurface: true,
         installerRunning: false,
-        asciiQr: '██ QR',
+        hasLiveQr: true,
+      })
+    ).toBe(false)
+
+    expect(
+      shouldAutoOpenFeishuQrModal({
+        selectedChannelId: 'feishu',
+        setupMode: 'create',
+        showCreateRuntimeSurface: true,
+        installerRunning: true,
+        hasLiveQr: false,
       })
     ).toBe(false)
   })

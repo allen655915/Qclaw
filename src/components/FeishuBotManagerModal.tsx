@@ -18,11 +18,15 @@ import {
   mergeFeishuCreateModeBots,
   mergeFeishuPairingAllowFromUsersIntoConfig,
   resolveFeishuInstallerAutoPairOpenId,
+  shouldAdoptPendingFeishuCreateSession,
+  shouldShowFeishuCreateRuntimeSurface,
+  shouldShowOwnedFeishuCreateSurface,
+  type FeishuInstallerSessionIdentity,
+  type FeishuCreateSessionOwnerSource,
 } from '../pages/ChannelConnect'
 import { applyFeishuMultiBotIsolation } from '../lib/feishu-multi-bot-routing'
 import {
   extractFeishuAsciiQr,
-  extractFirstHttpUrl,
   FEISHU_OFFICIAL_GUIDE_URL,
   FEISHU_OFFICIAL_INSTALL_COMMAND,
 } from '../lib/feishu-installer'
@@ -35,6 +39,11 @@ import {
 import { resolveChannelInstallerGuardrailView } from '../lib/channel-installer-guardrail'
 import { getFeishuOfficialPluginStateReady } from '../lib/feishu-official-plugin-auto-sync'
 import type { ChannelInstallerGuardrailStatus } from '../shared/channel-installer-session'
+import {
+  extractFeishuInstallerStartFailureDetail,
+  shouldWaitForFeishuInstallerActivation,
+} from '../shared/feishu-installer-start'
+import { toUserFacingCliFailureMessage, toUserFacingUnknownErrorMessage } from '../lib/user-facing-cli-feedback'
 
 interface FeishuBotManagerModalProps {
   opened: boolean
@@ -43,7 +52,6 @@ interface FeishuBotManagerModalProps {
 
 type PairingStatusMap = Record<string, { pairedCount: number; pairedUsers: string[] }>
 type FeishuRuntimeStatusState = 'online' | 'offline' | 'degraded' | 'disabled'
-type FeishuManagerSessionOwnerSource = 'started-here' | 'resumed-running'
 type RuntimeStatusMap = Record<
   string,
   {
@@ -79,14 +87,14 @@ function normalizeFeishuManagerSessionId(sessionId?: string | null): string {
 
 export function hasOwnedFeishuManagerCreateSession(params: {
   ownedSessionId?: string | null
-  ownerSource?: FeishuManagerSessionOwnerSource | null
+  ownerSource?: FeishuCreateSessionOwnerSource | null
 }): boolean {
   return normalizeFeishuManagerSessionId(params.ownedSessionId) !== '' && Boolean(params.ownerSource)
 }
 
 function isOwnedFeishuManagerCreateSession(params: {
   ownedSessionId?: string | null
-  ownerSource?: FeishuManagerSessionOwnerSource | null
+  ownerSource?: FeishuCreateSessionOwnerSource | null
   sessionId?: string | null
 }): boolean {
   if (!hasOwnedFeishuManagerCreateSession(params)) return false
@@ -96,10 +104,43 @@ function isOwnedFeishuManagerCreateSession(params: {
   return ownedSessionId !== '' && ownedSessionId === sessionId
 }
 
+function createFeishuInstallerRequestToken(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID()
+  }
+  return `feishu-installer-${Date.now()}-${Math.random().toString(16).slice(2)}`
+}
+
+async function waitForFeishuManagerInstallerActivation(
+  applySnapshot: (snapshot: Awaited<ReturnType<typeof window.api.getFeishuInstallerState>>) => void,
+  onActivated: (snapshot: Awaited<ReturnType<typeof window.api.getFeishuInstallerState>>) => boolean | void,
+  shouldContinue: () => boolean
+): Promise<boolean> {
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    if (!shouldContinue()) return false
+    await new Promise((resolve) => setTimeout(resolve, attempt === 0 ? 250 : 400))
+    if (!shouldContinue()) return false
+    const snapshot = await window.api.getFeishuInstallerState().catch(() => null)
+    if (!shouldContinue()) return false
+    if (!snapshot) continue
+
+    applySnapshot(snapshot)
+    if (!snapshot.active || !snapshot.sessionId) continue
+
+    if (onActivated(snapshot) === false) {
+      return false
+    }
+
+    return true
+  }
+
+  return false
+}
+
 export function shouldRetainOwnedFeishuManagerCreateSessionWhileHidden(params: {
   setupMode: 'create' | 'link'
   ownedSessionId?: string | null
-  ownerSource?: FeishuManagerSessionOwnerSource | null
+  ownerSource?: FeishuCreateSessionOwnerSource | null
   installerRunning: boolean
   installerExitCode: number | null
   installerCanceled: boolean
@@ -146,9 +187,12 @@ export default function FeishuBotManagerModal({
   const [feishuInstallerSessionId, setFeishuInstallerSessionId] = useState('')
   const [ownedFeishuCreateSessionId, setOwnedFeishuCreateSessionId] = useState('')
   const [ownedFeishuCreateSessionSource, setOwnedFeishuCreateSessionSource] =
-    useState<FeishuManagerSessionOwnerSource | null>(null)
+    useState<FeishuCreateSessionOwnerSource | null>(null)
+  const [feishuCreateStartConfigSnapshotKnown, setFeishuCreateStartConfigSnapshotKnown] = useState(false)
+  const [feishuCreateRuntimeSessionId, setFeishuCreateRuntimeSessionId] = useState('')
   const [feishuInstallerRunning, setFeishuInstallerRunning] = useState(false)
   const [feishuInstallerOutput, setFeishuInstallerOutput] = useState('')
+  const [feishuInstallerQrUrl, setFeishuInstallerQrUrl] = useState('')
   const [feishuInstallerExitCode, setFeishuInstallerExitCode] = useState<number | null>(null)
   const [feishuInstallerCanceled, setFeishuInstallerCanceled] = useState(false)
   const [feishuInstallerBusy, setFeishuInstallerBusy] = useState(false)
@@ -169,6 +213,8 @@ export default function FeishuBotManagerModal({
   const feishuInstallerHandledPromptIdRef = useRef('')
   const previousOpenedRef = useRef(opened)
   const feishuCreateStartConfigSnapshotRef = useRef<Record<string, any> | null>(null)
+  const feishuCreateRequestTokenRef = useRef('')
+  const feishuInstallerActivationWaitSeqRef = useRef(0)
   const handledOwnedFeishuCreateSessionIdRef = useRef('')
   const finalizeFeishuCreateInFlightRef = useRef(false)
 
@@ -190,19 +236,42 @@ export default function FeishuBotManagerModal({
     () => extractFeishuAsciiQr(feishuInstallerOutput),
     [feishuInstallerOutput]
   )
-  const feishuInstallerQrUrl = useMemo(
-    () => extractFirstHttpUrl(feishuInstallerOutput) || FEISHU_OFFICIAL_GUIDE_URL,
-    [feishuInstallerOutput]
-  )
   const feishuInstallerHasLiveQr =
-    feishuInstallerAsciiQr.length > 0 || feishuInstallerQrUrl !== FEISHU_OFFICIAL_GUIDE_URL
-  const showOwnedFeishuCreateSessionSurface =
-    feishuBotSetupMode === 'create'
-    && isOwnedFeishuManagerCreateSession({
-      ownedSessionId: ownedFeishuCreateSessionId,
-      ownerSource: ownedFeishuCreateSessionSource,
+    feishuInstallerAsciiQr.length > 0 || Boolean(feishuInstallerQrUrl)
+  const feishuInstallerSessionIdentity = useMemo<FeishuInstallerSessionIdentity>(
+    () => ({
       sessionId: feishuInstallerSessionId,
-    })
+      phase: feishuInstallerRunning
+        ? 'running'
+        : (feishuInstallerSessionId || feishuInstallerExitCode !== null || feishuInstallerCanceled)
+          ? 'exited'
+          : 'idle',
+      active: feishuInstallerRunning,
+    }),
+    [
+      feishuInstallerCanceled,
+      feishuInstallerExitCode,
+      feishuInstallerRunning,
+      feishuInstallerSessionId,
+    ]
+  )
+  const showOwnedFeishuCreateSessionSurface = shouldShowOwnedFeishuCreateSurface({
+    selectedChannelId: 'feishu',
+    setupMode: feishuBotSetupMode,
+    ownership: {
+      sessionId: ownedFeishuCreateSessionId,
+      source: ownedFeishuCreateSessionSource,
+    },
+    session: feishuInstallerSessionIdentity,
+  })
+  const showFeishuCreateRuntimeSurface = shouldShowFeishuCreateRuntimeSurface({
+    selectedChannelId: 'feishu',
+    setupMode: feishuBotSetupMode,
+    showOwnedCreateSessionSurface: showOwnedFeishuCreateSessionSurface,
+    hasCapturedCreateStartSnapshot: feishuCreateStartConfigSnapshotKnown,
+    createRuntimeSessionId: feishuCreateRuntimeSessionId,
+    session: feishuInstallerSessionIdentity,
+  })
   const feishuInstallerManualInputBlocked = shouldDisableFeishuInstallerManualInput(feishuInstallerPendingPrompt)
   const feishuCreateInstallerButtonDisabled = shouldDisableFeishuCreateInstallerButton({
     installerRunning: feishuInstallerRunning,
@@ -218,6 +287,7 @@ export default function FeishuBotManagerModal({
       setFeishuInstallerSessionId(snapshot.sessionId || '')
       setFeishuInstallerRunning(snapshot.active)
       setFeishuInstallerOutput(snapshot.output || '')
+      setFeishuInstallerQrUrl(snapshot.qrUrl || '')
       setFeishuInstallerExitCode(snapshot.code ?? null)
       setFeishuInstallerCanceled(Boolean(snapshot.canceled))
       setFeishuInstallerPendingPrompt(snapshot.pendingPrompt || null)
@@ -226,19 +296,112 @@ export default function FeishuBotManagerModal({
     []
   )
 
-  const clearFeishuCreateSessionOwnership = useCallback(() => {
+  const clearFeishuCreateStartConfigSnapshot = useCallback(() => {
+    feishuCreateStartConfigSnapshotRef.current = null
+    feishuCreateRequestTokenRef.current = ''
+    setFeishuCreateStartConfigSnapshotKnown(false)
+    setFeishuCreateRuntimeSessionId('')
+  }, [])
+
+  const rememberFeishuCreateStartConfigSnapshot = useCallback((config: Record<string, any> | null) => {
+    feishuCreateStartConfigSnapshotRef.current = captureFeishuBotConfigSnapshot(config)
+    setFeishuCreateStartConfigSnapshotKnown(true)
+  }, [])
+
+  const rememberFeishuCreateRuntimeSession = useCallback((sessionId: string | null | undefined) => {
+    const normalizedSessionId = normalizeFeishuManagerSessionId(sessionId)
+    if (!normalizedSessionId) return
+    setFeishuCreateRuntimeSessionId(normalizedSessionId)
+  }, [])
+
+  const clearOwnedFeishuCreateSessionMarkers = useCallback(() => {
     setOwnedFeishuCreateSessionId('')
     setOwnedFeishuCreateSessionSource(null)
   }, [])
 
+  const clearFeishuCreateSessionOwnership = useCallback(() => {
+    clearFeishuCreateStartConfigSnapshot()
+    clearOwnedFeishuCreateSessionMarkers()
+  }, [clearFeishuCreateStartConfigSnapshot, clearOwnedFeishuCreateSessionMarkers])
+
   const rememberFeishuCreateSessionOwnership = useCallback(
-    (sessionId: string | null | undefined, source: FeishuManagerSessionOwnerSource) => {
+    (sessionId: string | null | undefined, source: FeishuCreateSessionOwnerSource) => {
       const normalizedSessionId = normalizeFeishuManagerSessionId(sessionId)
       if (!normalizedSessionId) return
       setOwnedFeishuCreateSessionId(normalizedSessionId)
       setOwnedFeishuCreateSessionSource(source)
     },
     []
+  )
+
+  const shouldAdoptFeishuCreateSession = useCallback(
+    (
+      sessionId: string | null | undefined,
+      active: boolean,
+      sessionRequestToken?: string | null,
+      setupModeOverride?: 'create' | 'link'
+    ) =>
+      shouldAdoptPendingFeishuCreateSession({
+        setupMode: setupModeOverride || feishuBotSetupMode,
+        hasCapturedCreateStartSnapshot: Boolean(feishuCreateStartConfigSnapshotRef.current),
+        requestToken: feishuCreateRequestTokenRef.current,
+        ownership: {
+          sessionId: ownedFeishuCreateSessionId,
+          source: ownedFeishuCreateSessionSource,
+        },
+        sessionRequestToken,
+        session: {
+          sessionId,
+          phase: active ? 'running' : 'idle',
+          active,
+        },
+      }),
+    [
+      feishuBotSetupMode,
+      ownedFeishuCreateSessionId,
+      ownedFeishuCreateSessionSource,
+    ]
+  )
+
+  const resolveFeishuInstallerStartFailureMessage = useCallback(
+    (
+      snapshot: Awaited<ReturnType<typeof window.api.getFeishuInstallerState>> | null | undefined
+    ) =>
+      toUserFacingCliFailureMessage({
+        stderr: extractFeishuInstallerStartFailureDetail(snapshot),
+        fallback: '启动飞书官方安装器失败',
+      }),
+    []
+  )
+
+  const cancelFeishuInstallerActivationWait = useCallback(() => {
+    feishuInstallerActivationWaitSeqRef.current += 1
+  }, [])
+
+  const waitForFeishuInstallerActivation = useCallback(
+    async (mode: 'create' | 'link', waitSeq: number): Promise<boolean> =>
+      waitForFeishuManagerInstallerActivation(
+        applyFeishuInstallerSnapshot,
+        (snapshot) => {
+          if (mode !== 'create') return true
+          if (shouldAdoptFeishuCreateSession(snapshot.sessionId, snapshot.active, snapshot.requestToken)) {
+            rememberFeishuCreateSessionOwnership(snapshot.sessionId, 'resumed-running')
+            rememberFeishuCreateRuntimeSession(snapshot.sessionId)
+            return true
+          }
+          setFeishuInstallerNotice(
+            '检测到已有飞书安装器正在运行。为避免误接管其他新建流程，请等待原流程完成，或先停止后重新开始。'
+          )
+          return false
+        },
+        () => feishuInstallerActivationWaitSeqRef.current === waitSeq
+      ),
+    [
+      applyFeishuInstallerSnapshot,
+      rememberFeishuCreateRuntimeSession,
+      rememberFeishuCreateSessionOwnership,
+      shouldAdoptFeishuCreateSession,
+    ]
   )
 
   const refreshFeishuBotsFromConfig = useCallback(async () => {
@@ -401,14 +564,21 @@ export default function FeishuBotManagerModal({
         sessionId: snapshotSessionId,
       })
       if (snapshot.active && snapshotSessionId) {
-        rememberFeishuCreateSessionOwnership(snapshot.sessionId, 'resumed-running')
+        if (shouldAdoptFeishuCreateSession(snapshot.sessionId, snapshot.active, snapshot.requestToken)) {
+          rememberFeishuCreateSessionOwnership(snapshot.sessionId, 'resumed-running')
+          rememberFeishuCreateRuntimeSession(snapshot.sessionId)
+        }
       } else if (!shouldRetainExitedOwnedFeishuManagerCreateSession({
         snapshotMatchesOwnedSession,
         installerRunning: snapshot.active,
         installerExitCode: snapshot.code ?? null,
         installerCanceled: Boolean(snapshot.canceled),
       })) {
-        clearFeishuCreateSessionOwnership()
+        if (feishuBotSetupMode === 'create' && feishuCreateStartConfigSnapshotRef.current) {
+          clearOwnedFeishuCreateSessionMarkers()
+        } else {
+          clearFeishuCreateSessionOwnership()
+        }
       }
       await refreshFeishuBotsFromConfig()
     } catch (e: any) {
@@ -418,23 +588,31 @@ export default function FeishuBotManagerModal({
     }
   }, [
     applyFeishuInstallerSnapshot,
+    clearOwnedFeishuCreateSessionMarkers,
     clearFeishuCreateSessionOwnership,
+    feishuBotSetupMode,
     ownedFeishuCreateSessionId,
     ownedFeishuCreateSessionSource,
     refreshFeishuBotsFromConfig,
+    rememberFeishuCreateRuntimeSession,
     rememberFeishuCreateSessionOwnership,
+    shouldAdoptFeishuCreateSession,
   ])
 
   useEffect(() => {
     const unsubscribe = window.api.onFeishuInstallerEvent((payload) => {
       if (payload.type === 'started') {
         setFeishuInstallerSessionId(payload.sessionId || '')
-        rememberFeishuCreateSessionOwnership(payload.sessionId, 'started-here')
+        if (shouldAdoptFeishuCreateSession(payload.sessionId, true, payload.requestToken)) {
+          rememberFeishuCreateSessionOwnership(payload.sessionId, 'started-here')
+          rememberFeishuCreateRuntimeSession(payload.sessionId)
+        }
         setFeishuInstallerRunning(true)
         setFeishuInstallerExitCode(null)
         setFeishuInstallerCanceled(false)
         setFeishuInstallerPendingPrompt(payload.pendingPrompt || null)
         setFeishuInstallerGuardrail(payload.guardrail || null)
+        setFeishuInstallerQrUrl(payload.qrUrl || '')
         return
       }
 
@@ -451,12 +629,20 @@ export default function FeishuBotManagerModal({
         return
       }
 
+      if (payload.type === 'qr-ready') {
+        setFeishuInstallerQrUrl(String(payload.qrUrl || '').trim())
+        return
+      }
+
       if (payload.type === 'exit') {
         setFeishuInstallerRunning(false)
         setFeishuInstallerExitCode(payload.code ?? null)
         setFeishuInstallerCanceled(Boolean(payload.canceled))
         setFeishuInstallerPendingPrompt(null)
         setFeishuInstallerGuardrail(payload.guardrail || null)
+        if (typeof payload.qrUrl === 'string') {
+          setFeishuInstallerQrUrl(payload.qrUrl)
+        }
         void refreshFeishuBotsFromConfig().catch(() => {
           // Ignore refresh failure after installer exit.
         })
@@ -464,7 +650,12 @@ export default function FeishuBotManagerModal({
     })
 
     return unsubscribe
-  }, [refreshFeishuBotsFromConfig, rememberFeishuCreateSessionOwnership])
+  }, [
+    refreshFeishuBotsFromConfig,
+    rememberFeishuCreateRuntimeSession,
+    rememberFeishuCreateSessionOwnership,
+    shouldAdoptFeishuCreateSession,
+  ])
 
   useEffect(() => {
     if (!opened) return
@@ -474,7 +665,7 @@ export default function FeishuBotManagerModal({
   useEffect(() => {
     if (!opened) return
     if (feishuBotSetupMode !== 'create') return
-    if (!showOwnedFeishuCreateSessionSurface) return
+    if (!showFeishuCreateRuntimeSurface) return
     if (feishuInstallerRunning) return
     if (feishuInstallerCanceled) return
     if (feishuInstallerExitCode !== 0) return
@@ -492,7 +683,7 @@ export default function FeishuBotManagerModal({
     feishuInstallerSessionId,
     finalizeOwnedFeishuCreateSession,
     opened,
-    showOwnedFeishuCreateSessionSurface,
+    showFeishuCreateRuntimeSurface,
   ])
 
   useEffect(() => {
@@ -500,6 +691,7 @@ export default function FeishuBotManagerModal({
     previousOpenedRef.current = opened
 
     if (!opened) {
+      cancelFeishuInstallerActivationWait()
       if (wasOpened && isFeishuCreateBotConfirmationPrompt(feishuInstallerPendingPrompt)) {
         void window.api.stopFeishuInstaller().catch(() => {
           // Best effort only; modal reopen will re-sync installer state.
@@ -519,6 +711,7 @@ export default function FeishuBotManagerModal({
       }
     }
   }, [
+    cancelFeishuInstallerActivationWait,
     clearFeishuCreateSessionOwnership,
     feishuBotSetupMode,
     feishuInstallerCanceled,
@@ -588,6 +781,8 @@ export default function FeishuBotManagerModal({
   }
 
   const startFeishuInstallerFlow = async (mode: 'create' | 'link') => {
+    cancelFeishuInstallerActivationWait()
+    const waitSeq = feishuInstallerActivationWaitSeqRef.current
     setFeishuBotSetupMode(mode)
     if (mode !== 'create') {
       clearFeishuCreateSessionOwnership()
@@ -596,32 +791,87 @@ export default function FeishuBotManagerModal({
     setBotError('')
     setFeishuInstallerNotice('')
     setFeishuInstallerGuardrail(null)
+    setFeishuInstallerOutput('')
+    setFeishuInstallerQrUrl('')
+    setFeishuInstallerExitCode(null)
+    setFeishuInstallerCanceled(false)
+    setFeishuInstallerPendingPrompt(null)
     try {
       if (mode === 'create') {
+        clearFeishuCreateStartConfigSnapshot()
         const config = sanitizeFeishuPluginConfig(await window.api.readConfig())
-        feishuCreateStartConfigSnapshotRef.current = captureFeishuBotConfigSnapshot(config)
+        rememberFeishuCreateStartConfigSnapshot(config)
         handledOwnedFeishuCreateSessionIdRef.current = ''
+        feishuCreateRequestTokenRef.current = createFeishuInstallerRequestToken()
       }
 
       const current = await window.api.getFeishuInstallerState()
       if (current.active) {
         applyFeishuInstallerSnapshot(current)
-        if (mode === 'create') {
+        if (mode === 'create' && shouldAdoptFeishuCreateSession(current.sessionId, current.active, current.requestToken, mode)) {
           rememberFeishuCreateSessionOwnership(current.sessionId, 'resumed-running')
+          rememberFeishuCreateRuntimeSession(current.sessionId)
+        } else if (mode === 'create') {
+          setFeishuInstallerNotice('检测到已有飞书安装器正在运行。为避免误接管其他新建流程，请等待原流程完成，或先停止后重新开始。')
         }
         return
       }
 
-      const snapshot = await window.api.startFeishuInstaller()
+      const snapshot = await window.api.startFeishuInstaller(
+        mode === 'create' ? feishuCreateRequestTokenRef.current : undefined
+      )
       applyFeishuInstallerSnapshot(snapshot)
-      if (mode === 'create') {
+      if (mode === 'create' && shouldAdoptFeishuCreateSession(snapshot.sessionId, Boolean(snapshot.active), snapshot.requestToken, mode)) {
         rememberFeishuCreateSessionOwnership(snapshot.sessionId, 'started-here')
+        rememberFeishuCreateRuntimeSession(snapshot.sessionId)
+      } else if (mode === 'create' && snapshot.sessionId && snapshot.active) {
+        setFeishuInstallerNotice('飞书安装器已启动，但当前页面未接管到本次新建会话。请重新发起，或先结束当前安装流程后再试。')
+      }
+      if (!snapshot.active && !shouldWaitForFeishuInstallerActivation(snapshot)) {
+        setBotError(resolveFeishuInstallerStartFailureMessage(snapshot))
+        return
       }
       if (!snapshot.sessionId || !snapshot.active) {
-        throw new Error(snapshot.output || '飞书官方安装器启动失败')
+        setBotError('')
+        setFeishuInstallerNotice('正在启动飞书官方安装器并等待二维码，请稍候...')
+        void waitForFeishuInstallerActivation(mode, waitSeq).then((started) => {
+          if (feishuInstallerActivationWaitSeqRef.current !== waitSeq) return
+          if (!started && mode === 'create') {
+            setFeishuInstallerNotice((current) =>
+              current || '飞书安装器已经发起，正在继续等待本次新建机器人的二维码。'
+            )
+          }
+        })
+        return
       }
     } catch (e: any) {
-      setBotError(e?.message || '启动飞书官方安装器失败')
+      const recoverySnapshot = await window.api.getFeishuInstallerState().catch(() => null)
+      if (recoverySnapshot) {
+        applyFeishuInstallerSnapshot(recoverySnapshot)
+        if (recoverySnapshot.active) {
+          if (mode === 'create') {
+            if (shouldAdoptFeishuCreateSession(
+              recoverySnapshot.sessionId,
+              true,
+              recoverySnapshot.requestToken,
+              mode
+            )) {
+              rememberFeishuCreateSessionOwnership(recoverySnapshot.sessionId, 'resumed-running')
+              rememberFeishuCreateRuntimeSession(recoverySnapshot.sessionId)
+            } else {
+              setFeishuInstallerNotice(
+                '检测到已有飞书安装器正在运行。为避免误接管其他新建流程，请等待原流程完成，或先停止后重新开始。'
+              )
+            }
+          }
+          return
+        }
+        if (!shouldWaitForFeishuInstallerActivation(recoverySnapshot)) {
+          setBotError(resolveFeishuInstallerStartFailureMessage(recoverySnapshot))
+          return
+        }
+      }
+      setBotError(toUserFacingUnknownErrorMessage(e, '启动飞书官方安装器失败'))
     } finally {
       setFeishuInstallerBusy(false)
     }
@@ -699,12 +949,13 @@ export default function FeishuBotManagerModal({
     onClose()
   }
 
-  const visibleFeishuInstallerRunning = showOwnedFeishuCreateSessionSurface && feishuInstallerRunning
-  const visibleFeishuInstallerExitCode = showOwnedFeishuCreateSessionSurface ? feishuInstallerExitCode : null
-  const visibleFeishuInstallerCanceled = showOwnedFeishuCreateSessionSurface && feishuInstallerCanceled
-  const visibleFeishuInstallerOutput = showOwnedFeishuCreateSessionSurface ? feishuInstallerOutput : ''
-  const visibleFeishuInstallerAsciiQr = showOwnedFeishuCreateSessionSurface ? feishuInstallerAsciiQr : ''
-  const visibleFeishuInstallerHasLiveQr = showOwnedFeishuCreateSessionSurface && feishuInstallerHasLiveQr
+  const visibleFeishuInstallerRunning = showFeishuCreateRuntimeSurface && feishuInstallerRunning
+  const visibleFeishuInstallerExitCode = showFeishuCreateRuntimeSurface ? feishuInstallerExitCode : null
+  const visibleFeishuInstallerCanceled = showFeishuCreateRuntimeSurface && feishuInstallerCanceled
+  const visibleFeishuInstallerOutput = showFeishuCreateRuntimeSurface ? feishuInstallerOutput : ''
+  const visibleFeishuInstallerAsciiQr = showFeishuCreateRuntimeSurface ? feishuInstallerAsciiQr : ''
+  const visibleFeishuInstallerQrUrl = showFeishuCreateRuntimeSurface ? feishuInstallerQrUrl : ''
+  const visibleFeishuInstallerHasLiveQr = showFeishuCreateRuntimeSurface && feishuInstallerHasLiveQr
 
   return (
     <Modal
@@ -852,7 +1103,7 @@ export default function FeishuBotManagerModal({
         {feishuBotSetupMode === 'create' ? (
           <div className="border app-border rounded-lg p-3 space-y-3">
             <div className="flex flex-col items-center gap-2">
-              {showOwnedFeishuCreateSessionSurface ? (
+              {showFeishuCreateRuntimeSurface ? (
                 visibleFeishuInstallerAsciiQr ? (
                 <div className="w-full overflow-auto rounded-lg p-2" style={{ backgroundColor: 'var(--app-bg-inset)' }}>
                   <Group justify="space-between" mb={4}>
@@ -877,7 +1128,7 @@ export default function FeishuBotManagerModal({
                       {visibleFeishuInstallerHasLiveQr ? '已刷新' : visibleFeishuInstallerRunning ? '等待中' : '未刷新'}
                     </Badge>
                   </Group>
-                  <QRCodeSVG value={feishuInstallerQrUrl} size={160} includeMargin />
+                  <QRCodeSVG value={visibleFeishuInstallerQrUrl || FEISHU_OFFICIAL_GUIDE_URL} size={160} includeMargin />
                   {visibleFeishuInstallerRunning && !visibleFeishuInstallerHasLiveQr && (
                     <Text size="xs" c="yellow" ta="center">等待安装器生成新建机器人的二维码</Text>
                   )}

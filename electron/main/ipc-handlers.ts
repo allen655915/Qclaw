@@ -921,10 +921,10 @@ export function registerIpcHandlers() {
     validateFeishuCredentials(appId, appSecret, domain)
   )
   ipcMain.handle('feishu:installer:state:get', () => getFeishuInstallerSessionSnapshot())
-  ipcMain.handle('feishu:installer:start', (event) =>
+  ipcMain.handle('feishu:installer:start', (event, requestToken?: string | null) =>
     startFeishuInstallerSession((payload) => {
       event.sender.send('feishu:installer:event', payload)
-    })
+    }, requestToken)
   )
   ipcMain.handle('feishu:installer:input', (_e, sessionId: string, input: string) =>
     writeFeishuInstallerSessionInput(sessionId, input)

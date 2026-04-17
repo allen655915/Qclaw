@@ -1,4 +1,5 @@
 import type { OpenClawInstallCandidate } from '../../src/shared/openclaw-phase1'
+import { isQclawOwnedOpenClawSource } from '../../src/shared/openclaw-phase1'
 import type {
   OpenClawBackupEntry,
   OpenClawCleanupCandidateResult,
@@ -9,6 +10,7 @@ import type {
   OpenClawCleanupVerificationResult,
 } from '../../src/shared/openclaw-phase3'
 import {
+  clearSelectedWindowsOpenClawRuntimeSelection,
   cleanupOpenClawStateAndData,
   runShell,
   uninstallOpenClawNpmGlobalPackage,
@@ -17,9 +19,11 @@ import { createManagedBackupArchive } from './openclaw-backup-index'
 import { buildOpenClawCleanupPreview } from './openclaw-cleanup-planner'
 import { resolveOpenClawPathsFromStateRoot } from './openclaw-paths'
 import { resolveOpenClawBinaryPath } from './openclaw-package'
+import { getSelectedWindowsActiveRuntimeSnapshot } from './windows-active-runtime'
 
 const fs = process.getBuiltinModule('node:fs') as typeof import('node:fs')
-const { access } = fs.promises
+const path = process.getBuiltinModule('node:path') as typeof import('node:path')
+const { access, rm } = fs.promises
 
 function normalizePathForCompare(targetPath: string): string {
   const normalized = String(targetPath || '').trim()
@@ -85,9 +89,96 @@ async function runStateCleanupStep(
   }
 }
 
-async function runProgramUninstallStep(
-  installSource: OpenClawInstallCandidate['installSource']
+function collectWindowsOwnedProgramPaths(candidate: OpenClawInstallCandidate): string[] {
+  const candidates = [
+    candidate.binaryPath,
+    candidate.resolvedBinaryPath,
+    candidate.packageRoot,
+  ]
+  const binaryDirs = [
+    path.win32.dirname(String(candidate.binaryPath || '').trim()),
+    path.win32.dirname(String(candidate.resolvedBinaryPath || '').trim()),
+  ]
+
+  for (const binaryDir of binaryDirs) {
+    if (!String(binaryDir || '').trim()) continue
+    candidates.push(path.win32.join(binaryDir, 'openclaw'))
+    candidates.push(path.win32.join(binaryDir, 'openclaw.cmd'))
+    candidates.push(path.win32.join(binaryDir, 'openclaw.exe'))
+    candidates.push(path.win32.join(binaryDir, 'openclaw.ps1'))
+  }
+
+  const deduped = new Map<string, string>()
+  for (const candidatePath of candidates) {
+    const trimmed = String(candidatePath || '').trim()
+    const normalized = normalizePathForCompare(trimmed)
+    if (!trimmed || !normalized || deduped.has(normalized)) continue
+    deduped.set(normalized, trimmed)
+  }
+  return Array.from(deduped.values())
+}
+
+function collectProgramVerificationPaths(candidate: OpenClawInstallCandidate): string[] {
+  if (process.platform === 'win32' && isQclawOwnedOpenClawSource(candidate.installSource)) {
+    return collectWindowsOwnedProgramPaths(candidate)
+  }
+  return [
+    candidate.binaryPath,
+    candidate.resolvedBinaryPath,
+    candidate.packageRoot,
+  ]
+}
+
+function matchesSelectedWindowsRuntimeCandidate(candidate: OpenClawInstallCandidate): boolean {
+  if (process.platform !== 'win32') return false
+  const selectedRuntimeSnapshot = getSelectedWindowsActiveRuntimeSnapshot()
+  if (!selectedRuntimeSnapshot) return false
+
+  const selectedPaths = [
+    selectedRuntimeSnapshot.openclawPath,
+    selectedRuntimeSnapshot.hostPackageRoot,
+  ]
+    .map((targetPath) => normalizePathForCompare(targetPath))
+    .filter(Boolean)
+  if (selectedPaths.length === 0) return false
+
+  return collectWindowsOwnedProgramPaths(candidate).some((targetPath) =>
+    selectedPaths.includes(normalizePathForCompare(targetPath))
+  )
+}
+
+async function runWindowsOwnedProgramCleanupStep(
+  candidate: OpenClawInstallCandidate
 ): Promise<OpenClawCleanupStepResult> {
+  const shouldClearSelectedRuntime = matchesSelectedWindowsRuntimeCandidate(candidate)
+  const errors: string[] = []
+  for (const targetPath of collectWindowsOwnedProgramPaths(candidate)) {
+    try {
+      await rm(targetPath, { recursive: true, force: true })
+    } catch (error) {
+      errors.push(`${targetPath}: ${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+
+  if (errors.length === 0 && shouldClearSelectedRuntime) {
+    clearSelectedWindowsOpenClawRuntimeSelection()
+  }
+
+  return {
+    attempted: true,
+    ok: errors.length === 0,
+    message:
+      errors.length === 0
+        ? 'Qclaw 自带/托管 OpenClaw 程序文件删除完成。'
+        : 'Qclaw 自带/托管 OpenClaw 程序文件删除失败。',
+    errors,
+  }
+}
+
+async function runProgramUninstallStep(
+  candidate: OpenClawInstallCandidate
+): Promise<OpenClawCleanupStepResult> {
+  const { installSource } = candidate
   if (installSource === 'homebrew') {
     const brewResult = await uninstallHomebrewPackage()
     return {
@@ -106,6 +197,10 @@ async function runProgramUninstallStep(
       message: `安装来源为 ${installSource}，为避免误删，未自动卸载程序本体。`,
       errors: [],
     }
+  }
+
+  if (process.platform === 'win32' && isQclawOwnedOpenClawSource(installSource)) {
+    return runWindowsOwnedProgramCleanupStep(candidate)
   }
 
   const packageRemovalResult = await uninstallOpenClawNpmGlobalPackage()
@@ -136,11 +231,7 @@ async function verifyCandidateCleanup(
     runtimePaths.envFile,
     runtimePaths.credentialsDir,
   ]
-  const programPaths = [
-    candidate.binaryPath,
-    candidate.resolvedBinaryPath,
-    candidate.packageRoot,
-  ]
+  const programPaths = collectProgramVerificationPaths(candidate)
   const remainingPaths: string[] = []
 
   for (const targetPath of [...statePaths, ...programPaths]) {
@@ -163,7 +254,7 @@ async function verifyCandidateCleanup(
       const normalizeForCompare = (value: string) =>
         process.platform === 'win32' ? String(value || '').toLowerCase() : String(value || '')
       const targetPaths = new Set(
-        [candidate.binaryPath, candidate.resolvedBinaryPath]
+        programPaths
           .map((targetPath) => normalizeForCompare(targetPath))
           .filter(Boolean)
       )
@@ -421,7 +512,7 @@ export async function runOpenClawCleanup(
     } else if (!stateCleanup.ok) {
       errors.push(...(stateCleanup.errors || []))
     }
-    const programUninstall = await runProgramUninstallStep(candidate.installSource)
+    const programUninstall = await runProgramUninstallStep(candidate)
     if (!programUninstall.ok) {
       errors.push(...(programUninstall.errors || []))
     }

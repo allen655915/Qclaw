@@ -221,6 +221,7 @@ interface MacGitToolsPrepareResult extends CliResult {
 interface FeishuInstallerSessionSnapshot {
   active: boolean
   sessionId: string | null
+  requestToken: string
   phase: 'idle' | 'running' | 'exited'
   output: string
   code: number | null
@@ -229,12 +230,14 @@ interface FeishuInstallerSessionSnapshot {
   command: string[]
   guardrail?: ChannelInstallerGuardrailStatus
   pendingPrompt: FeishuInstallerPendingPrompt | null
+  qrUrl: string
   authResults: FeishuInstallerAuthResult[]
 }
 
 interface FeishuInstallerSessionEvent {
   sessionId: string
-  type: 'started' | 'output' | 'prompt' | 'exit'
+  requestToken?: string
+  type: 'started' | 'output' | 'prompt' | 'qr-ready' | 'exit'
   stream?: 'stdout' | 'stderr'
   chunk?: string
   phase?: FeishuInstallerSessionSnapshot['phase']
@@ -244,6 +247,7 @@ interface FeishuInstallerSessionEvent {
   command?: string[]
   guardrail?: ChannelInstallerGuardrailStatus
   pendingPrompt?: FeishuInstallerPendingPrompt | null
+  qrUrl?: string
 }
 
 interface FeishuInstallerAuthResult {
@@ -1776,7 +1780,7 @@ interface ElectronApi {
   ensureFeishuOfficialPluginReady: () => Promise<EnsureFeishuOfficialPluginReadyResult>
   validateFeishuCredentials: (appId: string, appSecret: string, domain?: string) => Promise<CliResult>
   getFeishuInstallerState: () => Promise<FeishuInstallerSessionSnapshot>
-  startFeishuInstaller: () => Promise<FeishuInstallerSessionSnapshot>
+  startFeishuInstaller: (requestToken?: string) => Promise<FeishuInstallerSessionSnapshot>
   listenFeishuBotDiagnosticActivity: (
     accountId?: FeishuBotDiagnosticListenRequest['accountId'],
     timeoutMs?: FeishuBotDiagnosticListenRequest['timeoutMs'],
