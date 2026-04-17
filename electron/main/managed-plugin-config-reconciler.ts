@@ -6,6 +6,11 @@ import {
   type ManagedChannelConfigReconcileScope,
   type ManagedChannelPluginLifecycleSpec,
 } from '../../src/shared/managed-channel-plugin-lifecycle'
+import {
+  PINNED_OPENCLAW_VERSION,
+  normalizeOpenClawPolicyVersion,
+} from '../../src/shared/openclaw-version-policy'
+import { getManagedChannelPluginByChannelId } from '../../src/shared/managed-channel-plugin-registry'
 import type { OpenClawGuardedWriteResult } from '../../src/shared/openclaw-phase2'
 import type { applyConfigPatchGuarded as ApplyConfigPatchGuarded } from './openclaw-config-coordinator'
 
@@ -140,6 +145,12 @@ function mergeRemovedFrom(
   }
 }
 
+const QQ_RUNTIME_ALLOW_ID = 'qqbot'
+const QQ_LEGACY_CONFIG_PLUGIN_IDS = normalizePluginIds(
+  (getManagedChannelPluginByChannelId('qqbot')?.cleanupPluginIds || [])
+    .filter((pluginId) => normalizeText(pluginId) !== QQ_RUNTIME_ALLOW_ID)
+)
+
 function hasPluginResidue(
   config: Record<string, any>,
   spec: ManagedChannelPluginLifecycleSpec,
@@ -159,6 +170,92 @@ function hasPluginResidue(
   if (pluginIds.some((pluginId) => Object.prototype.hasOwnProperty.call(installs, pluginId))) return true
   return scope === 'plugins-and-channels'
     && spec.cleanupChannelIds.some((channelId) => Object.prototype.hasOwnProperty.call(channels, channelId))
+}
+
+function hasConfiguredQqChannel(config: Record<string, any> | null | undefined): boolean {
+  const qqbot = hasOwnRecord(config?.channels?.qqbot) ? config!.channels.qqbot : null
+  return Boolean(
+    qqbot
+    && normalizeText(qqbot.appId)
+    && (normalizeText(qqbot.clientSecret) || normalizeText(qqbot.appSecret))
+  )
+}
+
+function hasQqPluginResidue(config: Record<string, any>): boolean {
+  const plugins = hasOwnRecord(config.plugins) ? config.plugins : {}
+  const allow = Array.isArray(plugins.allow)
+    ? plugins.allow.map((item: unknown) => normalizeText(item)).filter(Boolean)
+    : []
+  const entries = hasOwnRecord(plugins.entries) ? plugins.entries : {}
+  const installs = hasOwnRecord(plugins.installs) ? plugins.installs : {}
+  const qqPluginIds = normalizePluginIds([QQ_RUNTIME_ALLOW_ID, ...QQ_LEGACY_CONFIG_PLUGIN_IDS])
+
+  return qqPluginIds.some((pluginId) =>
+    allow.includes(pluginId)
+    || Object.prototype.hasOwnProperty.call(entries, pluginId)
+    || Object.prototype.hasOwnProperty.call(installs, pluginId)
+  )
+}
+
+function reconcileBundledQqPluginConfig(
+  config: Record<string, any> | null | undefined,
+  scope: ManagedChannelConfigReconcileScope
+): ManagedChannelConfigReconcileResult {
+  const next = cloneConfig(config)
+  const removedFrom = createEmptyRemovedFrom()
+  const hasConfiguredChannel = hasConfiguredQqChannel(next)
+  const shouldManageQqPluginConfig = hasConfiguredChannel || hasQqPluginResidue(next)
+  if (!shouldManageQqPluginConfig) {
+    return {
+      config: next,
+      changed: false,
+      scope,
+      configReadFailed: false,
+      removedFrom,
+    }
+  }
+
+  next.plugins = hasOwnRecord(next.plugins) ? next.plugins : {}
+  const allow = Array.isArray(next.plugins.allow)
+    ? next.plugins.allow.map((item: unknown) => normalizeText(item)).filter(Boolean)
+    : []
+  const runtimeAndLegacyQqPluginIds = normalizePluginIds([
+    QQ_RUNTIME_ALLOW_ID,
+    ...QQ_LEGACY_CONFIG_PLUGIN_IDS,
+  ])
+  const allowCleanupPluginIds = hasConfiguredChannel
+    ? QQ_LEGACY_CONFIG_PLUGIN_IDS
+    : runtimeAndLegacyQqPluginIds
+  const recordCleanupPluginIds = hasConfiguredChannel
+    ? runtimeAndLegacyQqPluginIds
+    : allowCleanupPluginIds
+  const normalizedAllow = normalizePluginIds([
+    ...allow.filter((pluginId: string) => !allowCleanupPluginIds.includes(pluginId)),
+    ...(hasConfiguredChannel ? [QQ_RUNTIME_ALLOW_ID] : []),
+  ])
+  removedFrom.allow.push(
+    ...allow.filter((pluginId: string) => allowCleanupPluginIds.includes(pluginId))
+  )
+  let changed = !isDeepEqual(allow, normalizedAllow)
+  next.plugins.allow = normalizedAllow
+
+  for (const key of ['entries', 'installs'] as const) {
+    if (!hasOwnRecord(next.plugins[key])) continue
+    for (const pluginId of recordCleanupPluginIds) {
+      if (!Object.prototype.hasOwnProperty.call(next.plugins[key], pluginId)) continue
+      delete next.plugins[key][pluginId]
+      removedFrom[key].push(pluginId)
+      changed = true
+    }
+  }
+
+  return {
+    config: next,
+    changed,
+    scope,
+    configReadFailed: false,
+    removedFrom,
+  }
 }
 
 function collectConfiguredInstallPaths(config: Record<string, any>, pluginId: string): string[] {
@@ -481,25 +578,30 @@ export async function reconcileManagedPluginConfig(
   let orphanedPluginIds: string[] = []
 
   if (!options.desiredConfig) {
+    const useBundledQqContract =
+      spec.channelId === 'qqbot'
+      && normalizeOpenClawPolicyVersion(runtimeContext.openclawVersion) === PINNED_OPENCLAW_VERSION
     const shouldRunSharedReconcile = installedOnDisk || hasPluginResidue(beforeConfig, spec, scope)
-    const sharedReconcile = shouldRunSharedReconcile
-      ? reconcileManagedChannelPluginConfig(
-          spec.channelId,
-          beforeConfig,
-          createManagedChannelRuntimeSnapshot({
-            installedOnDisk,
-            homeDir: homeDir || undefined,
-            installPath: installedOnDisk ? canonicalInstallPath || undefined : undefined,
-          }),
-          { scope }
-        )
-      : null
+    const sharedReconcile = useBundledQqContract
+      ? reconcileBundledQqPluginConfig(beforeConfig, scope)
+      : shouldRunSharedReconcile
+        ? reconcileManagedChannelPluginConfig(
+            spec.channelId,
+            beforeConfig,
+            createManagedChannelRuntimeSnapshot({
+              installedOnDisk,
+              homeDir: homeDir || undefined,
+              installPath: installedOnDisk ? canonicalInstallPath || undefined : undefined,
+            }),
+            { scope }
+          )
+        : null
     afterConfig = cloneConfig(sharedReconcile?.config || beforeConfig)
     removedFrom = sharedReconcile?.removedFrom || createEmptyRemovedFrom()
-    const preserveCanonicalConfiguredPath = homeDir
+    const preserveCanonicalConfiguredPath = !useBundledQqContract && homeDir
       ? await hasExistingConfiguredInstallPath(
-        homeDir,
-        collectConfiguredInstallPaths(beforeConfig, spec.canonicalPluginId),
+          homeDir,
+          collectConfiguredInstallPaths(beforeConfig, spec.canonicalPluginId),
         pathExists
       )
       : false
@@ -514,7 +616,7 @@ export async function reconcileManagedPluginConfig(
       removedFrom = restored.removedFrom
     }
 
-    orphanedPluginIds = options.detectOrphans === false || !homeDir
+    orphanedPluginIds = useBundledQqContract || options.detectOrphans === false || !homeDir
       ? []
       : await collectOrphanedManagedPluginIds({
           config: afterConfig,

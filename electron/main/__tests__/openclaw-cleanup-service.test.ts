@@ -219,6 +219,115 @@ describe('openclaw cleanup service', () => {
     expect(result.perCandidateResults?.[0]?.programUninstall?.message).toContain('未自动卸载程序本体')
   })
 
+  it('reuses state cleanup when selected instances share the same state root', async () => {
+    const candidate1 = buildCandidate({ id: 'candidate-1', source: 'npm-global' })
+    const candidate2 = {
+      ...buildCandidate({ id: 'candidate-2', source: 'npm-global' }),
+      configPath: candidate1.configPath,
+      stateRoot: candidate1.stateRoot,
+      displayConfigPath: candidate1.displayConfigPath,
+      displayStateRoot: candidate1.displayStateRoot,
+    }
+
+    buildOpenClawCleanupPreviewMock.mockResolvedValue({
+      ok: true,
+      canRun: true,
+      actionType: 'remove-openclaw',
+      activeCandidate: candidate1,
+      availableCandidates: [candidate1, candidate2],
+      selectedCandidateIds: [candidate1.candidateId, candidate2.candidateId],
+      deleteItems: [],
+      keepItems: [],
+      backupItems: [],
+      warnings: [],
+      blockedReasons: [],
+      backupDirectory: '/Users/test/Documents/Qclaw Lite Backups',
+    })
+    cleanupOpenClawStateAndDataMock.mockResolvedValue({
+      ok: true,
+      stdout: 'ok',
+      stderr: '',
+      code: 0,
+    })
+    uninstallOpenClawNpmGlobalPackageMock.mockResolvedValue({
+      ok: true,
+      stdout: '',
+      stderr: '',
+      code: 0,
+    })
+
+    const result = await runOpenClawCleanup({
+      actionType: 'remove-openclaw',
+      backupBeforeDelete: false,
+      selectedCandidateIds: [candidate1.candidateId, candidate2.candidateId],
+    })
+
+    expect(result.ok).toBe(true)
+    expect(result.summary).toEqual({
+      total: 2,
+      success: 2,
+      partial: 0,
+      failed: 0,
+      skipped: 0,
+    })
+    expect(cleanupOpenClawStateAndDataMock).toHaveBeenCalledTimes(1)
+    expect(cleanupOpenClawStateAndDataMock).toHaveBeenCalledWith({
+      stateRootOverride: candidate1.stateRoot,
+      displayStateRootOverride: candidate1.displayStateRoot,
+      targetedStateCleanup: true,
+    })
+    expect(uninstallOpenClawNpmGlobalPackageMock).toHaveBeenCalledTimes(2)
+    expect(result.perCandidateResults?.[1]?.stateCleanup?.attempted).toBe(false)
+    expect(result.perCandidateResults?.[1]?.warnings).toContain(
+      '检测到已选实例共用同一状态目录，本实例未重复执行状态清理。'
+    )
+  })
+
+  it('does not report a fake shell command for windows state cleanup metadata', async () => {
+    const candidate = buildCandidate({ id: 'candidate-win', source: 'custom' })
+    const originalPlatformDescriptor = Object.getOwnPropertyDescriptor(process, 'platform')
+
+    Object.defineProperty(process, 'platform', {
+      value: 'win32',
+    })
+
+    try {
+      buildOpenClawCleanupPreviewMock.mockResolvedValue({
+        ok: true,
+        canRun: true,
+        actionType: 'remove-openclaw',
+        activeCandidate: candidate,
+        availableCandidates: [candidate],
+        selectedCandidateIds: [candidate.candidateId],
+        deleteItems: [],
+        keepItems: [],
+        backupItems: [],
+        warnings: [],
+        blockedReasons: [],
+        backupDirectory: '/Users/test/Documents/Qclaw Lite Backups',
+      })
+      cleanupOpenClawStateAndDataMock.mockResolvedValue({
+        ok: true,
+        stdout: 'ok',
+        stderr: '',
+        code: 0,
+      })
+
+      const result = await runOpenClawCleanup({
+        actionType: 'remove-openclaw',
+        backupBeforeDelete: false,
+        selectedCandidateIds: [candidate.candidateId],
+      })
+
+      expect(result.ok).toBe(true)
+      expect(result.perCandidateResults?.[0]?.stateCleanup?.command).toBeUndefined()
+    } finally {
+      if (originalPlatformDescriptor) {
+        Object.defineProperty(process, 'platform', originalPlatformDescriptor)
+      }
+    }
+  })
+
   it('keeps batch running when one candidate fails and reports failure summary', async () => {
     const candidate1 = buildCandidate({ id: 'candidate-1', source: 'homebrew' })
     const candidate2 = buildCandidate({ id: 'candidate-2', source: 'npm-global' })

@@ -85,6 +85,14 @@ const WECOM_MANAGED_PLUGIN = getManagedChannelPluginByChannelId('wecom')
 const DINGTALK_MANAGED_PLUGIN = getManagedChannelPluginByChannelId('dingtalk')
 const QQBOT_MANAGED_PLUGIN = getManagedChannelPluginByChannelId('qqbot')
 const WEIXIN_MANAGED_PLUGIN = getManagedChannelPluginByChannelId('openclaw-weixin')
+const QQBOT_RUNTIME_ALLOW_ID = 'qqbot'
+const QQBOT_LEGACY_CONFIG_PLUGIN_IDS = Array.from(
+  new Set(
+    (QQBOT_MANAGED_PLUGIN?.cleanupPluginIds || [])
+      .map((pluginId) => String(pluginId || '').trim())
+      .filter((pluginId) => pluginId && pluginId !== QQBOT_RUNTIME_ALLOW_ID)
+  )
+)
 
 const CHANNEL_DEFINITIONS: ChannelDefinition[] = [
   {
@@ -206,6 +214,67 @@ function removePluginAllow(config: Record<string, any>, allowId: string | undefi
   config.plugins.allow = config.plugins.allow.filter((item: unknown) => String(item || '').trim() !== allowId)
 }
 
+function removePluginConfigIds(config: Record<string, any>, pluginIds: string[]): void {
+  const normalizedPluginIds = Array.from(
+    new Set(pluginIds.map((pluginId) => String(pluginId || '').trim()).filter(Boolean))
+  )
+  if (normalizedPluginIds.length === 0) return
+  if (!hasOwnRecord(config.plugins)) return
+
+  if (Array.isArray(config.plugins.allow)) {
+    config.plugins.allow = config.plugins.allow.filter(
+      (item: unknown) => !normalizedPluginIds.includes(String(item || '').trim())
+    )
+  }
+
+  for (const key of ['entries', 'installs'] as const) {
+    if (!hasOwnRecord(config.plugins[key])) continue
+    for (const pluginId of normalizedPluginIds) {
+      delete config.plugins[key][pluginId]
+    }
+  }
+}
+
+function hasConfiguredPluginId(config: Record<string, any>, pluginId: string): boolean {
+  if (!pluginId || !hasOwnRecord(config.plugins)) return false
+
+  if (Array.isArray(config.plugins.allow)) {
+    const allow = config.plugins.allow.map((item: unknown) => String(item || '').trim())
+    if (allow.includes(pluginId)) return true
+  }
+
+  for (const key of ['entries', 'installs'] as const) {
+    if (hasOwnRecord(config.plugins[key]) && hasOwnRecord(config.plugins[key][pluginId])) {
+      return true
+    }
+  }
+
+  return false
+}
+
+function resolveChannelConfigAllowId(
+  channel: Pick<ChannelDefinition, 'id' | 'plugin'>,
+  config: Record<string, any>
+): string | undefined {
+  if (channel.id !== 'qqbot') return resolveChannelPluginAllowId(channel)
+  if (hasConfiguredPluginId(config, QQBOT_RUNTIME_ALLOW_ID)) return QQBOT_RUNTIME_ALLOW_ID
+
+  const explicitAllowId = String(channel.plugin?.allowId || '').trim()
+  return explicitAllowId || resolveChannelPluginAllowId(channel)
+}
+
+function listChannelConfiguredPluginIds(channel: Pick<ChannelDefinition, 'id' | 'plugin'>): string[] {
+  const preferredPluginId = resolveChannelPluginAllowId(channel)
+  if (channel.id === 'qqbot') {
+    return Array.from(new Set([
+      preferredPluginId,
+      ...(QQBOT_MANAGED_PLUGIN?.cleanupPluginIds || []),
+    ].map((pluginId) => String(pluginId || '').trim()).filter(Boolean)))
+  }
+
+  return preferredPluginId ? [preferredPluginId] : []
+}
+
 function trimFieldValue(formData: Record<string, string>, key: string): string {
   return String(formData[key] || '').trim()
 }
@@ -242,7 +311,11 @@ export function getChannelDefinition(channelId: string): ChannelDefinition | nul
   return channel ? cloneChannelDefinition(channel) : null
 }
 
-export function resolveChannelPluginAllowId(channel: Pick<ChannelDefinition, 'plugin'>): string | undefined {
+export function resolveChannelPluginAllowId(
+  channel: Pick<ChannelDefinition, 'plugin'> & Partial<Pick<ChannelDefinition, 'id'>>
+): string | undefined {
+  if (channel.id === 'qqbot') return QQBOT_RUNTIME_ALLOW_ID
+
   const explicitAllowId = String(channel.plugin?.allowId || '').trim()
   if (explicitAllowId) return explicitAllowId
 
@@ -271,24 +344,30 @@ export function isChannelPluginConfigured(
   const channel = getChannelDefinition(channelId)
   if (!channel?.plugin) return false
 
-  const pluginId = resolveChannelPluginAllowId(channel)
-  if (!pluginId) return false
+  const configuredPluginIds = listChannelConfiguredPluginIds(channel)
+  if (configuredPluginIds.length === 0) return false
 
   const plugins = hasOwnRecord(config?.plugins) ? config.plugins : null
   if (!plugins) return false
 
-  if (Array.isArray(plugins.allow) && plugins.allow.some((item) => String(item || '').trim() === pluginId)) {
+  if (Array.isArray(plugins.allow) && plugins.allow.some((item) => configuredPluginIds.includes(String(item || '').trim()))) {
     return true
   }
 
   if (hasOwnRecord(plugins.entries)) {
-    const entry = plugins.entries[pluginId]
-    if (hasOwnRecord(entry) && entry.enabled !== false) {
+    const hasConfiguredEntry = configuredPluginIds.some((pluginId) => {
+      const entry = plugins.entries[pluginId]
+      return hasOwnRecord(entry) && entry.enabled !== false
+    })
+    if (hasConfiguredEntry) {
       return true
     }
   }
 
-  if (hasOwnRecord(plugins.installs) && hasOwnRecord(plugins.installs[pluginId])) {
+  if (
+    hasOwnRecord(plugins.installs)
+    && configuredPluginIds.some((pluginId) => hasOwnRecord(plugins.installs[pluginId]))
+  ) {
     return true
   }
 
@@ -442,9 +521,10 @@ export function applyChannelConfig(
       ...existingChannelWithoutLegacySecret,
       enabled: true,
       appId: values.appId,
-      clientSecret: values.appSecret,
-      allowFrom,
-    }
+        clientSecret: values.appSecret,
+        allowFrom,
+      }
+      removePluginConfigIds(nextConfig, QQBOT_LEGACY_CONFIG_PLUGIN_IDS)
   } else if (channel.id === 'openclaw-weixin') {
     const existingChannel = (nextConfig.channels['openclaw-weixin'] || {}) as Record<string, any>
     nextConfig.channels['openclaw-weixin'] = {
@@ -457,7 +537,7 @@ export function applyChannelConfig(
     }
   }
 
-  ensurePluginAllow(nextConfig, resolveChannelPluginAllowId(channel))
+  ensurePluginAllow(nextConfig, resolveChannelConfigAllowId(channel, nextConfig))
   return nextConfig
 }
 

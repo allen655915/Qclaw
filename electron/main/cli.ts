@@ -2,7 +2,7 @@
  * OpenClaw CLI wrapper — all interactions via spawn
  */
 import type { ChildProcess } from 'node:child_process'
-import { access, lstat, mkdir, readFile, stat, unlink, writeFile } from 'node:fs/promises'
+import { access, lstat, mkdir, readFile, rm, stat, unlink, writeFile } from 'node:fs/promises'
 import { createWriteStream, existsSync } from 'node:fs'
 import https from 'node:https'
 import { homedir, tmpdir, userInfo } from 'node:os'
@@ -6175,6 +6175,50 @@ async function uninstallLaunchAgentFallback(): Promise<void> {
   }
 }
 
+async function removeDirectoryWithTimeout(
+  targetPath: string,
+  timeoutMs: number,
+  controlDomain: CommandControlDomain = 'global'
+): Promise<void> {
+  const abortController = new AbortController()
+  const rmOptions: NonNullable<Parameters<typeof rm>[1]> & { signal: AbortSignal } = {
+    recursive: true,
+    force: true,
+    signal: abortController.signal,
+  }
+  const normalizedTimeoutMs = Number(timeoutMs || 0)
+  let timeoutTriggered = false
+  let timeoutId: ReturnType<typeof setTimeout> | null = null
+  let removeAbortListener: () => void = () => {}
+
+  trackActiveAbortController(abortController, controlDomain)
+  try {
+    const abortPromise = new Promise<never>((_, reject) => {
+      const onAbort = () => {
+        reject(new Error(timeoutTriggered ? `Operation timed out after ${normalizedTimeoutMs}ms` : 'Command canceled'))
+      }
+      abortController.signal.addEventListener('abort', onAbort, { once: true })
+      removeAbortListener = () => abortController.signal.removeEventListener('abort', onAbort)
+    })
+
+    if (Number.isFinite(normalizedTimeoutMs) && normalizedTimeoutMs > 0) {
+      timeoutId = setTimeout(() => {
+        timeoutTriggered = true
+        abortController.abort()
+      }, normalizedTimeoutMs)
+    }
+
+    await Promise.race([
+      rm(targetPath, rmOptions),
+      abortPromise,
+    ])
+  } finally {
+    if (timeoutId) clearTimeout(timeoutId)
+    removeAbortListener()
+    trackActiveAbortController(null, controlDomain)
+  }
+}
+
 interface CleanupOpenClawStateOptions {
   stateRootOverride?: string
   displayStateRootOverride?: string
@@ -6229,15 +6273,17 @@ export async function cleanupOpenClawStateAndData(
 
   if (isWin) {
     if (!officialStateCleanupSucceeded) {
-      // 旧版 OpenClaw 无官方 uninstall 时，回退到本地目录删除
-      const rmOpenclaw = await runShell(
-        'cmd',
-        ['/c', 'rmdir', '/s', '/q', targetHomeDir],
-        MAIN_RUNTIME_POLICY.cli.removeHomeDirTimeoutMs,
-        'upgrade'
-      )
-      if (!rmOpenclaw.ok) {
-        errors.push(`删除 ${targetDisplayHomeDir} 失败: ${rmOpenclaw.stderr}`)
+      try {
+        await removeDirectoryWithTimeout(
+          targetHomeDir,
+          MAIN_RUNTIME_POLICY.cli.removeHomeDirTimeoutMs,
+          'upgrade'
+        )
+        if (await canAccessPath(targetHomeDir)) {
+          errors.push(`删除 ${targetDisplayHomeDir} 失败: 目标目录仍然存在`)
+        }
+      } catch (error) {
+        errors.push(`删除 ${targetDisplayHomeDir} 失败: ${error instanceof Error ? error.message : String(error)}`)
       }
     }
   } else {

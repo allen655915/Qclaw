@@ -46,7 +46,7 @@ import { UI_RUNTIME_DEFAULTS } from '../shared/runtime-policies'
 import type { OpenClawGuardedWriteReason, OpenClawGuardedWriteResult } from '../shared/openclaw-phase2'
 import type { ChannelInstallerGuardrailStatus } from '../shared/channel-installer-session'
 
-type Status = 'form' | 'installing' | 'starting' | 'connected' | 'error'
+type Status = 'form' | 'preflighting' | 'installing' | 'starting' | 'connected' | 'error'
 
 export interface ChannelConnectNextPayload {
   channelId: string
@@ -92,6 +92,51 @@ export function resolveManagedPluginInstallStrategy(params: {
   return 'install-plugin'
 }
 
+export function isChannelConnectBusy(status: Status): boolean {
+  return status === 'preflighting' || status === 'installing' || status === 'starting'
+}
+
+export function resolveChannelConnectProgressLabel(params: {
+  status: Status
+  channel: Pick<NonNullable<ReturnType<typeof getChannelDefinition>>, 'id'> | null | undefined
+}): string {
+  if (params.status === 'preflighting') {
+    return params.channel?.id === 'qqbot'
+      ? '正在检查 QQ 运行时能力...'
+      : '正在准备连接环境...'
+  }
+
+  return params.status === 'installing' ? '正在安装插件...' : '正在启动服务...'
+}
+
+export function buildManagedPluginPreflightLogLine(
+  channel: Pick<NonNullable<ReturnType<typeof getChannelDefinition>>, 'id' | 'name' | 'plugin'> | null | undefined
+): string {
+  if (!channel?.plugin) return '正在准备连接环境...\n'
+  if (channel.id === 'qqbot') return '正在检查 QQ 运行时能力...\n'
+  return `正在检查 ${channel.name} 插件运行环境...\n`
+}
+
+export function buildManagedPluginReuseLogLine(
+  channel: Pick<NonNullable<ReturnType<typeof getChannelDefinition>>, 'id'> | null | undefined
+): string {
+  if (channel?.id === 'qqbot') {
+    return '✅ 已检测到 QQ 内置插件，跳过外部安装\n\n'
+  }
+
+  return '✅ 已复用已安装插件\n\n'
+}
+
+export function buildManagedPluginReuseStartLogLine(
+  channel: Pick<NonNullable<ReturnType<typeof getChannelDefinition>>, 'id' | 'name'> | null | undefined
+): string {
+  if (channel?.id === 'qqbot') {
+    return '检测到 QQ 内置插件，准备跳过外部安装...\n'
+  }
+
+  return `检测到 ${channel?.name || '当前'} 官方插件已安装，跳过重装...\n`
+}
+
 export function isSafeAlreadyInstalledManagedPluginInstallError(detail: string): boolean {
   return isPluginAlreadyInstalledError(detail)
     && !String(detail || '').includes('已自动隔离')
@@ -127,8 +172,18 @@ function getManagedPluginInstalledOnDiskFromStatus(
 function hasVerifiedManagedPluginInstallAndRegistration(
   status: ManagedChannelPluginStatusView
 ): boolean {
-  return getManagedPluginInstalledOnDiskFromStatus(status)
+  const installedAndRegistered = getManagedPluginInstalledOnDiskFromStatus(status)
     && status.stages.some((stage) => stage.id === 'registered' && stage.state === 'verified')
+
+  if (!installedAndRegistered) {
+    return false
+  }
+
+  if (status.channelId !== 'qqbot') {
+    return true
+  }
+
+  return status.stages.some((stage) => stage.id === 'ready' && stage.state === 'verified')
 }
 
 function isRepairableChannelConnectGatewayStateCode(stateCode: unknown): boolean {
@@ -531,19 +586,57 @@ export function mergeFeishuCreateModeBots(params: {
     params.currentConfig && typeof params.currentConfig === 'object' && !Array.isArray(params.currentConfig)
       ? cloneJsonValue(params.currentConfig)
       : {}
-  const previousSnapshot = params.previousFeishuConfigSnapshot
-    ? cloneJsonValue(params.previousFeishuConfigSnapshot)
-    : null
+  const currentBots = listFeishuBots(currentConfig)
+  const previousSnapshot = params.previousFeishuConfigSnapshot === undefined
+    ? undefined
+    : params.previousFeishuConfigSnapshot === null
+      ? null
+      : cloneJsonValue(params.previousFeishuConfigSnapshot)
 
-  if (!previousSnapshot) {
+  if (previousSnapshot === undefined) {
     return {
       nextConfig: currentConfig,
       addedBots: [],
     }
   }
 
+  if (previousSnapshot === null) {
+    if (currentBots.length === 0) {
+      return {
+        nextConfig: currentConfig,
+        addedBots: [],
+      }
+    }
+
+    const nextConfig = cloneJsonValue(currentConfig)
+    const feishu = hasOwnRecord(nextConfig.channels?.feishu)
+      ? nextConfig.channels.feishu as Record<string, any>
+      : null
+    if (feishu) {
+      if (normalizeFeishuConfigText(feishu.appId) && hasFeishuSecretInput(feishu.appSecret)) {
+        feishu.enabled = true
+      }
+      if (hasOwnRecord(feishu.accounts)) {
+        for (const account of Object.values(feishu.accounts)) {
+          if (!hasOwnRecord(account)) continue
+          if (normalizeFeishuConfigText(account.appId) && hasFeishuSecretInput(account.appSecret)) {
+            account.enabled = true
+          }
+        }
+      }
+    }
+
+    return {
+      nextConfig,
+      addedBots: currentBots.map((bot) => ({
+        accountId: bot.accountId,
+        accountName: bot.name,
+        appId: bot.appId,
+      })),
+    }
+  }
+
   const previousBots = listFeishuBots(wrapFeishuConfigSnapshot(previousSnapshot))
-  const currentBots = listFeishuBots(currentConfig)
   if (previousBots.length === 0 || currentBots.length === 0) {
     return {
       nextConfig: currentConfig,
@@ -3101,6 +3194,7 @@ export default function ChannelConnect({
 
   const doConnect = async () => {
     if (!selectedChannel) return
+    if (isChannelConnectBusy(status)) return
     if (selectedChannel.id === 'openclaw-weixin') {
       await startWeixinInstallerFlow()
       return
@@ -3144,6 +3238,16 @@ export default function ChannelConnect({
         setStatus('error')
       }
       return
+    }
+
+    const shouldShowManagedPluginPreflight =
+      !pluginInstalledRef.current &&
+      Boolean(selectedChannel.plugin?.npxSpecifier || selectedChannel.plugin?.packageName)
+
+    if (shouldShowManagedPluginPreflight) {
+      setStatus('preflighting')
+      setError('')
+      setLog((prev) => prev + buildManagedPluginPreflightLogLine(selectedChannel))
     }
 
     // 先清理配置中的无效根级别 key，否则后续 openclaw 命令会校验失败
@@ -3190,7 +3294,7 @@ export default function ChannelConnect({
           })
 
         if (pluginInstallStrategy === 'reuse-installed-plugin') {
-          setLog(`检测到 ${selectedChannel.name} 官方插件已安装，跳过重装...\n`)
+          setLog(buildManagedPluginReuseStartLogLine(selectedChannel))
         } else if (pluginAlreadyConfigured) {
           setLog(`检测到 ${selectedChannel.name} 配置中已有安装记录，但磁盘插件缺失，准备重新安装...\n`)
         } else {
@@ -3220,7 +3324,7 @@ export default function ChannelConnect({
               setLog(prev => prev + `✅ 官方插件已安装\n\n`)
             }
           } else {
-            setLog(prev => prev + '✅ 已复用已安装插件\n\n')
+            setLog(prev => prev + buildManagedPluginReuseLogLine(selectedChannel))
           }
         } catch (e: any) {
           setError(toUserFacingUnknownErrorMessage(e, '插件安装失败，请检查网络与 npm 环境后重试。'))
@@ -3285,7 +3389,7 @@ export default function ChannelConnect({
               setLog(prev => prev + `✅ 插件已安装\n\n`)
             }
           } else {
-            setLog(prev => prev + '✅ 已复用已安装插件\n\n')
+            setLog(prev => prev + buildManagedPluginReuseLogLine(selectedChannel))
           }
         } catch (e: any) {
           setError(toUserFacingUnknownErrorMessage(e, '插件安装失败，请检查网络与权限后重试。'))
@@ -3837,7 +3941,7 @@ export default function ChannelConnect({
             ) : (
               <Button
                 onClick={doConnect}
-                disabled={!canConnect}
+                disabled={!canConnect || isChannelConnectBusy(status)}
                 color="success"
                 size="sm"
                 className="flex-1"
@@ -3854,14 +3958,14 @@ export default function ChannelConnect({
         </>
       )}
 
-      {(status === 'installing' || status === 'starting' || status === 'connected' || status === 'error') && (
+      {(status === 'preflighting' || status === 'installing' || status === 'starting' || status === 'connected' || status === 'error') && (
         <>
           {/* 进度提示 */}
-          {(status === 'installing' || status === 'starting') && (
+          {isChannelConnectBusy(status) && (
             <div className="mb-3">
               <div className="flex items-center justify-between mb-2">
                 <span className="text-xs app-text-tertiary">
-                  {status === 'installing' ? '正在安装插件...' : '正在启动服务...'}
+                  {resolveChannelConnectProgressLabel({ status, channel: selectedChannel })}
                 </span>
                 <span className="text-xs app-text-muted">请稍候</span>
               </div>
@@ -3886,7 +3990,7 @@ export default function ChannelConnect({
 
           <div className="app-bg-tertiary border app-border rounded-lg p-3 mb-4 font-mono text-xs app-text-secondary whitespace-pre-wrap max-h-40 overflow-y-auto">
             {log}
-            {(status === 'installing' || status === 'starting') && (
+            {isChannelConnectBusy(status) && (
               <span className="inline-block w-1.5 h-3.5 bg-emerald-400 animate-pulse ml-0.5" />
             )}
           </div>

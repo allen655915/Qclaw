@@ -15,6 +15,10 @@ const GATEWAY_UNREADY_REGEX =
 const CLAWHUB_RATE_LIMIT_REGEX =
   /\bclawhub\b[\s\S]*\b(?:429|rate limit exceeded|too many requests)\b/i
 const CLAWHUB_RESOLUTION_FAILED_REGEX = /resolving clawhub:[\s\S]*fetch failed/i
+const PLUGIN_INSTALL_SECURITY_SCAN_BLOCK_REGEX =
+  /\b(dangerous code patterns detected|installation blocked|critical findings|shell command execution detected|environment variable access combined with network send)\b/i
+const SECURITY_SCAN_CONTEXT_REGEX = /\b(plugin|plugins install|plugin install|install plugin|security scan)\b/i
+const QQ_PLUGIN_CONTEXT_REGEX = /\b(qqbot|openclaw-qqbot|@tencent-connect\/openclaw-qqbot|@tencent-connect\/qqbot)\b/i
 const NETWORK_BLOCKED_REGEX =
   /\b(timeout|timed out|network|dns|proxy|certificate|tls|ssl|socket hang up|econnreset|enotfound|fetch failed)\b/i
 const PLUGIN_INSTALL_PERMISSION_MARKER = 'QCLAW_PLUGIN_INSTALL_PERMISSION_DENIED'
@@ -68,6 +72,22 @@ function extractSkillMutationBusyHint(corpus: string): string | null {
   )
 }
 
+function extractPluginInstallSecurityScanHint(corpus: string): string | null {
+  const blockedBySecurityScan =
+    PLUGIN_INSTALL_SECURITY_SCAN_BLOCK_REGEX.test(corpus)
+    || (
+      /security scan/i.test(corpus)
+      && SECURITY_SCAN_CONTEXT_REGEX.test(corpus)
+    )
+  if (!blockedBySecurityScan) return null
+
+  if (QQ_PLUGIN_CONTEXT_REGEX.test(corpus)) {
+    return 'QQ 插件安装被 OpenClaw 安全扫描阻断。当前版本请改用 OpenClaw 2026.4.12 内置 QQ 插件，不要继续强装外部 QQ 包。'
+  }
+
+  return '插件安装被 OpenClaw 安全扫描阻断。当前插件包含危险代码模式，请改用受信版本或已内置/已安装的插件后重试。'
+}
+
 export function toUserFacingCliFailureMessage(params: {
   stderr?: string
   stdout?: string
@@ -90,6 +110,11 @@ export function toUserFacingCliFailureMessage(params: {
   const skillMutationBusyHint = extractSkillMutationBusyHint(corpus)
   if (skillMutationBusyHint) {
     return skillMutationBusyHint
+  }
+
+  const pluginInstallSecurityScanHint = extractPluginInstallSecurityScanHint(corpus)
+  if (pluginInstallSecurityScanHint) {
+    return pluginInstallSecurityScanHint
   }
 
   if (LOCAL_AUTH_CONFIG_FAILURE_REGEX.test(corpus) && LOCAL_AUTH_CONFIG_FAILURE_MARKER_REGEX.test(corpus)) {

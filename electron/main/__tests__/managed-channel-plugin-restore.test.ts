@@ -72,6 +72,74 @@ describe('restoreConfiguredManagedChannelPlugins', () => {
     expect(repairManagedChannelPlugin).toHaveBeenCalledWith('wecom')
   })
 
+  it('restores configured qqbot through the same shared lifecycle repair service', async () => {
+    const inspectManagedChannelPlugin = vi.fn().mockResolvedValueOnce({
+      kind: 'config-sync-required',
+      channelId: 'qqbot',
+      pluginScope: 'channel',
+      entityScope: 'channel',
+      reason: '当前插件配置仍待同步',
+      status: {
+        channelId: 'qqbot',
+        pluginId: 'openclaw-qqbot',
+        summary: 'QQ 官方插件已安装，但配置仍待同步。',
+        stages: [
+          { id: 'installed', state: 'verified', source: 'runtime', message: 'installed' },
+          { id: 'registered', state: 'verified', source: 'plugins-list', message: 'registered' },
+          { id: 'loaded', state: 'unknown', source: 'status', message: 'unknown' },
+          { id: 'ready', state: 'unknown', source: 'status', message: 'unknown' },
+        ],
+        evidence: ['bundled qqbot detected'],
+      },
+    })
+    const repairManagedChannelPlugin = vi.fn().mockResolvedValue({
+      kind: 'ok',
+      channelId: 'qqbot',
+      pluginScope: 'channel',
+      entityScope: 'channel',
+      action: 'restored',
+      status: {
+        channelId: 'qqbot',
+        pluginId: 'openclaw-qqbot',
+        summary: '已检测到 OpenClaw 内置 QQ 插件，并已在上游 plugins list 中确认注册；loaded / ready 仍待上游证据。',
+        stages: [
+          { id: 'installed', state: 'verified', source: 'runtime', message: 'installed' },
+          { id: 'registered', state: 'verified', source: 'plugins-list', message: 'registered' },
+          { id: 'loaded', state: 'unknown', source: 'status', message: 'unknown' },
+          { id: 'ready', state: 'unknown', source: 'status', message: 'unknown' },
+        ],
+        evidence: ['bundled qqbot detected'],
+      },
+    })
+
+    const result = await restoreConfiguredManagedChannelPlugins({
+      referenceConfig: {
+        channels: {
+          qqbot: {
+            enabled: true,
+            appId: 'bot_123',
+            clientSecret: 'secret_456',
+            allowFrom: ['*'],
+          },
+        },
+      },
+      repairResult: {
+        quarantinedPluginIds: [],
+        prunedPluginIds: [],
+      },
+      dependencies: {
+        inspectManagedChannelPlugin,
+        repairManagedChannelPlugin,
+      },
+    })
+
+    expect(result.ok).toBe(true)
+    expect(result.restoredChannelIds).toEqual(['qqbot'])
+    expect(result.gatewayReloaded).toBe(true)
+    expect(inspectManagedChannelPlugin).toHaveBeenCalledWith('qqbot')
+    expect(repairManagedChannelPlugin).toHaveBeenCalledWith('qqbot')
+  })
+
   it('skips restore when inspection shows the configured plugin is already healthy enough', async () => {
     const inspectManagedChannelPlugin = vi.fn().mockResolvedValue({
       kind: 'plugin-ready-channel-not-ready',

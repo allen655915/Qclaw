@@ -73,6 +73,36 @@ describe('user-facing-cli-feedback', () => {
     expect(message).toBe('ClawHub 当前请求过于频繁，已被限流，请稍后再试。')
   })
 
+  it('maps qq plugin security-scan blocks away from the generic network or permission fallback', () => {
+    const message = toUserFacingCliFailureMessage({
+      stderr: [
+        'openclaw plugins install @tencent-connect/openclaw-qqbot@latest',
+        'installation blocked: dangerous code patterns detected',
+        'Environment variable access combined with network send',
+        'Shell command execution detected (child_process)',
+      ].join('\n'),
+      fallback: '插件安装失败，请检查网络与权限后重试。',
+    })
+
+    expect(message).toBe(
+      'QQ 插件安装被 OpenClaw 安全扫描阻断。当前版本请改用 OpenClaw 2026.4.12 内置 QQ 插件，不要继续强装外部 QQ 包。'
+    )
+  })
+
+  it('keeps the security-scan wording generic for non-qq plugin installs', () => {
+    const message = toUserFacingCliFailureMessage({
+      stderr: [
+        'plugins install suspicious-plugin',
+        'security scan failed with critical findings',
+      ].join('\n'),
+      fallback: 'fallback',
+    })
+
+    expect(message).toBe(
+      '插件安装被 OpenClaw 安全扫描阻断。当前插件包含危险代码模式，请改用受信版本或已内置/已安装的插件后重试。'
+    )
+  })
+
   it('maps gateway-not-ready logs into the unified gateway wording', () => {
     const message = toUserFacingCliFailureMessage({
       stderr: 'Gateway did not become reachable at ws://127.0.0.1:18789.',

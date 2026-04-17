@@ -23,6 +23,15 @@ import {
   type ManagedPluginConfigReconcileResult,
 } from './managed-plugin-config-reconciler'
 import type { RepairIncompatibleExtensionsResult } from './plugin-install-safety'
+import {
+  PINNED_OPENCLAW_VERSION,
+  normalizeOpenClawPolicyVersion,
+} from '../../src/shared/openclaw-version-policy'
+import type { WindowsActiveRuntimeSnapshot } from './platforms/windows/windows-runtime-policy'
+import { resolveWindowsChannelRuntimeContext } from './platforms/windows/windows-channel-runtime-context'
+
+const path = process.getBuiltinModule('node:path') as typeof import('node:path')
+const { readFile } = process.getBuiltinModule('node:fs/promises') as typeof import('node:fs/promises')
 
 interface GatewayReloadLikeResult {
   ok: boolean
@@ -31,6 +40,16 @@ interface GatewayReloadLikeResult {
   stdout?: string
   stderr?: string
   code?: number | null
+}
+
+interface QqBundledRuntimeInspectionResult {
+  applicable: boolean
+  available: boolean
+  pluginId: string
+  runtimeVersion: string | null
+  packageRoot: string | null
+  message: string | null
+  evidence: string[]
 }
 
 export interface ManagedChannelPluginLifecycleDependencies {
@@ -52,6 +71,9 @@ export interface ManagedChannelPluginLifecycleDependencies {
     reason: string,
     options?: { preferEnsureWhenNotRunning?: boolean }
   ) => Promise<GatewayReloadLikeResult>
+  inspectBundledQqRuntime: (options?: {
+    runtimeContext?: RepairIncompatibleExtensionPluginsOptions['runtimeContext']
+  }) => Promise<QqBundledRuntimeInspectionResult>
   now: () => number
 }
 
@@ -72,6 +94,54 @@ function hasOwnRecord(value: unknown): value is Record<string, any> {
 
 function normalizeText(value: unknown): string {
   return String(value || '').trim()
+}
+
+function createBundledQqPackageRuntimeOptions(
+  runtimeContext?: RepairIncompatibleExtensionPluginsOptions['runtimeContext']
+): { activeRuntimeSnapshot?: WindowsActiveRuntimeSnapshot | null } | undefined {
+  const context = runtimeContext as (RepairIncompatibleExtensionPluginsOptions['runtimeContext'] & Record<string, unknown>) | null | undefined
+  if (!context) return undefined
+
+  const stateDir = normalizeText(context.stateDir ?? context.homeDir)
+  const configPath = normalizeText(context.configPath) || (stateDir ? path.join(stateDir, 'openclaw.json') : '')
+  const extensionsDir = normalizeText(context.extensionsDir) || (stateDir ? path.join(stateDir, 'extensions') : '')
+  const hostPackageRoot = normalizeText(context.hostPackageRoot)
+  const npmPrefix = normalizeText(context.npmPrefix)
+  const openclawPath = normalizeText(context.openclawPath ?? context.openclawExecutable)
+  const nodePath = normalizeText(context.nodePath ?? context.nodeExecutable)
+
+  if (!hostPackageRoot && !npmPrefix && !openclawPath) {
+    return undefined
+  }
+
+  return {
+    activeRuntimeSnapshot: {
+      configPath,
+      extensionsDir,
+      hostPackageRoot,
+      logsDir: '',
+      nodePath,
+      npmPrefix,
+      openclawPath,
+      stateDir,
+      tmpDir: '',
+    },
+  }
+}
+
+function hasBundledQqRuntimeContextHints(
+  runtimeContext?: RepairIncompatibleExtensionPluginsOptions['runtimeContext']
+): boolean {
+  const context = runtimeContext as (RepairIncompatibleExtensionPluginsOptions['runtimeContext'] & Record<string, unknown>) | null | undefined
+  if (!context) return false
+
+  return Boolean(
+    normalizeText(context.openclawVersion)
+    || normalizeText(context.hostPackageRoot)
+    || normalizeText(context.npmPrefix)
+    || normalizeText(context.openclawPath)
+    || normalizeText(context.openclawExecutable)
+  )
 }
 
 function createStatusStage(
@@ -219,6 +289,18 @@ function buildInspectResult(params: {
   }
 }
 
+function appendCapabilityBlockedReasons(
+  capabilities: ManagedChannelCapabilitySnapshot,
+  reasons: string[]
+): ManagedChannelCapabilitySnapshot {
+  if (reasons.length === 0) return capabilities
+  return createManagedChannelCapabilitySnapshot({
+    supportsBackgroundRestore: capabilities.supportsBackgroundRestore,
+    supportsInteractiveRepair: capabilities.supportsInteractiveRepair,
+    blockedReasons: [...capabilities.blockedReasons, ...reasons],
+  })
+}
+
 function createUnavailableDependencies(): ManagedChannelPluginLifecycleDependencies {
   return {
     getOfficialChannelStatus: async () => {
@@ -254,6 +336,7 @@ function createUnavailableDependencies(): ManagedChannelPluginLifecycleDependenc
     reloadGatewayForConfigChange: async () => {
       throw new Error('reloadGatewayForConfigChange dependency unavailable')
     },
+    inspectBundledQqRuntime: async () => inspectBundledQqRuntimeDefault(),
     now: () => Date.now(),
   }
 }
@@ -267,7 +350,8 @@ function toOfficialAdapterId(channelId: ManagedChannelLifecycleId): OfficialChan
 
 async function buildGenericStatus(
   spec: ManagedChannelPluginLifecycleSpec,
-  dependencies: ManagedChannelPluginLifecycleDependencies
+  dependencies: ManagedChannelPluginLifecycleDependencies,
+  options: ManagedChannelPluginOperationOptions = {}
 ): Promise<{
   status: ManagedChannelPluginStatusView
   configNeedsSync: boolean
@@ -275,15 +359,27 @@ async function buildGenericStatus(
   currentConfig: Record<string, any> | null
   configReconcile: ManagedPluginConfigReconcileResult
   normalizedConfig: { config: Record<string, any>; changed: boolean }
+  qqBundledRuntime: QqBundledRuntimeInspectionResult | null
 }> {
-  const [installedOnDisk, registeredPlugins, currentConfig] = await Promise.all([
+  const [qqBundledRuntime, installedOnDiskFromDisk, registeredPlugins, currentConfig] = await Promise.all([
+    spec.channelId === 'qqbot'
+      ? dependencies.inspectBundledQqRuntime({ runtimeContext: options.runtimeContext })
+      : Promise.resolve(null),
     dependencies.isPluginInstalledOnDisk(spec.canonicalPluginId),
     dependencies.listRegisteredPlugins(),
     dependencies.readConfig(),
   ])
+  const installedOnDisk = qqBundledRuntime?.applicable && qqBundledRuntime.available
+    ? true
+    : installedOnDiskFromDisk
   const registeredState: ManagedChannelPluginStatusStageState = registeredPlugins == null
     ? 'unknown'
     : registeredPlugins.includes(spec.canonicalPluginId)
+      || Boolean(
+        qqBundledRuntime?.applicable
+        && qqBundledRuntime.available
+        && registeredPlugins.includes(qqBundledRuntime.pluginId)
+      )
       ? 'verified'
       : 'missing'
   const runtime = createManagedChannelRuntimeSnapshot({
@@ -297,6 +393,7 @@ async function buildGenericStatus(
   const configAvailable = hasOwnRecord(currentConfig)
   const configReconcile = await dependencies.reconcileManagedPluginConfig({
     channelId: spec.channelId,
+    runtimeContext: options.runtimeContext,
     currentConfig: configAvailable ? currentConfig : null,
     installedOnDisk,
     apply: false,
@@ -311,7 +408,15 @@ async function buildGenericStatus(
     status: {
       channelId: spec.channelId,
       pluginId: spec.canonicalPluginId,
-      summary: !installedOnDisk
+        summary: qqBundledRuntime?.applicable && !qqBundledRuntime.available
+        ? qqBundledRuntime.message || `${spec.channelId} 内置插件运行时不可用。`
+        : qqBundledRuntime?.applicable && qqBundledRuntime.available && !configNeedsSync
+          ? registeredState === 'verified'
+            ? '已检测到 OpenClaw 内置 QQ 插件，并已在上游 plugins list 中确认注册；loaded / ready 仍待上游证据。'
+            : registeredState === 'missing'
+              ? '已检测到 OpenClaw 内置 QQ 插件，但尚未在上游 plugins list 中确认注册。'
+              : '已检测到 OpenClaw 内置 QQ 插件；registered / loaded / ready 仍待更多上游证据。'
+        : !installedOnDisk
         ? `${spec.channelId} 官方插件尚未安装。`
         : configNeedsSync
           ? `${spec.channelId} 官方插件已安装，但配置仍待同步。`
@@ -324,8 +429,14 @@ async function buildGenericStatus(
         createStatusStage(
           'installed',
           installedOnDisk ? 'verified' : 'missing',
-          'disk',
-          installedOnDisk ? '已确认本机存在插件安装' : '当前未确认到插件安装目录'
+          qqBundledRuntime?.applicable ? 'runtime' : 'disk',
+          qqBundledRuntime?.applicable && qqBundledRuntime.available
+            ? '已确认当前 OpenClaw 运行时包含内置 qqbot 插件'
+            : qqBundledRuntime?.applicable && !qqBundledRuntime.available
+              ? qqBundledRuntime.message || '当前未确认到可用的内置 QQ 插件'
+              : installedOnDisk
+                ? '已确认本机存在插件安装'
+                : '当前未确认到插件安装目录'
         ),
         createStatusStage(
           'registered',
@@ -342,10 +453,16 @@ async function buildGenericStatus(
       ],
       evidence: [
         {
-          source: 'disk',
+          source: qqBundledRuntime?.applicable ? 'status' : 'disk',
           channelId: spec.channelId,
           pluginId: spec.canonicalPluginId,
-          message: installedOnDisk ? '已确认插件安装目录存在' : '当前未确认到插件安装目录',
+          message: qqBundledRuntime?.applicable && qqBundledRuntime.available
+            ? '已确认当前 OpenClaw 运行时包含内置 qqbot 插件'
+            : qqBundledRuntime?.applicable && !qqBundledRuntime.available
+              ? qqBundledRuntime.message || '当前未确认到可用的内置 QQ 插件'
+              : installedOnDisk
+                ? '已确认插件安装目录存在'
+                : '当前未确认到插件安装目录',
         },
         {
           source: 'plugins-list',
@@ -365,6 +482,12 @@ async function buildGenericStatus(
               message: '检测到插件配置仍待同步',
             }]
           : []),
+        ...((qqBundledRuntime?.evidence || []).map((message) => ({
+          source: 'status' as const,
+          channelId: spec.channelId,
+          pluginId: qqBundledRuntime?.pluginId || spec.canonicalPluginId,
+          message,
+        }))),
       ],
     },
     configNeedsSync,
@@ -372,6 +495,164 @@ async function buildGenericStatus(
     currentConfig: configAvailable ? currentConfig : null,
     configReconcile,
     normalizedConfig,
+    qqBundledRuntime,
+  }
+}
+
+async function inspectBundledQqRuntimeDefault(options?: {
+  runtimeContext?: RepairIncompatibleExtensionPluginsOptions['runtimeContext']
+}): Promise<QqBundledRuntimeInspectionResult> {
+  if (process.platform !== 'win32') {
+    return {
+      applicable: false,
+      available: false,
+      pluginId: 'qqbot',
+      runtimeVersion: null,
+      packageRoot: null,
+      message: null,
+      evidence: [],
+    }
+  }
+
+  let runtimeContext = options?.runtimeContext
+  if (!hasBundledQqRuntimeContextHints(runtimeContext)) {
+    const runtimeResult = await resolveWindowsChannelRuntimeContext({
+      platform: process.platform,
+    }).catch(() => null)
+    if (runtimeResult?.ok) {
+      runtimeContext = {
+        configPath: runtimeResult.context.configPath,
+        homeDir: runtimeResult.context.homeDir,
+        openclawVersion: runtimeResult.context.openclawVersion,
+        hostPackageRoot: runtimeResult.context.hostPackageRoot,
+        nodePath: runtimeResult.context.nodePath,
+        npmPrefix: runtimeResult.context.npmPrefix,
+        openclawPath: runtimeResult.context.openclawPath,
+        stateDir: runtimeResult.context.stateDir,
+      } as RepairIncompatibleExtensionPluginsOptions['runtimeContext']
+    }
+  }
+  const runtimeContextRecord = runtimeContext as (RepairIncompatibleExtensionPluginsOptions['runtimeContext'] & Record<string, unknown>) | null | undefined
+  const runtimeVersionHint = normalizeOpenClawPolicyVersion(
+    normalizeText(runtimeContextRecord?.openclawVersion) || null
+  )
+  const packageOptions = createBundledQqPackageRuntimeOptions(runtimeContext)
+  let runtimeVersion: string | null = runtimeVersionHint
+  let packageRoot: string | null = null
+
+  if (runtimeVersion && runtimeVersion !== PINNED_OPENCLAW_VERSION) {
+    return {
+      applicable: false,
+      available: false,
+      pluginId: 'qqbot',
+      runtimeVersion,
+      packageRoot: null,
+      message: null,
+      evidence: [],
+    }
+  }
+
+  try {
+    const { readOpenClawPackageInfo, resolveOpenClawPackageRoot } = await import('./openclaw-package')
+    if (!runtimeVersion) {
+      runtimeVersion = normalizeOpenClawPolicyVersion((await readOpenClawPackageInfo(packageOptions)).version)
+    }
+    packageRoot = await resolveOpenClawPackageRoot(packageOptions).catch(() => null)
+  } catch {
+    packageRoot = null
+  }
+
+  if (runtimeVersion !== PINNED_OPENCLAW_VERSION) {
+    return {
+      applicable: false,
+      available: false,
+      pluginId: 'qqbot',
+      runtimeVersion,
+      packageRoot,
+      message: null,
+      evidence: [],
+    }
+  }
+
+  if (!packageRoot) {
+    return {
+      applicable: true,
+      available: false,
+      pluginId: 'qqbot',
+      runtimeVersion,
+      packageRoot: null,
+      message: `当前 Windows OpenClaw ${PINNED_OPENCLAW_VERSION} 运行时无法定位 host package root，无法确认内置 QQ 插件。`,
+      evidence: ['未能解析当前 OpenClaw host package root。'],
+    }
+  }
+
+  const packageJsonPath = path.join(packageRoot, 'dist', 'extensions', 'qqbot', 'package.json')
+  const pluginManifestPath = path.join(packageRoot, 'dist', 'extensions', 'qqbot', 'openclaw.plugin.json')
+
+  try {
+    const [packageJsonRaw, pluginManifestRaw] = await Promise.all([
+      readFile(packageJsonPath, 'utf8'),
+      readFile(pluginManifestPath, 'utf8'),
+    ])
+    const packageJson = JSON.parse(packageJsonRaw) as Record<string, any>
+    const pluginManifest = JSON.parse(pluginManifestRaw) as Record<string, any>
+    const packageName = normalizeText(packageJson.name)
+    const channelId = normalizeText(packageJson.openclaw?.channel?.id)
+    const pluginId = normalizeText(pluginManifest.id)
+    const manifestChannels = Array.isArray(pluginManifest.channels)
+      ? pluginManifest.channels.map((item: unknown) => normalizeText(item)).filter(Boolean)
+      : []
+
+    if (
+      packageName !== '@openclaw/qqbot'
+      || channelId !== 'qqbot'
+      || pluginId !== 'qqbot'
+      || !manifestChannels.includes('qqbot')
+    ) {
+      return {
+        applicable: true,
+        available: false,
+        pluginId: 'qqbot',
+        runtimeVersion,
+        packageRoot,
+        message: `当前 Windows OpenClaw ${PINNED_OPENCLAW_VERSION} 运行时存在 QQ 插件目录，但内置 manifest 不符合预期。`,
+        evidence: [
+          `package.json name=${packageName || 'missing'}`,
+          `package channel id=${channelId || 'missing'}`,
+          `plugin manifest id=${pluginId || 'missing'}`,
+          `plugin manifest channels=${manifestChannels.join(',') || 'missing'}`,
+        ],
+      }
+    }
+
+    return {
+      applicable: true,
+      available: true,
+      pluginId: 'qqbot',
+      runtimeVersion,
+      packageRoot,
+      message: null,
+      evidence: [
+        `已确认 OpenClaw ${runtimeVersion} host package root: ${packageRoot}`,
+        '已确认 dist/extensions/qqbot/package.json 与 openclaw.plugin.json 完整可读',
+        '已确认 bundled QQ plugin id = qqbot',
+      ],
+    }
+  } catch (error) {
+    return {
+      applicable: true,
+      available: false,
+      pluginId: 'qqbot',
+      runtimeVersion,
+      packageRoot,
+      message: `当前 Windows OpenClaw ${PINNED_OPENCLAW_VERSION} 运行时缺少或损坏内置 QQ 插件文件。`,
+      evidence: [
+        `packageRoot=${packageRoot}`,
+        `packageJsonPath=${packageJsonPath}`,
+        `pluginManifestPath=${pluginManifestPath}`,
+        error instanceof Error ? error.message : String(error),
+      ],
+    }
   }
 }
 
@@ -488,7 +769,10 @@ export function createManagedChannelPluginLifecycleService(
     return status
   }
 
-  async function inspectManagedChannelPlugin(channelId: string): Promise<ManagedChannelPluginInspectResult> {
+  async function inspectManagedChannelPlugin(
+    channelId: string,
+    options: ManagedChannelPluginOperationOptions = {}
+  ): Promise<ManagedChannelPluginInspectResult> {
     await appendEnvCheckDiagnostic('main-managed-channel-inspect-start', {
       channelId,
     })
@@ -505,17 +789,27 @@ export function createManagedChannelPluginLifecycleService(
 
     try {
       const officialAdapterId = toOfficialAdapterId(spec.channelId)
-      const { status, configNeedsSync } = officialAdapterId
-        ? {
-            status: await getManagedChannelPluginStatus(spec.channelId),
-            configNeedsSync: false,
-          }
-        : await buildGenericStatus(spec, resolvedDependencies)
+      let status: ManagedChannelPluginStatusView
+      let configNeedsSync = false
+      let capabilities = createCapabilities(spec)
+      if (officialAdapterId) {
+        status = await getManagedChannelPluginStatus(spec.channelId)
+      } else {
+        const genericStatus = await buildGenericStatus(spec, resolvedDependencies, options)
+        status = genericStatus.status
+        configNeedsSync = genericStatus.configNeedsSync
+        capabilities = appendCapabilityBlockedReasons(
+          capabilities,
+          genericStatus.qqBundledRuntime?.applicable && !genericStatus.qqBundledRuntime.available
+            ? [genericStatus.qqBundledRuntime.message || 'QQ 内置运行时不可用']
+            : []
+        )
+      }
 
       const result = buildInspectResult({
         spec,
         status,
-        capabilities: createCapabilities(spec),
+        capabilities,
         configNeedsSync,
       })
       await appendEnvCheckDiagnostic('main-managed-channel-inspect-result', {
@@ -580,7 +874,7 @@ export function createManagedChannelPluginLifecycleService(
         }
 
         resetFailure(spec.channelId)
-        const status = await buildGenericStatus(spec, resolvedDependencies)
+        const status = await buildGenericStatus(spec, resolvedDependencies, options)
           .then((result) => result.status)
           .catch(() => createEmptyStatus(spec, '该渠道需要交互式安装器。'))
         return {
@@ -598,7 +892,7 @@ export function createManagedChannelPluginLifecycleService(
         : withManagedOperationLock(`managed-channel-plugin:${spec.channelId}`, run)
     }
 
-    const inspection = await inspectManagedChannelPlugin(spec.channelId)
+    const inspection = await inspectManagedChannelPlugin(spec.channelId, options)
     if (inspection.kind === 'config-sync-required') {
       if (getInstalledStageState(inspection.status) === 'verified') {
         return toPrepareResultFromRepairResult(await repairManagedChannelPlugin(spec.channelId, options))
@@ -766,6 +1060,90 @@ export function createManagedChannelPluginLifecycleService(
         }
       }
 
+      const qqBundledRuntime = spec.channelId === 'qqbot'
+        ? await resolvedDependencies.inspectBundledQqRuntime({ runtimeContext: options.runtimeContext })
+        : null
+      if (qqBundledRuntime?.applicable) {
+        const statusBeforeNormalize = await buildGenericStatus(spec, resolvedDependencies, options)
+        if (!qqBundledRuntime.available) {
+          recordFailure(spec.channelId, 'bundled-runtime-missing')
+          return {
+            kind: 'capability-blocked',
+            channelId: spec.channelId,
+            pluginScope: 'channel',
+            entityScope: spec.entityScope,
+            missingCapabilities: [qqBundledRuntime.message || 'QQ 内置运行时不可用'],
+            status: statusBeforeNormalize.status,
+          }
+        }
+
+        if (statusBeforeNormalize.configReconcile.configReadFailed) {
+          recordFailure(spec.channelId, 'repair-failed')
+          return {
+            kind: 'repair-failed',
+            channelId: spec.channelId,
+            pluginScope: 'channel',
+            entityScope: spec.entityScope,
+            status: statusBeforeNormalize.status,
+            error: '当前 OpenClaw 配置读取失败或格式异常，已停止自动修复以避免覆盖现有配置。',
+          }
+        }
+
+        const shouldSyncConfig = statusBeforeNormalize.normalizedConfig.changed
+        if (shouldSyncConfig) {
+          const reconcileResult = await resolvedDependencies.reconcileManagedPluginConfig({
+            channelId: spec.channelId,
+            runtimeContext: options.runtimeContext,
+            currentConfig: statusBeforeNormalize.currentConfig,
+            installedOnDisk: true,
+            apply: true,
+            applyGatewayPolicy: true,
+          })
+          await appendEnvCheckDiagnostic('main-managed-channel-repair-after-config-reconcile', {
+            channelId: spec.channelId,
+            ok: reconcileResult.ok,
+            changed: reconcileResult.changed,
+            written: reconcileResult.written,
+            gatewayApplyOk: reconcileResult.writeResult?.gatewayApply?.ok ?? null,
+            failureReason: reconcileResult.failureReason || null,
+          })
+          if (!reconcileResult.ok) {
+            recordFailure(spec.channelId, reconcileResult.failureReason || 'config-reconcile-failed')
+            return {
+              kind: 'repair-failed',
+              channelId: spec.channelId,
+              pluginScope: 'channel',
+              entityScope: spec.entityScope,
+              status: statusBeforeNormalize.status,
+              error: reconcileResult.message,
+            }
+          }
+
+          if (reconcileResult.writeResult?.gatewayApply?.ok === false) {
+            recordFailure(spec.channelId, 'gateway-reload-failed')
+            return {
+              kind: 'gateway-reload-failed',
+              channelId: spec.channelId,
+              pluginScope: 'channel',
+              entityScope: spec.entityScope,
+              reloadReason: reconcileResult.writeResult.gatewayApply.note || reconcileResult.message,
+              status: statusBeforeNormalize.status,
+            }
+          }
+        }
+
+        resetFailure(spec.channelId)
+        const finalStatus = await buildGenericStatus(spec, resolvedDependencies, options)
+        return {
+          kind: 'ok',
+          channelId: spec.channelId,
+          pluginScope: 'channel',
+          entityScope: spec.entityScope,
+          action: shouldSyncConfig ? 'restored' : 'reused-existing',
+          status: finalStatus.status,
+        }
+      }
+
       const repairResult = await repairManagedPluginScope(spec, options)
       await appendEnvCheckDiagnostic('main-managed-channel-repair-after-scope-repair', {
         channelId: spec.channelId,
@@ -826,7 +1204,7 @@ export function createManagedChannelPluginLifecycleService(
         }
       }
 
-      const statusBeforeNormalize = await buildGenericStatus(spec, resolvedDependencies)
+      const statusBeforeNormalize = await buildGenericStatus(spec, resolvedDependencies, options)
       if (statusBeforeNormalize.configReconcile.configReadFailed) {
         recordFailure(spec.channelId, 'repair-failed')
         return {
@@ -842,6 +1220,7 @@ export function createManagedChannelPluginLifecycleService(
       if (shouldSyncConfig) {
         const reconcileResult = await resolvedDependencies.reconcileManagedPluginConfig({
           channelId: spec.channelId,
+          runtimeContext: options.runtimeContext,
           currentConfig: statusBeforeNormalize.currentConfig,
           installedOnDisk: true,
           apply: true,
@@ -881,7 +1260,7 @@ export function createManagedChannelPluginLifecycleService(
       }
 
       resetFailure(spec.channelId)
-      const finalStatus = await buildGenericStatus(spec, resolvedDependencies)
+      const finalStatus = await buildGenericStatus(spec, resolvedDependencies, options)
       return {
         kind: 'ok',
         channelId: spec.channelId,
@@ -956,6 +1335,7 @@ async function getDefaultManagedChannelPluginLifecycleService() {
         reconcileManagedPluginConfig,
         writeConfig: cli.writeConfig,
         reloadGatewayForConfigChange: gateway.reloadGatewayForConfigChange,
+        inspectBundledQqRuntime: inspectBundledQqRuntimeDefault,
         now: () => Date.now(),
       })
     })()
@@ -964,9 +1344,12 @@ async function getDefaultManagedChannelPluginLifecycleService() {
   return defaultManagedChannelPluginLifecycleServicePromise
 }
 
-export async function inspectManagedChannelPlugin(channelId: string): Promise<ManagedChannelPluginInspectResult> {
+export async function inspectManagedChannelPlugin(
+  channelId: string,
+  options: ManagedChannelPluginOperationOptions = {}
+): Promise<ManagedChannelPluginInspectResult> {
   const service = await getDefaultManagedChannelPluginLifecycleService()
-  return service.inspectManagedChannelPlugin(channelId)
+  return service.inspectManagedChannelPlugin(channelId, options)
 }
 
 export async function getManagedChannelPluginStatus(channelId: string): Promise<ManagedChannelPluginStatusView> {

@@ -48,7 +48,7 @@ describe('openclaw-channel-registry', () => {
     const channel = getChannelDefinition('qqbot')
     expect(channel).toBeTruthy()
     expect(channel?.plugin?.packageName).toBe('@tencent-connect/openclaw-qqbot@latest')
-    expect(resolveChannelPluginAllowId(channel!)).toBe('openclaw-qqbot')
+    expect(resolveChannelPluginAllowId(channel!)).toBe('qqbot')
     expect(channel?.plugin?.cleanupPluginIds).toEqual([
       'qqbot',
       'openclaw-qq',
@@ -61,6 +61,17 @@ describe('openclaw-channel-registry', () => {
   })
 
   it('detects when a managed channel plugin is already configured in openclaw.json', () => {
+    expect(
+      isChannelPluginConfigured(
+        {
+          plugins: {
+            allow: ['qqbot'],
+          },
+        },
+        'qqbot'
+      )
+    ).toBe(true)
+
     expect(
       isChannelPluginConfigured(
         {
@@ -332,7 +343,7 @@ describe('openclaw-channel-registry', () => {
     })
   })
 
-  it('applies qqbot config using the new clientSecret schema', () => {
+  it('applies qqbot config using the new clientSecret schema without forcing the bundled runtime allow id', () => {
     const nextConfig = applyChannelConfig(
       {},
       'qqbot',
@@ -349,11 +360,26 @@ describe('openclaw-channel-registry', () => {
       allowFrom: ['*'],
     })
     expect(nextConfig.plugins.allow).toContain('openclaw-qqbot')
+    expect(nextConfig.plugins.allow).not.toContain('qqbot')
   })
 
-  it('preserves existing qqbot accounts and allowFrom entries while dropping legacy appSecret keys', () => {
+  it('preserves existing qqbot accounts and allowFrom entries while dropping legacy appSecret keys and stale plugin residue', () => {
     const nextConfig = applyChannelConfig(
       {
+        plugins: {
+          allow: ['openclaw-qqbot', 'other-plugin'],
+          entries: {
+            'openclaw-qqbot': {
+              enabled: true,
+              installPath: '/Users/demo/.openclaw/extensions/openclaw-qqbot',
+            },
+          },
+          installs: {
+            'openclaw-qqbot': {
+              installPath: '/Users/demo/.openclaw/extensions/openclaw-qqbot',
+            },
+          },
+        },
         channels: {
           qqbot: {
             enabled: false,
@@ -387,6 +413,51 @@ describe('openclaw-channel-registry', () => {
           clientSecret: 'bot-2-secret',
         },
       },
+    })
+    expect(nextConfig.plugins).toEqual({
+      allow: ['other-plugin', 'openclaw-qqbot'],
+      entries: {},
+      installs: {},
+    })
+  })
+
+  it('preserves an already-normalized bundled qqbot allow id when editing channel config', () => {
+    const nextConfig = applyChannelConfig(
+      {
+        plugins: {
+          allow: ['qqbot', 'other-plugin'],
+          entries: {
+            'openclaw-qqbot': {
+              enabled: true,
+              installPath: '/Users/demo/.openclaw/extensions/openclaw-qqbot',
+            },
+          },
+        },
+        channels: {
+          qqbot: {
+            enabled: true,
+            appId: 'old-app',
+            clientSecret: 'old-secret',
+            allowFrom: ['USER_A'],
+          },
+        },
+      },
+      'qqbot',
+      {
+        appId: 'new-app',
+        appSecret: 'new-secret',
+      }
+    )
+
+    expect(nextConfig.channels.qqbot).toEqual({
+      enabled: true,
+      appId: 'new-app',
+      clientSecret: 'new-secret',
+      allowFrom: ['USER_A'],
+    })
+    expect(nextConfig.plugins).toEqual({
+      allow: ['qqbot', 'other-plugin'],
+      entries: {},
     })
   })
 

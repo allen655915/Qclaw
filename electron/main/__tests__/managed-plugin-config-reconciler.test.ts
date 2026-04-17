@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
+import { applyChannelConfig } from '../../../src/lib/openclaw-channel-registry'
 import { reconcileManagedPluginConfig } from '../managed-plugin-config-reconciler'
 
 const path = process.getBuiltinModule('node:path') as typeof import('node:path')
@@ -396,5 +397,266 @@ describe('reconcileManagedPluginConfig', () => {
         },
       },
     })
+  })
+
+  it('normalizes bundled qqbot config to the runtime allow id and clears stale legacy plugin entries', async () => {
+    const homeDir = await createTempHome()
+
+    const result = await reconcileManagedPluginConfig({
+      channelId: 'qqbot',
+      runtimeContext: {
+        homeDir,
+        openclawVersion: '2026.4.12',
+      },
+      installedOnDisk: true,
+      currentConfig: {
+        channels: {
+          qqbot: {
+            enabled: true,
+            appId: 'bot_123',
+            clientSecret: 'secret_456',
+            allowFrom: ['*'],
+          },
+        },
+        plugins: {
+          allow: ['openclaw-qqbot', 'other-plugin'],
+          entries: {
+            'openclaw-qqbot': {
+              enabled: true,
+              installPath: path.join(homeDir, 'extensions', 'openclaw-qqbot'),
+            },
+          },
+          installs: {
+            'openclaw-qqbot': {
+              installPath: path.join(homeDir, 'extensions', 'openclaw-qqbot'),
+            },
+          },
+        },
+      },
+    })
+
+    expect(result.ok).toBe(true)
+    expect(result.changed).toBe(true)
+    expect(result.orphanedPluginIds).toEqual([])
+    expect(result.prunedPluginIds).toEqual(['openclaw-qqbot'])
+    expect(result.removedFrom).toEqual({
+      allow: ['openclaw-qqbot'],
+      entries: ['openclaw-qqbot'],
+      installs: ['openclaw-qqbot'],
+      channels: [],
+    })
+    expect(result.afterConfig).toEqual({
+      channels: {
+        qqbot: {
+          enabled: true,
+          appId: 'bot_123',
+          clientSecret: 'secret_456',
+          allowFrom: ['*'],
+        },
+      },
+      plugins: {
+        allow: ['other-plugin', 'qqbot'],
+        entries: {},
+        installs: {},
+      },
+    })
+  })
+
+  it('preserves the runtime qqbot allow entry while pruning external qqbot install residue for a configured bundled channel', async () => {
+    const homeDir = await createTempHome()
+
+    const result = await reconcileManagedPluginConfig({
+      channelId: 'qqbot',
+      runtimeContext: {
+        homeDir,
+        openclawVersion: '2026.4.12',
+      },
+      installedOnDisk: true,
+      currentConfig: {
+        channels: {
+          qqbot: {
+            enabled: true,
+            appId: 'bot_123',
+            clientSecret: 'secret_456',
+            allowFrom: ['*'],
+          },
+        },
+        plugins: {
+          allow: ['qqbot', 'other-plugin'],
+          entries: {
+            qqbot: {
+              enabled: true,
+              installPath: path.join(homeDir, 'extensions', 'qqbot'),
+            },
+          },
+          installs: {
+            qqbot: {
+              installPath: path.join(homeDir, 'extensions', 'qqbot'),
+            },
+          },
+        },
+      },
+    })
+
+    expect(result.ok).toBe(true)
+    expect(result.changed).toBe(true)
+    expect(result.orphanedPluginIds).toEqual([])
+    expect(result.prunedPluginIds).toEqual(['qqbot'])
+    expect(result.removedFrom).toEqual({
+      allow: [],
+      entries: ['qqbot'],
+      installs: ['qqbot'],
+      channels: [],
+    })
+    expect(result.afterConfig).toEqual({
+      channels: {
+        qqbot: {
+          enabled: true,
+          appId: 'bot_123',
+          clientSecret: 'secret_456',
+          allowFrom: ['*'],
+        },
+      },
+      plugins: {
+        allow: ['qqbot', 'other-plugin'],
+        entries: {},
+        installs: {},
+      },
+    })
+  })
+
+  it('does not invent bundled qqbot plugin config before the channel itself is configured', async () => {
+    const homeDir = await createTempHome()
+
+    const result = await reconcileManagedPluginConfig({
+      channelId: 'qqbot',
+      runtimeContext: {
+        homeDir,
+        openclawVersion: '2026.4.12',
+      },
+      installedOnDisk: true,
+      currentConfig: {},
+    })
+
+    expect(result.ok).toBe(true)
+    expect(result.changed).toBe(false)
+    expect(result.orphanedPluginIds).toEqual([])
+    expect(result.afterConfig).toEqual({})
+  })
+
+  it('prunes residue-only bundled qqbot plugin config instead of inventing a runtime allow entry', async () => {
+    const homeDir = await createTempHome()
+
+    const result = await reconcileManagedPluginConfig({
+      channelId: 'qqbot',
+      runtimeContext: {
+        homeDir,
+        openclawVersion: '2026.4.12',
+      },
+      installedOnDisk: true,
+      currentConfig: {
+        plugins: {
+          allow: ['other-plugin', 'qqbot', 'openclaw-qqbot'],
+          entries: {
+            qqbot: {
+              enabled: true,
+              installPath: path.join(homeDir, 'extensions', 'qqbot'),
+            },
+            'openclaw-qqbot': {
+              enabled: true,
+              installPath: path.join(homeDir, 'extensions', 'openclaw-qqbot'),
+            },
+          },
+          installs: {
+            qqbot: {
+              installPath: path.join(homeDir, 'extensions', 'qqbot'),
+            },
+            'openclaw-qqbot': {
+              installPath: path.join(homeDir, 'extensions', 'openclaw-qqbot'),
+            },
+          },
+        },
+      },
+    })
+
+    expect(result.ok).toBe(true)
+    expect(result.changed).toBe(true)
+    expect(result.orphanedPluginIds).toEqual([])
+    expect(result.prunedPluginIds).toEqual(['qqbot', 'openclaw-qqbot'])
+    expect(result.removedFrom).toEqual({
+      allow: ['qqbot', 'openclaw-qqbot'],
+      entries: ['qqbot', 'openclaw-qqbot'],
+      installs: ['qqbot', 'openclaw-qqbot'],
+      channels: [],
+    })
+    expect(result.afterConfig).toEqual({
+      plugins: {
+        allow: ['other-plugin'],
+        entries: {},
+        installs: {},
+      },
+    })
+  })
+
+  it('normalizes the conservative renderer qqbot config shape to the pinned bundled runtime contract', async () => {
+    const homeDir = await createTempHome()
+    const currentConfig = applyChannelConfig({}, 'qqbot', {
+      appId: 'bot_123',
+      appSecret: 'secret_456',
+    })
+
+    const result = await reconcileManagedPluginConfig({
+      channelId: 'qqbot',
+      runtimeContext: {
+        homeDir,
+        openclawVersion: '2026.4.12',
+      },
+      installedOnDisk: true,
+      currentConfig,
+    })
+
+    expect(result.ok).toBe(true)
+    expect(result.changed).toBe(true)
+    expect(result.orphanedPluginIds).toEqual([])
+    expect(result.prunedPluginIds).toEqual(['openclaw-qqbot'])
+    expect(result.afterConfig).toEqual({
+      channels: currentConfig.channels,
+      plugins: {
+        allow: ['qqbot'],
+      },
+    })
+  })
+
+  it('keeps qqbot on the legacy generic contract outside the pinned 2026.4.12 runtime', async () => {
+    const homeDir = await createTempHome()
+    const currentConfig = {
+      channels: {
+        qqbot: {
+          enabled: true,
+          appId: 'bot_123',
+          clientSecret: 'secret_456',
+          allowFrom: ['*'],
+        },
+      },
+      plugins: {
+        allow: ['openclaw-qqbot'],
+      },
+    }
+
+    const result = await reconcileManagedPluginConfig({
+      channelId: 'qqbot',
+      runtimeContext: {
+        homeDir,
+        openclawVersion: '2026.4.11',
+      },
+      installedOnDisk: true,
+      currentConfig,
+    })
+
+    expect(result.ok).toBe(true)
+    expect(result.changed).toBe(false)
+    expect(result.orphanedPluginIds).toEqual([])
+    expect(result.prunedPluginIds).toEqual([])
+    expect(result.afterConfig).toEqual(currentConfig)
   })
 })

@@ -14,6 +14,9 @@ import {
   reconcileManagedPluginConfig as reconcileManagedPluginConfigOnDisk,
 } from '../managed-plugin-config-reconciler'
 
+const fs = process.getBuiltinModule('node:fs') as typeof import('node:fs')
+const path = process.getBuiltinModule('node:path') as typeof import('node:path')
+
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
@@ -70,6 +73,15 @@ function createDependencies() {
       stdout: '',
       stderr: '',
       code: 0,
+    }),
+    inspectBundledQqRuntime: vi.fn().mockResolvedValue({
+      applicable: false,
+      available: false,
+      pluginId: 'qqbot',
+      runtimeVersion: null,
+      packageRoot: null,
+      message: null,
+      evidence: [],
     }),
     now: vi.fn(() => 0),
   }
@@ -215,6 +227,21 @@ describe('managed channel lifecycle specs', () => {
 })
 
 describe('createManagedChannelPluginLifecycleService', () => {
+  it('binds bundled qqbot runtime inspection to the provided runtime context instead of ignoring it', () => {
+    const source = fs.readFileSync(
+      path.join(process.cwd(), 'electron', 'main', 'managed-channel-plugin-lifecycle.ts'),
+      'utf8'
+    )
+
+    expect(source).toContain('createBundledQqPackageRuntimeOptions')
+    expect(source).toContain('resolveWindowsChannelRuntimeContext')
+    expect(source).toContain('runtimeContextRecord?.openclawVersion')
+    expect(source).toContain('readOpenClawPackageInfo(packageOptions)')
+    expect(source).toContain('resolveOpenClawPackageRoot(packageOptions)')
+    expect(source).not.toContain("caller: 'channel-preflight'")
+    expect(source).not.toContain('void options')
+  })
+
   it('returns plugin-ready-channel-not-ready when the plugin is healthy but runtime/account proof is still missing', async () => {
     const dependencies = createDependencies()
     dependencies.getOfficialChannelStatus.mockResolvedValue(
@@ -548,8 +575,13 @@ describe('createManagedChannelPluginLifecycleService', () => {
     })
   })
 
-  it('treats hidden install-stage metadata as config drift for qqbot too', async () => {
+  it('treats hidden install-stage metadata as config drift for bundled qqbot without falling back to external repair', async () => {
     const dependencies = createDependencies()
+    const runtimeContext = {
+      homeDir: 'C:\\OpenClaw',
+      configPath: 'C:\\OpenClaw\\openclaw.json',
+      openclawVersion: '2026.4.12',
+    }
     let currentConfig: Record<string, any> = {
       channels: {
         qqbot: {
@@ -569,25 +601,34 @@ describe('createManagedChannelPluginLifecycleService', () => {
         },
       },
     }
-    dependencies.isPluginInstalledOnDisk.mockResolvedValue(true)
-    dependencies.listRegisteredPlugins.mockResolvedValue(['openclaw-qqbot'])
+    dependencies.inspectBundledQqRuntime.mockResolvedValue({
+      applicable: true,
+      available: true,
+      pluginId: 'qqbot',
+      runtimeVersion: '2026.4.12',
+      packageRoot: 'C:\\OpenClaw\\node_modules\\openclaw',
+      message: null,
+      evidence: ['bundled qqbot detected'],
+    })
+    dependencies.isPluginInstalledOnDisk.mockResolvedValue(false)
+    dependencies.listRegisteredPlugins.mockResolvedValue(['qqbot'])
     dependencies.readConfig.mockImplementation(async () => currentConfig)
     dependencies.writeConfig.mockImplementation(async (config: Record<string, any>) => {
       currentConfig = config
     })
 
     const service = createManagedChannelPluginLifecycleService(dependencies)
-    const result = await service.prepareManagedChannelPluginForSetup('qqbot')
+    const result = await service.prepareManagedChannelPluginForSetup('qqbot', {
+      runtimeContext,
+    })
 
     expect(result).toMatchObject({
       kind: 'ok',
       channelId: 'qqbot',
       action: 'repair-before-setup',
     })
-    expect(dependencies.repairIncompatiblePlugins).toHaveBeenCalledWith({
-      scopePluginIds: ['openclaw-qqbot', 'qqbot', 'openclaw-qq', '@sliverp/qqbot', '@tencent-connect/qqbot', '@tencent-connect/openclaw-qq', '@tencent-connect/openclaw-qqbot'],
-      quarantineOfficialManagedPlugins: true,
-    })
+    expect(dependencies.repairIncompatiblePlugins).not.toHaveBeenCalled()
+    expect(dependencies.installPlugin).not.toHaveBeenCalled()
     expect(dependencies.writeConfig).toHaveBeenCalledWith({
       channels: {
         qqbot: {
@@ -598,10 +639,96 @@ describe('createManagedChannelPluginLifecycleService', () => {
         },
       },
       plugins: {
-        allow: ['openclaw-qqbot'],
+        allow: ['qqbot'],
         entries: {},
       },
     })
+  })
+
+  it('blocks qq setup preflight when the pinned Windows runtime is missing bundled qqbot files', async () => {
+    const dependencies = createDependencies()
+    dependencies.inspectBundledQqRuntime.mockResolvedValue({
+      applicable: true,
+      available: false,
+      pluginId: 'qqbot',
+      runtimeVersion: '2026.4.12',
+      packageRoot: 'C:\\OpenClaw\\node_modules\\openclaw',
+      message: '当前 Windows OpenClaw 2026.4.12 运行时缺少或损坏内置 QQ 插件文件。',
+      evidence: ['package.json missing'],
+    })
+    dependencies.readConfig.mockResolvedValue({
+      channels: {
+        qqbot: {
+          enabled: true,
+          appId: 'bot_123',
+          clientSecret: 'secret_456',
+        },
+      },
+      plugins: {},
+    })
+
+    const service = createManagedChannelPluginLifecycleService(dependencies)
+    const result = await service.prepareManagedChannelPluginForSetup('qqbot')
+
+    expect(result).toMatchObject({
+      kind: 'capability-blocked',
+      channelId: 'qqbot',
+      missingCapabilities: ['当前 Windows OpenClaw 2026.4.12 运行时缺少或损坏内置 QQ 插件文件。'],
+    })
+    expect(dependencies.repairIncompatiblePlugins).not.toHaveBeenCalled()
+    expect(dependencies.installPlugin).not.toHaveBeenCalled()
+  })
+
+  it('reuses bundled qqbot during repair without running external install or generic scope repair', async () => {
+    const dependencies = createDependencies()
+    const runtimeContext = {
+      homeDir: 'C:\\OpenClaw',
+      configPath: 'C:\\OpenClaw\\openclaw.json',
+      openclawVersion: '2026.4.12',
+    }
+    dependencies.inspectBundledQqRuntime.mockResolvedValue({
+      applicable: true,
+      available: true,
+      pluginId: 'qqbot',
+      runtimeVersion: '2026.4.12',
+      packageRoot: 'C:\\OpenClaw\\node_modules\\openclaw',
+      message: null,
+      evidence: ['bundled qqbot detected'],
+    })
+    dependencies.isPluginInstalledOnDisk.mockResolvedValue(false)
+    dependencies.listRegisteredPlugins.mockResolvedValue(['qqbot'])
+    let currentConfig: Record<string, any> = {
+      channels: {
+        qqbot: {
+          enabled: true,
+          appId: 'bot_123',
+          clientSecret: 'secret_456',
+          allowFrom: ['*'],
+        },
+      },
+      plugins: {
+        allow: ['openclaw-qqbot'],
+      },
+    }
+    dependencies.readConfig.mockImplementation(async () => currentConfig)
+    dependencies.writeConfig.mockImplementation(async (config: Record<string, any>) => {
+      currentConfig = config
+    })
+
+    const service = createManagedChannelPluginLifecycleService(dependencies)
+    const result = await service.repairManagedChannelPlugin('qqbot', {
+      runtimeContext,
+    })
+
+    expect(result).toMatchObject({
+      kind: 'ok',
+      channelId: 'qqbot',
+      action: 'restored',
+    })
+    expect(result.status.summary).toBe('已检测到 OpenClaw 内置 QQ 插件，并已在上游 plugins list 中确认注册；loaded / ready 仍待上游证据。')
+    expect(dependencies.repairIncompatiblePlugins).not.toHaveBeenCalled()
+    expect(dependencies.installPlugin).not.toHaveBeenCalled()
+    expect(currentConfig.plugins.allow).toEqual(['qqbot'])
   })
 
   it('reuses an installed managed plugin during setup preflight when the current config is unreadable', async () => {

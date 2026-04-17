@@ -21,6 +21,11 @@ import { resolveOpenClawBinaryPath } from './openclaw-package'
 const fs = process.getBuiltinModule('node:fs') as typeof import('node:fs')
 const { access } = fs.promises
 
+function normalizePathForCompare(targetPath: string): string {
+  const normalized = String(targetPath || '').trim()
+  return process.platform === 'win32' ? normalized.toLowerCase() : normalized
+}
+
 function resolveManualQClawUninstallStep(): string {
   if (process.platform === 'darwin') {
     return '请将 Qclaw 应用拖入废纸篓以完成卸载。'
@@ -74,10 +79,7 @@ async function runStateCleanupStep(
   return {
     attempted: true,
     ok: stateCleanupResult.ok,
-    command:
-      process.platform === 'win32'
-        ? `openclaw gateway stop && rmdir /s /q ${candidate.displayStateRoot}`
-        : `openclaw gateway stop && rm -rf ${candidate.displayStateRoot}`,
+    command: process.platform === 'win32' ? undefined : `openclaw gateway stop && rm -rf ${candidate.displayStateRoot}`,
     message: stateCleanupResult.ok ? '状态与数据清理命令执行成功。' : '状态与数据清理命令执行失败。',
     errors,
   }
@@ -378,6 +380,7 @@ export async function runOpenClawCleanup(
 
   let backupCreated: OpenClawBackupEntry | null = null
   const perCandidateResults: OpenClawCleanupCandidateResult[] = []
+  const stateCleanupCache = new Map<string, OpenClawCleanupStepResult>()
 
   for (const candidate of targets) {
     const warnings: string[] = []
@@ -398,8 +401,24 @@ export async function runOpenClawCleanup(
       }
     }
 
-    const stateCleanup = await runStateCleanupStep(candidate)
-    if (!stateCleanup.ok) {
+    const normalizedStateRoot = normalizePathForCompare(candidate.stateRoot)
+    const cachedStateCleanup = normalizedStateRoot ? stateCleanupCache.get(normalizedStateRoot) : null
+    const stateCleanup = cachedStateCleanup
+      ? {
+          attempted: false,
+          ok: cachedStateCleanup.ok,
+          message: cachedStateCleanup.ok
+            ? '该状态目录已在本次批量清理中处理，本实例复用前序清理结果。'
+            : '该状态目录已在本次批量清理中处理，但前序清理未成功，本实例复用前序结果。',
+          errors: [],
+        }
+      : await runStateCleanupStep(candidate)
+    if (!cachedStateCleanup && normalizedStateRoot) {
+      stateCleanupCache.set(normalizedStateRoot, stateCleanup)
+    }
+    if (cachedStateCleanup) {
+      warnings.push('检测到已选实例共用同一状态目录，本实例未重复执行状态清理。')
+    } else if (!stateCleanup.ok) {
       errors.push(...(stateCleanup.errors || []))
     }
     const programUninstall = await runProgramUninstallStep(candidate.installSource)

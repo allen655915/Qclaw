@@ -70,7 +70,7 @@ export const MAIN_RUNTIME_POLICY = Object.freeze({
       process.env,
       'QCLAW_RUNTIME_DOCTOR_TIMEOUT_MS',
       MAIN_RUNTIME_DEFAULTS.cli.doctorTimeoutMs,
-      1_000
+      0
     ),
     pairingApproveTimeoutMs: readEnvNumber(
       process.env,
@@ -82,13 +82,13 @@ export const MAIN_RUNTIME_POLICY = Object.freeze({
       process.env,
       'QCLAW_RUNTIME_PLUGIN_INSTALL_TIMEOUT_MS',
       MAIN_RUNTIME_DEFAULTS.cli.pluginInstallTimeoutMs,
-      1_000
+      0
     ),
     pluginInstallNpxTimeoutMs: readEnvNumber(
       process.env,
       'QCLAW_RUNTIME_PLUGIN_INSTALL_NPX_TIMEOUT_MS',
       MAIN_RUNTIME_DEFAULTS.cli.pluginInstallNpxTimeoutMs,
-      1_000
+      0
     ),
     dashboardLaunchTimeoutMs: readEnvNumber(
       process.env,

@@ -14,14 +14,19 @@ import {
   canUseFeishuManualBindingOpenClawHotReload,
   clearFeishuManualCredentialInput,
   captureFeishuBotConfigSnapshot,
+  buildManagedPluginPreflightLogLine,
+  buildManagedPluginReuseLogLine,
+  buildManagedPluginReuseStartLogLine,
   ensureGatewayReadyForChannelConnect,
   hasRecoveredFeishuCreateMode,
   hasFeishuManualCredentialInput,
   isFeishuManualBindingReady,
+  isChannelConnectBusy,
   mergeFeishuPairingAllowFromUsersIntoConfig,
   mergeFeishuCreateModeBots,
   resolveFeishuCreateModeRecoveryNotice,
   resolveChannelConnectBindingStrategy,
+  resolveChannelConnectProgressLabel,
   resolveFeishuAutoRecoveryTarget,
   resolveFeishuInstallerAutoPairOpenId,
   resolveFeishuManualBindingEnsureReadyOutcome,
@@ -260,6 +265,88 @@ describe('ensureGatewayReadyForChannelConnect', () => {
     expect(repairManagedChannelPlugin).toHaveBeenCalledWith('wecom')
     expect(ensureGatewayRunning).toHaveBeenCalledWith({ skipRuntimePrecheck: true })
     expect(getManagedChannelPluginStatus).toHaveBeenCalledWith('wecom')
+  })
+
+  it('keeps qqbot on the failure path until ready is explicitly verified', async () => {
+    const reloadGatewayAfterChannelChange = vi.fn().mockResolvedValue({
+      ok: false,
+      running: false,
+      stateCode: 'plugin_load_failure',
+      summary: 'Gateway 依赖的插件没有正常加载',
+      stdout: '',
+      stderr: 'failed to load plugin',
+      code: 1,
+    })
+    const repairManagedChannelPlugin = vi.fn().mockResolvedValue({
+      kind: 'ok',
+      channelId: 'qqbot',
+      pluginScope: 'channel',
+      entityScope: 'channel',
+      action: 'installed',
+      status: {
+        channelId: 'qqbot',
+        pluginId: 'openclaw-qqbot',
+        summary: 'QQ 官方插件已修复。',
+        stages: [
+          { id: 'installed', state: 'verified', source: 'disk', message: 'installed' },
+          { id: 'registered', state: 'verified', source: 'plugins-list', message: 'registered' },
+          { id: 'loaded', state: 'unknown', source: 'status', message: 'unknown' },
+          { id: 'ready', state: 'unknown', source: 'status', message: 'unknown' },
+        ],
+        evidence: [],
+      },
+    })
+    const ensureGatewayRunning = vi.fn().mockResolvedValue({
+      ok: true,
+      running: true,
+      autoInstalledNode: false,
+      autoInstalledOpenClaw: false,
+      autoInstalledGatewayService: false,
+      autoPortMigrated: false,
+      effectivePort: 18789,
+      stateCode: 'healthy',
+      summary: 'Gateway 已确认可用',
+      attemptedCommands: [],
+      evidence: [],
+      repairActionsTried: ['repair-bad-plugin'],
+      repairOutcome: 'recovered',
+      safeToRetry: true,
+      stdout: '',
+      stderr: '',
+      code: 0,
+    })
+    const getManagedChannelPluginStatus = vi.fn().mockResolvedValue({
+      channelId: 'qqbot',
+      pluginId: 'openclaw-qqbot',
+      summary: '已检测到 OpenClaw 内置 QQ 插件，并已在上游 plugins list 中确认注册；loaded / ready 仍待上游证据。',
+      stages: [
+        { id: 'installed', state: 'verified', source: 'disk', message: 'installed' },
+        { id: 'registered', state: 'verified', source: 'plugins-list', message: 'registered' },
+        { id: 'loaded', state: 'unknown', source: 'status', message: 'unknown' },
+        { id: 'ready', state: 'unknown', source: 'status', message: 'unknown' },
+      ],
+      evidence: [],
+    })
+
+    const appendLog = vi.fn()
+    const result = await ensureGatewayReadyForChannelConnect(
+      {
+        reloadGatewayAfterChannelChange,
+        repairManagedChannelPlugin,
+        ensureGatewayRunning,
+        getManagedChannelPluginStatus,
+      } as any,
+      appendLog,
+      { channelId: 'qqbot' }
+    )
+
+    expect(result).toEqual({
+      ok: false,
+      message: '已检测到 OpenClaw 内置 QQ 插件，并已在上游 plugins list 中确认注册；loaded / ready 仍待上游证据。',
+    })
+    expect(repairManagedChannelPlugin).toHaveBeenCalledWith('qqbot')
+    expect(ensureGatewayRunning).toHaveBeenCalledWith({ skipRuntimePrecheck: true })
+    expect(getManagedChannelPluginStatus).toHaveBeenCalledWith('qqbot')
   })
 
   it('fails after targeted repair when Gateway still does not come back up', async () => {
@@ -684,6 +771,51 @@ describe('QQ channel connect flow', () => {
     expect(resolveChannelConnectBindingStrategy(getChannelDefinition('qqbot'))).toBe('config-write')
   })
 
+  it('enters the busy state during the new preflight phase and keeps install/start semantics unchanged', () => {
+    expect(isChannelConnectBusy('preflighting')).toBe(true)
+    expect(isChannelConnectBusy('installing')).toBe(true)
+    expect(isChannelConnectBusy('starting')).toBe(true)
+    expect(isChannelConnectBusy('form')).toBe(false)
+    expect(isChannelConnectBusy('error')).toBe(false)
+  })
+
+  it('uses dedicated QQ runtime copy during preflight and a runtime reuse hint after preflight succeeds', () => {
+    expect(
+      resolveChannelConnectProgressLabel({
+        status: 'preflighting',
+        channel: getChannelDefinition('qqbot'),
+      })
+    ).toBe('正在检查 QQ 运行时能力...')
+    expect(buildManagedPluginPreflightLogLine(getChannelDefinition('qqbot'))).toBe('正在检查 QQ 运行时能力...\n')
+    expect(buildManagedPluginReuseStartLogLine(getChannelDefinition('qqbot'))).toBe(
+      '检测到 QQ 内置插件，准备跳过外部安装...\n'
+    )
+    expect(buildManagedPluginReuseLogLine(getChannelDefinition('qqbot'))).toBe(
+      '✅ 已检测到 QQ 内置插件，跳过外部安装\n\n'
+    )
+  })
+
+  it('keeps non-QQ managed channels on generic preflight copy', () => {
+    expect(
+      resolveChannelConnectProgressLabel({
+        status: 'preflighting',
+        channel: getChannelDefinition('wecom'),
+      })
+    ).toBe('正在准备连接环境...')
+    expect(buildManagedPluginPreflightLogLine(getChannelDefinition('wecom'))).toBe(
+      '正在检查 企业微信 插件运行环境...\n'
+    )
+    expect(buildManagedPluginReuseStartLogLine(getChannelDefinition('wecom'))).toBe(
+      '检测到 企业微信 官方插件已安装，跳过重装...\n'
+    )
+    expect(buildManagedPluginReuseLogLine(getChannelDefinition('wecom'))).toBe('✅ 已复用已安装插件\n\n')
+  })
+
+  it('records the preflighting state in the source so QQ clicks no longer wait silently', () => {
+    expect(channelConnectSource).toContain("'preflighting'")
+    expect(channelConnectSource).toContain('正在检查 QQ 运行时能力...')
+  })
+
   it('reinstalls managed plugins when only openclaw.json records remain but the plugin is missing on disk', () => {
     expect(
       resolveManagedPluginInstallStrategy({
@@ -715,13 +847,13 @@ describe('QQ channel connect flow', () => {
   it('builds scoped repair options from the canonical plugin id and cleanup aliases', () => {
     expect(buildManagedPluginScopedRepairOptions(getChannelDefinition('qqbot'))).toEqual({
       scopePluginIds: [
-        'openclaw-qqbot',
         'qqbot',
         'openclaw-qq',
         '@sliverp/qqbot',
         '@tencent-connect/qqbot',
         '@tencent-connect/openclaw-qq',
         '@tencent-connect/openclaw-qqbot',
+        'openclaw-qqbot',
       ],
       quarantineOfficialManagedPlugins: true,
     })
@@ -1953,6 +2085,52 @@ describe('resolveFeishuPairingTarget', () => {
 })
 
 describe('mergeFeishuCreateModeBots', () => {
+  it('does not infer added bots when the pre-create baseline was never captured', () => {
+    const currentConfig = {
+      channels: {
+        feishu: {
+          enabled: false,
+          name: '现有 Bot',
+          appId: 'cli_existing',
+          appSecret: 'secret-existing',
+        },
+      },
+    }
+
+    const result = mergeFeishuCreateModeBots({
+      previousFeishuConfigSnapshot: undefined,
+      currentConfig,
+    })
+
+    expect(result.addedBots).toEqual([])
+    expect(result.nextConfig).toEqual(currentConfig)
+  })
+
+  it('re-enables a newly recovered default bot when create mode started from an empty baseline', () => {
+    const result = mergeFeishuCreateModeBots({
+      previousFeishuConfigSnapshot: null,
+      currentConfig: {
+        channels: {
+          feishu: {
+            enabled: false,
+            name: '新建 Bot',
+            appId: 'cli_created',
+            appSecret: 'secret-created',
+          },
+        },
+      },
+    })
+
+    expect(result.addedBots).toEqual([{
+      accountId: 'default',
+      accountName: '新建 Bot',
+      appId: 'cli_created',
+    }])
+    expect(result.nextConfig.channels.feishu.enabled).toBe(true)
+    expect(result.nextConfig.channels.feishu.appId).toBe('cli_created')
+    expect(result.nextConfig.channels.feishu.appSecret).toBe('secret-created')
+  })
+
   it('preserves the existing default bot and appends the newly created installer bot', () => {
     const result = mergeFeishuCreateModeBots({
       previousFeishuConfigSnapshot: {

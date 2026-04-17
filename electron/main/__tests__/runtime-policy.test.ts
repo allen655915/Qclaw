@@ -2,6 +2,9 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 
 const OVERRIDE_KEYS = [
   'QCLAW_RUNTIME_AUTH_LOGIN_TIMEOUT_MS',
+  'QCLAW_RUNTIME_DOCTOR_TIMEOUT_MS',
+  'QCLAW_RUNTIME_PLUGIN_INSTALL_TIMEOUT_MS',
+  'QCLAW_RUNTIME_PLUGIN_INSTALL_NPX_TIMEOUT_MS',
   'QCLAW_RUNTIME_COMMAND_AVAILABILITY_TIMEOUT_MS',
   'QCLAW_RUNTIME_COMMAND_AVAILABILITY_BACKOFF_FACTOR',
 ] as const
@@ -20,6 +23,24 @@ describe('MAIN_RUNTIME_POLICY', () => {
     const { MAIN_RUNTIME_POLICY } = await import('../runtime-policy')
 
     expect(MAIN_RUNTIME_POLICY.auth.loginTimeoutMs).toBe(420_000)
+  })
+
+  it('allows disabling the doctor timeout via env override', async () => {
+    process.env.QCLAW_RUNTIME_DOCTOR_TIMEOUT_MS = '0'
+
+    const { MAIN_RUNTIME_POLICY } = await import('../runtime-policy')
+
+    expect(MAIN_RUNTIME_POLICY.cli.doctorTimeoutMs).toBe(0)
+  })
+
+  it('allows disabling plugin install timeouts via env override', async () => {
+    process.env.QCLAW_RUNTIME_PLUGIN_INSTALL_TIMEOUT_MS = '0'
+    process.env.QCLAW_RUNTIME_PLUGIN_INSTALL_NPX_TIMEOUT_MS = '0'
+
+    const { MAIN_RUNTIME_POLICY } = await import('../runtime-policy')
+
+    expect(MAIN_RUNTIME_POLICY.cli.pluginInstallTimeoutMs).toBe(0)
+    expect(MAIN_RUNTIME_POLICY.cli.pluginInstallNpxTimeoutMs).toBe(0)
   })
 
   it('falls back to defaults for invalid override values', async () => {

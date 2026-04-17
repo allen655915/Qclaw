@@ -277,6 +277,19 @@ describe('dashboard plugin center helpers', () => {
     expect(dashboardSource).toContain('window.api.repairManagedChannelPlugin')
   })
 
+  it('keeps qq plugin center repair on the shared managed repair path', () => {
+    const dashboardSource = fs.readFileSync(
+      path.join(process.cwd(), 'src', 'pages', 'Dashboard.tsx'),
+      'utf8'
+    )
+
+    expect(dashboardSource).toContain("id: 'qqbot'")
+    expect(dashboardSource).toContain("buttonLabel: '修复QQ插件'")
+    expect(dashboardSource).toContain("expectedPluginIds: ['openclaw-qqbot', 'qqbot']")
+    expect(dashboardSource).toContain("window.api.repairManagedChannelPlugin")
+    expect(dashboardSource).toContain("window.api.getManagedChannelPluginStatus")
+  })
+
   it('does not keep the redundant plugin center helper copy', () => {
     const dashboardSource = fs.readFileSync(
       path.join(process.cwd(), 'src', 'pages', 'Dashboard.tsx'),
