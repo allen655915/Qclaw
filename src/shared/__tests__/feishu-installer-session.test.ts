@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 
 import {
   buildFeishuCreateBotConfirmationMessage,
@@ -6,6 +6,8 @@ import {
   isFeishuCreateBotConfirmationPrompt,
   shouldDisableFeishuCreateInstallerButton,
   shouldDisableFeishuInstallerManualInput,
+  shouldStopFeishuInstallerForPendingPromptCleanup,
+  submitFeishuInstallerPromptDecision,
   type FeishuInstallerManualCredentialRequirement,
   type FeishuInstallerPendingPrompt,
 } from '../feishu-installer-session'
@@ -51,6 +53,13 @@ describe('feishu installer prompt helpers', () => {
     expect(shouldDisableFeishuInstallerManualInput(null)).toBe(false)
   })
 
+  it('does not auto-stop the installer once confirm is already in flight', () => {
+    expect(shouldStopFeishuInstallerForPendingPromptCleanup(buildPrompt(), null)).toBe(true)
+    expect(shouldStopFeishuInstallerForPendingPromptCleanup(buildPrompt(), 'cancel')).toBe(true)
+    expect(shouldStopFeishuInstallerForPendingPromptCleanup(buildPrompt(), 'confirm')).toBe(false)
+    expect(shouldStopFeishuInstallerForPendingPromptCleanup(null, 'confirm')).toBe(false)
+  })
+
   it('recognizes the narrow structured manual credential fallback state', () => {
     expect(hasFeishuInstallerManualCredentialRequirement(buildManualRequirement())).toBe(true)
     expect(hasFeishuInstallerManualCredentialRequirement(buildManualRequirement({ kind: 'secret-only' }))).toBe(true)
@@ -68,5 +77,57 @@ describe('feishu installer prompt helpers', () => {
   it('builds a user-facing confirmation message with the detected app id when available', () => {
     expect(buildFeishuCreateBotConfirmationMessage(buildPrompt({ appId: 'cli_existing_bot' }))).toBe('确认新建机器人？')
     expect(buildFeishuCreateBotConfirmationMessage(buildPrompt())).toBe('确认新建机器人？')
+  })
+
+  it('submits the structured prompt decision through the installer api', async () => {
+    const answerPrompt = vi.fn().mockResolvedValue({ ok: true })
+
+    const result = await submitFeishuInstallerPromptDecision({
+      sessionId: 'session-1',
+      prompt: buildPrompt({ promptId: 'prompt-123' }),
+      decision: 'confirm',
+      answerPrompt,
+    })
+
+    expect(result).toEqual({ ok: true, confirmed: true })
+    expect(answerPrompt).toHaveBeenCalledWith('session-1', 'prompt-123', 'confirm')
+  })
+
+  it('returns a missing-context result instead of calling the api when prompt metadata is stale', async () => {
+    const answerPrompt = vi.fn()
+
+    const result = await submitFeishuInstallerPromptDecision({
+      sessionId: '   ',
+      prompt: buildPrompt({ promptId: '' }),
+      decision: 'cancel',
+      answerPrompt,
+    })
+
+    expect(result).toEqual({
+      ok: false,
+      confirmed: false,
+      reason: 'missing-context',
+      message: '飞书官方安装器确认状态已失效，请重新点击“新建机器人”。',
+    })
+    expect(answerPrompt).not.toHaveBeenCalled()
+  })
+
+  it('surfaces installer api failures with the matching decision fallback copy', async () => {
+    const answerPrompt = vi.fn().mockResolvedValue({ ok: false, message: '' })
+
+    const result = await submitFeishuInstallerPromptDecision({
+      sessionId: 'session-1',
+      prompt: buildPrompt({ promptId: 'prompt-456' }),
+      decision: 'cancel',
+      answerPrompt,
+    })
+
+    expect(result).toEqual({
+      ok: false,
+      confirmed: false,
+      reason: 'api-error',
+      message: '取消新建机器人失败',
+    })
+    expect(answerPrompt).toHaveBeenCalledWith('session-1', 'prompt-456', 'cancel')
   })
 })

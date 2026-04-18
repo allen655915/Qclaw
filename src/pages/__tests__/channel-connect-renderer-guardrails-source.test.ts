@@ -72,12 +72,32 @@ describe('ChannelConnect renderer guardrails', () => {
     expect(source).not.toContain('检测到旧的飞书安装器会话，Qclaw 已先将其终止。重新点击“新建机器人”会启动新的官方安装流程。')
   })
 
+  it('renders the Feishu create confirmation inline instead of relying on browser confirm dialogs', () => {
+    const source = readChannelConnectSource()
+
+    expect(source).toContain('const [feishuInstallerPromptDecision, setFeishuInstallerPromptDecision]')
+    expect(source).toContain('handleFeishuCreateBotPromptDecision')
+    expect(source).toContain('shouldStopFeishuInstallerForPendingPromptCleanup(')
+    expect(source).toContain('submitFeishuInstallerPromptDecision({')
+    expect(source).toContain('title="等待确认"')
+    expect(source).toContain('继续新建')
+    expect(source).not.toContain('window.confirm(buildFeishuCreateBotConfirmationMessage')
+  })
+
+  it('keeps the Feishu installer console and sync notice visible for any active create session', () => {
+    const source = readChannelConnectSource()
+
+    expect(source).toContain("|| Boolean(params.session?.active || params.session?.phase === 'running')")
+    expect(source).toContain('const hasActiveFeishuCreateSession =')
+    expect(source).toContain('hasActiveCreateSession: hasActiveFeishuCreateSession')
+  })
+
   it('does not auto-open the Feishu QR modal for arbitrary stale ASCII output', () => {
     const source = readChannelConnectSource()
 
     expect(source).not.toMatch(/if \(feishuInstallerAsciiQr\.length > 0\) \{\s*setShowFeishuQrModal\(true\)\s*\}/)
     expect(source).toContain('shouldAutoOpenFeishuQrModal({')
-    expect(source).toContain('showOwnedCreateSessionSurface')
+    expect(source).toContain('showInstallerConsoleSurface: showFeishuInstallerConsoleSurface')
     expect(source).toContain('installerRunning: feishuInstallerRunning')
     expect(source).toContain('qrUrl: feishuInstallerQrUrl')
     expect(source).toContain("payload.type === 'qr-ready'")

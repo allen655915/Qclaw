@@ -14,7 +14,6 @@ import {
   failChannelInstallerGuardrailStatus,
   mergeChannelInstallerGuardrailStatus,
   type ChannelInstallerGuardrailStatus,
-  type ChannelInstallerGatewayRecoveryStatus,
 } from '../../src/shared/channel-installer-session'
 import {
   cancelActiveProcess,
@@ -32,14 +31,6 @@ import { probePlatformCommandCapability } from './command-capabilities'
 import { ensureFeishuOfficialPluginReady } from './feishu-official-plugin-state'
 import { buildInstallerCommandEnv } from './installer-command-env'
 import { FEISHU_OFFICIAL_PLUGIN_ID } from './feishu-installer-config'
-import type {
-  GatewayInstallerStopSnapshot,
-  GatewayRecoveryResult,
-} from './gateway-lifecycle-controller'
-import {
-  recoverGatewayForInstaller,
-  stopGatewayForInstaller,
-} from './gateway-lifecycle-controller'
 import {
   resolveOpenClawPathsForRead,
   resolveWindowsActiveRuntimeSnapshotForRead,
@@ -575,10 +566,6 @@ interface ActiveFeishuInstallerSession {
   promptSessionToken: string
   runtimeBinding: FeishuInstallerRuntimeBinding | null
   managedOperationLease: ManagedOperationLease
-  gatewayRecoveryAttempted: boolean
-  gatewayRecoveryResult: GatewayRecoveryResult | null
-  gatewayStoppedForInstall: boolean
-  gatewayStopSnapshot: GatewayInstallerStopSnapshot | null
   terminalCleanupDone: Promise<void>
   resolveTerminalCleanup: (() => void) | null
 }
@@ -606,6 +593,7 @@ type FeishuInstallerPreflightResult =
 
 let activeSession: ActiveFeishuInstallerSession | null = null
 let feishuInstallerStartSequence: Promise<void> = Promise.resolve()
+let feishuInstallerTerminalCleanupQueue: Promise<void> = Promise.resolve()
 
 function createDeferredVoid(): {
   promise: Promise<void>
@@ -632,6 +620,21 @@ async function runSerializedFeishuInstallerStart<T>(task: () => Promise<T>): Pro
   }
 }
 
+function enqueueFeishuInstallerTerminalCleanup(
+  session: ActiveFeishuInstallerSession,
+  task: () => Promise<void>
+): void {
+  const queuedTask = feishuInstallerTerminalCleanupQueue
+    .catch(() => undefined)
+    .then(task)
+
+  feishuInstallerTerminalCleanupQueue = queuedTask.catch(() => undefined)
+  void queuedTask.finally(() => {
+    session.resolveTerminalCleanup?.()
+    session.resolveTerminalCleanup = null
+  })
+}
+
 export interface FeishuInstallerAuthResult {
   appId: string
   openId: string
@@ -643,15 +646,6 @@ function hasRunningFeishuInstallerSession(): boolean {
   return activeSession?.phase === 'running'
 }
 
-function buildGatewayRecoveryTimeoutResult(): GatewayRecoveryResult {
-  return {
-    ok: false,
-    recovered: false,
-    skipped: false,
-    message: '网关恢复超时，退出清理不会继续等待。',
-  }
-}
-
 function createFeishuInstallerGuardrail(
   patch: Parameters<typeof mergeChannelInstallerGuardrailStatus>[1] = {}
 ): ChannelInstallerGuardrailStatus {
@@ -659,29 +653,6 @@ function createFeishuInstallerGuardrail(
     createIdleChannelInstallerGuardrailStatus(FEISHU_MANAGED_CHANNEL_ID),
     patch
   )
-}
-
-function toInstallerGatewayRecoveryStatus(
-  result: GatewayRecoveryResult
-): ChannelInstallerGatewayRecoveryStatus {
-  return {
-    ok: result.ok,
-    recovered: result.recovered,
-    skipped: result.skipped,
-    code: result.code ?? null,
-    message: result.message,
-  }
-}
-
-function formatGatewayRecoveryFailure(result: GatewayRecoveryResult): string {
-  return [
-    result.message,
-    result.stderr,
-    result.stdout,
-  ]
-    .map((value) => String(value || '').trim())
-    .filter(Boolean)
-    .join('\n\n') || '安装器结束后网关恢复失败。'
 }
 
 function releaseSessionManagedOperationLease(session: ActiveFeishuInstallerSession): void {
@@ -697,87 +668,6 @@ function createBypassManagedOperationLease(key: string): ManagedOperationLease {
       released = true
     },
   }
-}
-
-async function runGatewayRecoveryWithTimeout(
-  snapshot: GatewayInstallerStopSnapshot | null | undefined,
-  reason: string,
-  timeoutMs?: number
-): Promise<GatewayRecoveryResult> {
-  const recovery = recoverGatewayForInstaller(snapshot, reason)
-  const normalizedTimeoutMs = Number(timeoutMs || 0)
-  if (!Number.isFinite(normalizedTimeoutMs) || normalizedTimeoutMs <= 0) {
-    return recovery
-  }
-
-  return await new Promise((resolve) => {
-    const timeout = setTimeout(() => {
-      resolve(buildGatewayRecoveryTimeoutResult())
-    }, normalizedTimeoutMs)
-    recovery.then(
-      (result) => {
-        clearTimeout(timeout)
-        resolve(result)
-      },
-      (error) => {
-        clearTimeout(timeout)
-        resolve({
-          ok: false,
-          recovered: false,
-          skipped: false,
-          message: error instanceof Error ? error.message : String(error),
-        })
-      }
-    )
-  })
-}
-
-async function recoverGatewayForSession(
-  session: ActiveFeishuInstallerSession,
-  reason: string,
-  options: { timeoutMs?: number } = {}
-): Promise<GatewayRecoveryResult> {
-  if (session.gatewayRecoveryAttempted) {
-    return session.gatewayRecoveryResult || {
-      ok: true,
-      recovered: false,
-      skipped: true,
-      message: '本次安装器会话已请求过网关恢复。',
-    }
-  }
-
-  session.gatewayRecoveryAttempted = true
-  const result = await runGatewayRecoveryWithTimeout(
-    session.gatewayStopSnapshot,
-    reason,
-    options.timeoutMs
-  )
-  session.gatewayRecoveryResult = result
-  session.guardrail = mergeChannelInstallerGuardrailStatus(session.guardrail, {
-    gateway: {
-      recovery: toInstallerGatewayRecoveryStatus(result),
-    },
-    ...(result.ok
-      ? {}
-      : {
-          failure: {
-            code: 'gateway-recovery-failed' as const,
-            message: formatGatewayRecoveryFailure(result),
-            step: 'gateway-recovery' as const,
-          },
-        }),
-  })
-  if (!result.ok) {
-    session.output += `\n${formatGatewayRecoveryFailure(result)}`
-  }
-  void appendFeishuInstallerDiag('gateway-recovery-finished', {
-    sessionId: session.id,
-    reason,
-    ok: result.ok,
-    recovered: result.recovered,
-    skipped: result.skipped,
-  })
-  return result
 }
 
 function buildSnapshot(): FeishuInstallerSessionSnapshot {
@@ -1147,18 +1037,31 @@ export async function startFeishuInstallerSession(
 ): Promise<FeishuInstallerSessionSnapshot> {
   return await runSerializedFeishuInstallerStart(async () => {
     const normalizedRequestToken = String(requestToken || '').trim()
-    const existingRunningSession = activeSession?.phase === 'running' ? activeSession : null
-    if (existingRunningSession) {
+    const existingSession = activeSession
+    if (existingSession?.phase === 'running') {
       void appendFeishuInstallerDiag('restart-replacing-running-session', {
-        existingSessionId: existingRunningSession.id,
+        existingSessionId: existingSession.id,
         requestToken: normalizedRequestToken,
       })
-      const stopResult = await stopFeishuInstallerSession({ recoverGateway: false })
-      const stopped = await waitForFeishuInstallerSessionTerminalCleanup(existingRunningSession)
-      if (!stopResult.ok || !stopped) {
-        const message = stopped
-          ? '检测到已有飞书安装器会话，但终止旧会话失败，无法启动新的安装流程。'
-          : '检测到已有飞书安装器会话，但终止旧会话超时，无法启动新的安装流程。'
+      const stopResult = await stopFeishuInstallerSession()
+      if (!stopResult.ok) {
+        const message = '检测到已有飞书安装器会话，但终止旧会话失败，无法启动新的安装流程。'
+        return buildExitedSnapshot({
+          code: 1,
+          output: message,
+          guardrail: failChannelInstallerGuardrailStatus({
+            channelId: FEISHU_MANAGED_CHANNEL_ID,
+            step: 'spawn',
+            code: 'spawn-failed',
+            message,
+          }),
+        })
+      }
+    }
+    if (existingSession) {
+      const cleaned = await waitForFeishuInstallerSessionTerminalCleanup(existingSession)
+      if (!cleaned) {
+        const message = '检测到上一次飞书安装器收尾仍未完成，无法启动新的安装流程。'
         return buildExitedSnapshot({
           code: 1,
           output: message,
@@ -1433,72 +1336,14 @@ export async function startFeishuInstallerSession(
       })
     }
 
-    const stopGatewayResult = preferImmediateLaunch
-      ? {
-          ok: true,
-          skipped: true,
-          stopped: false,
-          stopResult: null,
-          snapshot: {
-            gatewayOwner: null,
-            runtimeSnapshot: effectiveRuntimeSnapshot || null,
-            stopped: false,
-            wasOwnedByQclaw: false,
-            wasRunning: false,
-          },
-        }
-      : await stopGatewayForInstaller('feishu-installer-start')
-    const guardrailAfterGatewayStop = mergeChannelInstallerGuardrailStatus(preflightResult.guardrail, {
+    const guardrailAfterStartupChecks = mergeChannelInstallerGuardrailStatus(preflightResult.guardrail, {
       environment: { state: 'ok' },
       command: { state: 'ok' },
       lock: {
         state: 'ok',
         key: FEISHU_MANAGED_CHANNEL_LOCK_KEY,
       },
-      gateway: {
-        stop: {
-          state: preferImmediateLaunch
-            ? 'skipped'
-            : stopGatewayResult.ok ? 'ok' : 'failed',
-          stopped: stopGatewayResult.stopped,
-          skipped: stopGatewayResult.skipped,
-          ...(preferImmediateLaunch
-            ? {
-                message: '已跳过启动前网关停止，优先立即拉起飞书官方安装器。',
-              }
-            : stopGatewayResult.ok
-            ? {}
-            : {
-                code: 'gateway-stop-failed' as const,
-                message: stopGatewayResult.stopResult?.stderr
-                  || stopGatewayResult.stopResult?.stdout
-                  || 'Failed to stop gateway before starting the Feishu installer.',
-              }),
-        },
-      },
-      ...(stopGatewayResult.ok
-        ? {}
-        : {
-            failure: {
-              code: 'gateway-stop-failed' as const,
-              message: stopGatewayResult.stopResult?.stderr
-                || stopGatewayResult.stopResult?.stdout
-                || 'Failed to stop gateway before starting the Feishu installer.',
-              step: 'gateway-stop' as const,
-            },
-          }),
     })
-    if (!stopGatewayResult.ok) {
-      await cleanupFeishuInstallerRuntimeBinding(runtimeBinding).catch(() => undefined)
-      return buildExitedSnapshot({
-        guardrail: guardrailAfterGatewayStop,
-        output: stopGatewayResult.stopResult?.stderr
-          || stopGatewayResult.stopResult?.stdout
-          || 'Failed to stop gateway before starting the Feishu installer.',
-        code: stopGatewayResult.stopResult?.code ?? 1,
-        command: [...buildFeishuInstallerCommand().command],
-      })
-    }
 
     let isolatedNpmCache: Awaited<ReturnType<typeof createIsolatedNpmCacheEnv>> | null = null
     let promptBridgeServer: Server | null = null
@@ -1574,7 +1419,7 @@ export async function startFeishuInstallerSession(
         ok: false,
         canceled: false,
         command: [...commandResolution.command],
-        guardrail: mergeChannelInstallerGuardrailStatus(guardrailAfterGatewayStop, {
+        guardrail: mergeChannelInstallerGuardrailStatus(guardrailAfterStartupChecks, {
           spawn: { state: 'ok' },
         }),
         npmCacheDir: isolatedNpmCache.cacheDir,
@@ -1588,10 +1433,6 @@ export async function startFeishuInstallerSession(
         promptSessionToken: sessionToken,
         runtimeBinding,
         managedOperationLease: operationLease,
-        gatewayRecoveryAttempted: false,
-        gatewayRecoveryResult: null,
-        gatewayStoppedForInstall: stopGatewayResult.stopped,
-        gatewayStopSnapshot: stopGatewayResult.snapshot,
         terminalCleanupDone: terminalCleanup.promise,
         resolveTerminalCleanup: terminalCleanup.resolve,
       }
@@ -1619,7 +1460,6 @@ export async function startFeishuInstallerSession(
           : effectiveRuntimeSnapshot?.openclawPath || runtimeSnapshotCheck.snapshot?.openclawPath || null,
         runtimeBindingDir: runtimeBinding.cleanupDir || null,
         npmCacheDir: isolatedNpmCache.cacheDir,
-        gatewayStoppedForInstall: stopGatewayResult.stopped,
         skipInstalledPluginUpdate,
       })
 
@@ -1636,93 +1476,90 @@ export async function startFeishuInstallerSession(
         const session = activeSession
         if (session.phase === 'exited') return
         const npmCacheDirForCleanup = session.npmCacheDir
-        try {
-          clearPendingPrompt(session, {
-            notify: false,
-            abortMessage: 'Feishu installer session has exited.',
-          })
-          closePromptBridgeServer(session)
-          clearActiveProcessIfMatch(proc, FEISHU_INSTALLER_CONTROL_DOMAIN)
-          const canceled = consumeCanceledProcess(proc, FEISHU_INSTALLER_CONTROL_DOMAIN)
-          session.phase = 'exited'
-          session.code = canceled ? null : code
-          session.ok = code === 0 && !canceled
-          session.canceled = canceled
-          if (session.ok) {
-            const finalizeResult = await ensureFeishuOfficialPluginReady({
-              runtimeContext: preflightResult.runtimeContext,
-            }).catch((error) => ({
-              ok: false,
-              installedThisRun: false,
-              state: null,
-              stdout: '',
-              stderr: error instanceof Error ? error.message : String(error),
-              code: 1,
-              message: '飞书官方插件最终同步失败',
-            }))
-            if (!finalizeResult.ok) {
-              const details = [finalizeResult.message, finalizeResult.stderr, finalizeResult.stdout]
-                .map((value) => String(value || '').trim())
-                .filter(Boolean)
-                .join('\n\n')
-              if (details) {
-                session.output += `\n${details}`
+        clearPendingPrompt(session, {
+          notify: false,
+          abortMessage: 'Feishu installer session has exited.',
+        })
+        closePromptBridgeServer(session)
+        clearActiveProcessIfMatch(proc, FEISHU_INSTALLER_CONTROL_DOMAIN)
+        const canceled = consumeCanceledProcess(proc, FEISHU_INSTALLER_CONTROL_DOMAIN)
+        session.phase = 'exited'
+        session.code = canceled ? null : code
+        session.ok = code === 0 && !canceled
+        session.canceled = canceled
+        enqueueFeishuInstallerTerminalCleanup(session, async () => {
+          try {
+            if (session.ok) {
+              const finalizeResult = await ensureFeishuOfficialPluginReady({
+                runtimeContext: preflightResult.runtimeContext,
+              }).catch((error) => ({
+                ok: false,
+                installedThisRun: false,
+                state: null,
+                stdout: '',
+                stderr: error instanceof Error ? error.message : String(error),
+                code: 1,
+                message: '飞书官方插件最终同步失败',
+              }))
+              if (!finalizeResult.ok) {
+                const details = [finalizeResult.message, finalizeResult.stderr, finalizeResult.stdout]
+                  .map((value) => String(value || '').trim())
+                  .filter(Boolean)
+                  .join('\n\n')
+                if (details) {
+                  session.output += `\n${details}`
+                }
+                session.ok = false
+                session.code = finalizeResult.code ?? 1
+                session.guardrail = mergeChannelInstallerGuardrailStatus(session.guardrail, {
+                  finalSync: {
+                    state: 'failed',
+                    code: 'final-sync-failed',
+                    message: details || '飞书官方插件最终同步失败。',
+                  },
+                  failure: {
+                    code: 'final-sync-failed',
+                    message: details || '飞书官方插件最终同步失败。',
+                    step: 'final-sync',
+                  },
+                })
+              } else {
+                session.guardrail = mergeChannelInstallerGuardrailStatus(session.guardrail, {
+                  finalSync: {
+                    state: 'ok',
+                    message: finalizeResult.message,
+                  },
+                })
               }
-              session.ok = false
-              session.code = finalizeResult.code ?? 1
-              session.guardrail = mergeChannelInstallerGuardrailStatus(session.guardrail, {
-                finalSync: {
-                  state: 'failed',
-                  code: 'final-sync-failed',
-                  message: details || '飞书官方插件最终同步失败。',
-                },
-                failure: {
-                  code: 'final-sync-failed',
-                  message: details || '飞书官方插件最终同步失败。',
-                  step: 'final-sync',
-                },
-              })
-            } else {
-              session.guardrail = mergeChannelInstallerGuardrailStatus(session.guardrail, {
-                finalSync: {
-                  state: 'ok',
-                  message: finalizeResult.message,
-                },
-              })
+            }
+            emitFeishuInstallerEvent(emit, {
+              sessionId,
+              requestToken: session.requestToken,
+              type: 'exit',
+              phase: 'exited',
+              code: session.code,
+              ok: session.ok,
+              canceled,
+              guardrail: session.guardrail,
+              pendingPrompt: null,
+              manualCredentialRequirement: session.manualCredentialRequirement,
+              qrUrl: session.qrUrl,
+            })
+            void appendFeishuInstallerDiag('session-exit', {
+              sessionId,
+              code: session.code,
+              ok: session.ok,
+              canceled,
+            })
+          } finally {
+            try {
+              releaseSessionManagedOperationLease(session)
+            } finally {
+              void cleanupFeishuInstallerRuntimeBinding(session.runtimeBinding)
+              void cleanupIsolatedNpmCacheEnv(npmCacheDirForCleanup)
             }
           }
-          const recoveryResult = await recoverGatewayForSession(session, 'feishu-installer-close')
-          if (!recoveryResult.ok) {
-            session.ok = false
-            session.code = session.code ?? 1
-          }
-          emitFeishuInstallerEvent(emit, {
-            sessionId,
-            requestToken: session.requestToken,
-            type: 'exit',
-            phase: 'exited',
-            code: session.code,
-            ok: session.ok,
-            canceled,
-            guardrail: session.guardrail,
-            pendingPrompt: null,
-            manualCredentialRequirement: session.manualCredentialRequirement,
-            qrUrl: session.qrUrl,
-          })
-          void appendFeishuInstallerDiag('session-exit', {
-            sessionId,
-            code: session.code,
-            ok: session.ok,
-            canceled,
-            gatewayRecoveryOk: recoveryResult.ok,
-          })
-          releaseSessionManagedOperationLease(session)
-          void cleanupFeishuInstallerRuntimeBinding(session.runtimeBinding)
-          void cleanupIsolatedNpmCacheEnv(npmCacheDirForCleanup)
-        } finally {
-          session.resolveTerminalCleanup?.()
-          session.resolveTerminalCleanup = null
-        }
+        })
       })
 
       proc.on('error', async (error) => {
@@ -1730,50 +1567,48 @@ export async function startFeishuInstallerSession(
         const session = activeSession
         if (session.phase === 'exited') return
         const npmCacheDirForCleanup = session.npmCacheDir
-        try {
-          clearPendingPrompt(session, {
-            notify: false,
-            abortMessage: 'Feishu installer session failed before answering the pending prompt.',
-          })
-          closePromptBridgeServer(session)
-          clearActiveProcessIfMatch(proc, FEISHU_INSTALLER_CONTROL_DOMAIN)
-          const canceled = consumeCanceledProcess(proc, FEISHU_INSTALLER_CONTROL_DOMAIN)
-          session.output += `\n${error instanceof Error ? error.message : String(error)}`
-          session.phase = 'exited'
-          session.code = canceled ? null : 1
-          session.ok = false
-          session.canceled = canceled
-          const recoveryResult = await recoverGatewayForSession(session, 'feishu-installer-error')
-          if (!recoveryResult.ok) {
-            session.code = session.code ?? 1
+        clearPendingPrompt(session, {
+          notify: false,
+          abortMessage: 'Feishu installer session failed before answering the pending prompt.',
+        })
+        closePromptBridgeServer(session)
+        clearActiveProcessIfMatch(proc, FEISHU_INSTALLER_CONTROL_DOMAIN)
+        const canceled = consumeCanceledProcess(proc, FEISHU_INSTALLER_CONTROL_DOMAIN)
+        session.output += `\n${error instanceof Error ? error.message : String(error)}`
+        session.phase = 'exited'
+        session.code = canceled ? null : 1
+        session.ok = false
+        session.canceled = canceled
+        enqueueFeishuInstallerTerminalCleanup(session, async () => {
+          try {
+            emitFeishuInstallerEvent(emit, {
+              sessionId,
+              requestToken: session.requestToken,
+              type: 'exit',
+              phase: 'exited',
+              code: session.code,
+              ok: false,
+              canceled,
+              guardrail: session.guardrail,
+              pendingPrompt: null,
+              manualCredentialRequirement: session.manualCredentialRequirement,
+              qrUrl: session.qrUrl,
+            })
+            void appendFeishuInstallerDiag('session-error', {
+              sessionId,
+              code: session.code,
+              canceled,
+              message: error instanceof Error ? error.message : String(error),
+            })
+          } finally {
+            try {
+              releaseSessionManagedOperationLease(session)
+            } finally {
+              void cleanupFeishuInstallerRuntimeBinding(session.runtimeBinding)
+              void cleanupIsolatedNpmCacheEnv(npmCacheDirForCleanup)
+            }
           }
-          emitFeishuInstallerEvent(emit, {
-            sessionId,
-            requestToken: session.requestToken,
-            type: 'exit',
-            phase: 'exited',
-            code: session.code,
-            ok: false,
-            canceled,
-            guardrail: session.guardrail,
-            pendingPrompt: null,
-            manualCredentialRequirement: session.manualCredentialRequirement,
-            qrUrl: session.qrUrl,
-          })
-          void appendFeishuInstallerDiag('session-error', {
-            sessionId,
-            code: session.code,
-            canceled,
-            message: error instanceof Error ? error.message : String(error),
-            gatewayRecoveryOk: recoveryResult.ok,
-          })
-          releaseSessionManagedOperationLease(session)
-          void cleanupFeishuInstallerRuntimeBinding(session.runtimeBinding)
-          void cleanupIsolatedNpmCacheEnv(npmCacheDirForCleanup)
-        } finally {
-          session.resolveTerminalCleanup?.()
-          session.resolveTerminalCleanup = null
-        }
+        })
       })
 
       return buildSnapshot()
@@ -1786,26 +1621,16 @@ export async function startFeishuInstallerSession(
         void cleanupIsolatedNpmCacheEnv(isolatedNpmCache.cacheDir)
       }
       const message = error instanceof Error ? error.message : String(error)
-      const recoveryResult = await runGatewayRecoveryWithTimeout(
-        stopGatewayResult.snapshot,
-        'feishu-installer-start-failed'
-      )
-      const recoveryFailure = recoveryResult.ok ? '' : `\n${formatGatewayRecoveryFailure(recoveryResult)}`
-      const guardrail = mergeChannelInstallerGuardrailStatus(guardrailAfterGatewayStop, {
+      const guardrail = mergeChannelInstallerGuardrailStatus(guardrailAfterStartupChecks, {
         spawn: {
           state: 'failed',
           code: 'spawn-failed',
           message: message || '飞书官方安装器启动失败',
         },
-        gateway: {
-          recovery: toInstallerGatewayRecoveryStatus(recoveryResult),
-        },
         failure: {
-          code: recoveryResult.ok ? 'spawn-failed' : 'gateway-recovery-failed',
-          message: recoveryResult.ok
-            ? message || '飞书官方安装器启动失败'
-            : formatGatewayRecoveryFailure(recoveryResult),
-          step: recoveryResult.ok ? 'spawn' : 'gateway-recovery',
+          code: 'spawn-failed',
+          message: message || '飞书官方安装器启动失败',
+          step: 'spawn',
         },
       })
       return {
@@ -1813,7 +1638,7 @@ export async function startFeishuInstallerSession(
         sessionId: randomUUID(),
         requestToken: '',
         phase: 'exited',
-        output: `${message || '飞书官方安装器启动失败'}${recoveryFailure}`,
+        output: message || '飞书官方安装器启动失败',
         code: 1,
         ok: false,
         canceled: false,
@@ -1908,19 +1733,11 @@ export async function answerFeishuInstallerSessionPrompt(
   return { ok: true }
 }
 
-export interface StopFeishuInstallerSessionOptions {
-  recoverGateway?: boolean
-  recoveryTimeoutMs?: number
-}
-
 export interface StopFeishuInstallerSessionResult {
-  gatewayRecovery?: GatewayRecoveryResult
   ok: boolean
 }
 
-export async function stopFeishuInstallerSession(
-  options: StopFeishuInstallerSessionOptions = {}
-): Promise<StopFeishuInstallerSessionResult> {
+export async function stopFeishuInstallerSession(): Promise<StopFeishuInstallerSessionResult> {
   if (!activeSession || activeSession.phase !== 'running') {
     return { ok: true }
   }
@@ -1931,28 +1748,10 @@ export async function stopFeishuInstallerSession(
     notify: true,
     abortMessage: 'Feishu installer session was canceled by Qclaw.',
   })
-  if (!options.recoverGateway && !session.gatewayRecoveryAttempted) {
-    session.gatewayRecoveryAttempted = true
-    session.gatewayRecoveryResult = {
-      ok: true,
-      recovered: false,
-      skipped: true,
-      message: '旧飞书安装器会话正在被替换，本次退出已跳过网关恢复。',
-    }
-  }
   const ok = await cancelActiveProcess(FEISHU_INSTALLER_CONTROL_DOMAIN)
-  const gatewayRecovery = options.recoverGateway
-    ? await recoverGatewayForSession(session, 'feishu-installer-stop', {
-        timeoutMs: options.recoveryTimeoutMs,
-      })
-    : undefined
   void appendFeishuInstallerDiag('stop-finished', {
     sessionId,
     ok,
-    gatewayRecoveryOk: gatewayRecovery?.ok ?? null,
   })
-  return {
-    gatewayRecovery,
-    ok: ok && (gatewayRecovery ? gatewayRecovery.ok : true),
-  }
+  return { ok }
 }

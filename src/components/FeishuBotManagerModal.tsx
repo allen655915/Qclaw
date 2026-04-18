@@ -37,6 +37,8 @@ import {
   isFeishuCreateBotConfirmationPrompt,
   shouldDisableFeishuCreateInstallerButton,
   shouldDisableFeishuInstallerManualInput,
+  shouldStopFeishuInstallerForPendingPromptCleanup,
+  submitFeishuInstallerPromptDecision,
 } from '../shared/feishu-installer-session'
 import { resolveChannelInstallerGuardrailView } from '../lib/channel-installer-guardrail'
 import { getFeishuOfficialPluginStateReady } from '../lib/feishu-official-plugin-auto-sync'
@@ -207,6 +209,8 @@ export default function FeishuBotManagerModal({
     useState<ChannelInstallerGuardrailStatus | null>(null)
   const [feishuInstallerPendingPrompt, setFeishuInstallerPendingPrompt] =
     useState<Awaited<ReturnType<typeof window.api.getFeishuInstallerState>>['pendingPrompt']>(null)
+  const [feishuInstallerPromptDecision, setFeishuInstallerPromptDecision] =
+    useState<'confirm' | 'cancel' | null>(null)
   const [showFeishuInstallTutorial, setShowFeishuInstallTutorial] = useState(false)
   const [botError, setBotError] = useState('')
   const [botListRefreshing, setBotListRefreshing] = useState(false)
@@ -214,11 +218,11 @@ export default function FeishuBotManagerModal({
   const [repairingIsolation, setRepairingIsolation] = useState(false)
   const [isolationDrift, setIsolationDrift] = useState(() => detectFeishuIsolationDrift(null))
 
-  const feishuInstallerHandledPromptIdRef = useRef('')
   const previousOpenedRef = useRef(opened)
   const feishuCreateStartConfigSnapshotRef = useRef<Record<string, any> | null>(null)
   const feishuCreateRequestTokenRef = useRef('')
   const feishuInstallerActivationWaitSeqRef = useRef(0)
+  const feishuInstallerLogViewportRef = useRef<HTMLDivElement | null>(null)
   const handledOwnedFeishuCreateSessionIdRef = useRef('')
   const handledManualCredentialRequirementKeyRef = useRef('')
   const finalizeFeishuCreateInFlightRef = useRef(false)
@@ -715,6 +719,13 @@ export default function FeishuBotManagerModal({
   }, [opened, refreshBotModalState])
 
   useEffect(() => {
+    if (!showFeishuInstallerConsoleSurface) return
+    const viewport = feishuInstallerLogViewportRef.current
+    if (!viewport) return
+    viewport.scrollTop = viewport.scrollHeight
+  }, [showFeishuInstallerConsoleSurface, feishuInstallerOutput])
+
+  useEffect(() => {
     if (!opened) return
     if (feishuBotSetupMode !== 'create') return
     if (!showFeishuCreateRuntimeSurface) return
@@ -744,13 +755,18 @@ export default function FeishuBotManagerModal({
 
     if (!opened) {
       cancelFeishuInstallerActivationWait()
-      if (wasOpened && isFeishuCreateBotConfirmationPrompt(feishuInstallerPendingPrompt)) {
+      if (
+        wasOpened
+        && shouldStopFeishuInstallerForPendingPromptCleanup(
+          feishuInstallerPendingPrompt,
+          feishuInstallerPromptDecision
+        )
+      ) {
         void window.api.stopFeishuInstaller().catch(() => {
           // Best effort only; modal reopen will re-sync installer state.
         })
       }
       setShowFeishuInstallTutorial(false)
-      feishuInstallerHandledPromptIdRef.current = ''
       if (!shouldRetainOwnedFeishuManagerCreateSessionWhileHidden({
         setupMode: feishuBotSetupMode,
         ownedSessionId: ownedFeishuCreateSessionId,
@@ -769,6 +785,7 @@ export default function FeishuBotManagerModal({
     feishuInstallerCanceled,
     feishuInstallerExitCode,
     feishuInstallerPendingPrompt,
+    feishuInstallerPromptDecision,
     feishuInstallerRunning,
     opened,
     ownedFeishuCreateSessionId,
@@ -776,44 +793,10 @@ export default function FeishuBotManagerModal({
   ])
 
   useEffect(() => {
-    if (!opened) return
     if (!isFeishuCreateBotConfirmationPrompt(feishuInstallerPendingPrompt)) {
-      feishuInstallerHandledPromptIdRef.current = ''
-      return
+      setFeishuInstallerPromptDecision(null)
     }
-
-    const promptId = feishuInstallerPendingPrompt.promptId
-    if (!promptId || feishuInstallerHandledPromptIdRef.current === promptId) return
-
-    const sessionId = String(feishuInstallerSessionId || '').trim()
-    if (!sessionId) return
-
-    feishuInstallerHandledPromptIdRef.current = promptId
-    const confirmed = window.confirm(buildFeishuCreateBotConfirmationMessage(feishuInstallerPendingPrompt))
-
-    void window.api.answerFeishuInstallerPrompt(
-      sessionId,
-      promptId,
-      confirmed ? 'confirm' : 'cancel'
-    ).then((result) => {
-      if (!result.ok) {
-        feishuInstallerHandledPromptIdRef.current = ''
-        setBotError(result.message || (confirmed ? '继续新建机器人失败' : '取消新建机器人失败'))
-        return
-      }
-
-      setFeishuInstallerPendingPrompt(null)
-      setFeishuInstallerNotice(
-        confirmed
-          ? '已确认新建机器人，Qclaw 正在继续官方安装器流程。'
-          : '已取消新建机器人；当前安装流程已停止，你可以稍后重新发起。'
-      )
-      setBotError('')
-    }).catch((e: any) => {
-      feishuInstallerHandledPromptIdRef.current = ''
-      setBotError(e?.message || (confirmed ? '继续新建机器人失败' : '取消新建机器人失败'))
-    })
-  }, [opened, feishuInstallerPendingPrompt, feishuInstallerSessionId])
+  }, [feishuInstallerPendingPrompt])
 
   useEffect(() => {
     if (!opened || feishuBotSetupMode !== 'create') return
@@ -887,6 +870,37 @@ export default function FeishuBotManagerModal({
     setBotError('')
     return true
   }
+
+  const handleFeishuCreateBotPromptDecision = useCallback(
+    async (decision: 'confirm' | 'cancel') => {
+      setFeishuInstallerPromptDecision(decision)
+      try {
+        const result = await submitFeishuInstallerPromptDecision({
+          sessionId: feishuInstallerSessionId,
+          prompt: feishuInstallerPendingPrompt,
+          decision,
+          answerPrompt: window.api.answerFeishuInstallerPrompt,
+        })
+        if (!result.ok) {
+          setBotError(result.message)
+          return
+        }
+
+        setFeishuInstallerPendingPrompt(null)
+        setFeishuInstallerNotice(
+          result.confirmed
+            ? '已确认新建机器人，Qclaw 正在继续官方安装器流程。'
+            : '已取消新建机器人；当前安装流程已停止，你可以稍后重新发起。'
+        )
+        setBotError('')
+      } catch (e: any) {
+        setBotError(e?.message || (decision === 'confirm' ? '继续新建机器人失败' : '取消新建机器人失败'))
+      } finally {
+        setFeishuInstallerPromptDecision(null)
+      }
+    },
+    [feishuInstallerPendingPrompt, feishuInstallerSessionId]
+  )
 
   const startFeishuInstallerFlow = async (mode: 'create' | 'link') => {
     cancelFeishuInstallerActivationWait()
@@ -1056,15 +1070,16 @@ export default function FeishuBotManagerModal({
     setFeishuConfigNotice('')
     setFeishuInstallerGuardrail(null)
     setFeishuInstallerInput('')
+    setFeishuInstallerPromptDecision(null)
     setFeishuInstallerManualCredentialRequirement(null)
     handledManualCredentialRequirementKeyRef.current = ''
     onClose()
   }
 
-  const visibleFeishuInstallerRunning = showFeishuCreateRuntimeSurface && feishuInstallerRunning
-  const visibleFeishuInstallerExitCode = showFeishuCreateRuntimeSurface ? feishuInstallerExitCode : null
-  const visibleFeishuInstallerCanceled = showFeishuCreateRuntimeSurface && feishuInstallerCanceled
-  const visibleFeishuInstallerOutput = showFeishuCreateRuntimeSurface ? feishuInstallerOutput : ''
+  const visibleFeishuInstallerRunning = showFeishuInstallerConsoleSurface && feishuInstallerRunning
+  const visibleFeishuInstallerExitCode = showFeishuInstallerConsoleSurface ? feishuInstallerExitCode : null
+  const visibleFeishuInstallerCanceled = showFeishuInstallerConsoleSurface && feishuInstallerCanceled
+  const visibleFeishuInstallerOutput = showFeishuInstallerConsoleSurface ? feishuInstallerOutput : ''
   const visibleFeishuInstallerAsciiQr = showFeishuCreateRuntimeSurface ? feishuInstallerAsciiQr : ''
   const visibleFeishuInstallerQrUrl = showFeishuCreateRuntimeSurface ? feishuInstallerQrUrl : ''
   const visibleFeishuInstallerHasLiveQr = showFeishuCreateRuntimeSurface && feishuInstallerHasLiveQr
@@ -1212,6 +1227,39 @@ export default function FeishuBotManagerModal({
           </Button>
         </Group>
 
+        {isFeishuCreateBotConfirmationPrompt(feishuInstallerPendingPrompt) && (
+          <Alert color="yellow" variant="light" title="等待确认">
+            <Stack gap="xs">
+              <Text size="xs">
+                飞书官方安装器正在等待你的确认。确认后才会继续生成本次新建机器人的二维码。
+              </Text>
+              <Text size="xs" fw={600}>
+                {buildFeishuCreateBotConfirmationMessage(feishuInstallerPendingPrompt)}
+              </Text>
+              <Group gap="xs">
+                <Button
+                  size="xs"
+                  color="teal"
+                  onClick={() => void handleFeishuCreateBotPromptDecision('confirm')}
+                  loading={feishuInstallerPromptDecision === 'confirm'}
+                  disabled={feishuInstallerPromptDecision !== null}
+                >
+                  继续新建
+                </Button>
+                <Button
+                  size="xs"
+                  variant="default"
+                  onClick={() => void handleFeishuCreateBotPromptDecision('cancel')}
+                  loading={feishuInstallerPromptDecision === 'cancel'}
+                  disabled={feishuInstallerPromptDecision !== null}
+                >
+                  取消
+                </Button>
+              </Group>
+            </Stack>
+          </Alert>
+        )}
+
         {feishuBotSetupMode === 'create' ? (
           <div className="border app-border rounded-lg p-3 space-y-3">
             <div className="flex flex-col items-center gap-2">
@@ -1350,7 +1398,12 @@ export default function FeishuBotManagerModal({
             </Group>
           )}
 
-          <ScrollArea.Autosize mah={180} className="rounded-md" style={{ backgroundColor: 'var(--app-bg-inset)' }}>
+          <ScrollArea.Autosize
+            mah={180}
+            className="rounded-md"
+            style={{ backgroundColor: 'var(--app-bg-inset)' }}
+            viewportRef={feishuInstallerLogViewportRef}
+          >
             <pre className="whitespace-pre-wrap break-words font-mono text-[11px] leading-5 app-text-secondary px-3 py-2">
               {visibleFeishuInstallerOutput
                 || (visibleFeishuInstallerRunning

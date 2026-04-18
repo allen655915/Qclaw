@@ -1648,7 +1648,7 @@ describe('Feishu create session ownership helpers', () => {
     ).toBe(false)
   })
 
-  it('shows the Feishu installer console only for the owned create session', () => {
+  it('shows the Feishu installer console for owned sessions and any active create session', () => {
     expect(
       shouldShowFeishuInstallerConsoleSurface({
         selectedChannelId: 'feishu',
@@ -1679,7 +1679,7 @@ describe('Feishu create session ownership helpers', () => {
           active: true,
         },
       })
-    ).toBe(false)
+    ).toBe(true)
 
     expect(
       shouldShowFeishuInstallerConsoleSurface({
@@ -1696,14 +1696,30 @@ describe('Feishu create session ownership helpers', () => {
         },
       })
     ).toBe(false)
+
+    expect(
+      shouldShowFeishuInstallerConsoleSurface({
+        selectedChannelId: 'feishu',
+        setupMode: 'link',
+        ownership: {
+          sessionId: 'session-owned',
+          source: 'started-here',
+        },
+        session: {
+          sessionId: 'session-foreign',
+          phase: 'running',
+          active: true,
+        },
+      })
+    ).toBe(false)
   })
 
-  it('auto-opens the Feishu QR modal only for an owned running create session', () => {
+  it('auto-opens the Feishu QR modal only when the running create session console is visible', () => {
     expect(
       shouldAutoOpenFeishuQrModal({
         selectedChannelId: 'feishu',
         setupMode: 'create',
-        showOwnedCreateSessionSurface: true,
+        showInstallerConsoleSurface: true,
         installerRunning: true,
         asciiQr: '██ QR',
         qrUrl: '',
@@ -1714,7 +1730,7 @@ describe('Feishu create session ownership helpers', () => {
       shouldAutoOpenFeishuQrModal({
         selectedChannelId: 'feishu',
         setupMode: 'create',
-        showOwnedCreateSessionSurface: false,
+        showInstallerConsoleSurface: false,
         installerRunning: true,
         asciiQr: '██ QR',
         qrUrl: '',
@@ -1725,7 +1741,7 @@ describe('Feishu create session ownership helpers', () => {
       shouldAutoOpenFeishuQrModal({
         selectedChannelId: 'feishu',
         setupMode: 'create',
-        showOwnedCreateSessionSurface: true,
+        showInstallerConsoleSurface: true,
         installerRunning: false,
         asciiQr: '██ QR',
         qrUrl: '',
@@ -1738,7 +1754,7 @@ describe('Feishu create session ownership helpers', () => {
       shouldAutoOpenFeishuQrModal({
         selectedChannelId: 'feishu',
         setupMode: 'create',
-        showOwnedCreateSessionSurface: true,
+        showInstallerConsoleSurface: true,
         installerRunning: true,
         asciiQr: '',
         qrUrl: 'https://open.feishu.cn/page/openclaw?user_code=ABCD-EFGH&from=onboard',
@@ -1749,7 +1765,7 @@ describe('Feishu create session ownership helpers', () => {
       shouldAutoOpenFeishuQrModal({
         selectedChannelId: 'feishu',
         setupMode: 'create',
-        showOwnedCreateSessionSurface: true,
+        showInstallerConsoleSurface: true,
         installerRunning: true,
         asciiQr: '',
         qrUrl: '   ',

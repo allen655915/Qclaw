@@ -139,6 +139,80 @@ describe('prepareFeishuInstallerRuntimeBinding', () => {
     expect(fs.existsSync(binding.cleanupDir)).toBe(false)
   })
 
+  it('falls back to the selected node bin directory when npm shims are not stored under the openclaw npm prefix', async () => {
+    const runtimeRoot = makeTempDir()
+    const roamingNpmDir = path.join(runtimeRoot, 'roaming-npm')
+    const nodeDir = path.join(runtimeRoot, 'program-files-nodejs')
+    const hostPackageRoot = path.join(runtimeRoot, 'managed-host', 'node_modules', 'openclaw')
+    const stateDir = path.join(runtimeRoot, 'state')
+    fs.mkdirSync(roamingNpmDir, { recursive: true })
+    fs.mkdirSync(nodeDir, { recursive: true })
+    fs.mkdirSync(hostPackageRoot, { recursive: true })
+    fs.mkdirSync(stateDir, { recursive: true })
+    fs.writeFileSync(path.join(roamingNpmDir, 'openclaw.cmd'), '@echo off\r\necho stale shim\r\n')
+    fs.writeFileSync(path.join(nodeDir, 'npm.cmd'), '@echo off\r\n')
+    fs.writeFileSync(path.join(nodeDir, 'npx.cmd'), '@echo off\r\n')
+    fs.writeFileSync(path.join(nodeDir, 'node.exe'), '')
+    fs.writeFileSync(
+      path.join(hostPackageRoot, 'package.json'),
+      JSON.stringify({
+        name: 'openclaw',
+        version: '2026.4.12',
+        bin: {
+          openclaw: 'openclaw.mjs',
+        },
+      })
+    )
+    fs.writeFileSync(path.join(hostPackageRoot, 'openclaw.mjs'), 'console.log("OpenClaw 2026.4.12")\n')
+
+    const snapshot = buildWindowsActiveRuntimeSnapshot({
+      hostPackageRoot,
+      openclawExecutable: path.join(roamingNpmDir, 'openclaw.cmd'),
+      nodeExecutable: path.join(nodeDir, 'node.exe'),
+      npmPrefix: roamingNpmDir,
+      configPath: path.join(stateDir, 'openclaw.json'),
+      stateDir,
+      extensionsDir: path.join(stateDir, 'extensions'),
+    })
+
+    const binding = await prepareFeishuInstallerRuntimeBinding({
+      activeRuntimeSnapshot: snapshot,
+      baseEnv: buildTestEnv({
+        APPDATA: 'D:\\OldRoaming',
+        COMSPEC: 'C:\\Windows\\System32\\cmd.exe',
+        LOCALAPPDATA: 'D:\\OldLocal',
+        PATH: `${roamingNpmDir};C:\\Windows\\System32`,
+        SystemRoot: 'C:\\Windows',
+        USERPROFILE: 'D:\\OldUser',
+      }),
+      platform: 'win32',
+      sessionToken: 'case-external-node-bin',
+    })
+
+    try {
+      const pathEntries = String(binding.env.PATH || '').split(';')
+      expect(pathEntries[0]).toBe(binding.shimDir)
+      expect(pathEntries).toContain(nodeDir)
+      expect(pathEntries).not.toContain(roamingNpmDir)
+      expect(fs.readFileSync(path.join(binding.shimDir, 'npm.cmd'), 'utf8')).toContain(
+        `"${path.join(nodeDir, 'npm.cmd')}"`
+      )
+      expect(fs.readFileSync(path.join(binding.shimDir, 'npx.cmd'), 'utf8')).toContain(
+        `"${path.join(nodeDir, 'npx.cmd')}"`
+      )
+      const npxCapability = await probePlatformCommandCapability('npx', {
+        platform: 'win32',
+        env: binding.env,
+      })
+      expect(npxCapability.available).toBe(true)
+      expect(npxCapability.resolvedPath?.toLowerCase()).toBe(
+        path.join(binding.shimDir, 'npx.cmd').toLowerCase()
+      )
+    } finally {
+      await cleanupFeishuInstallerRuntimeBinding(binding)
+    }
+  })
+
   it('escapes percent signs when generating Windows cmd shims', async () => {
     const runtimeRoot = makeTempDir()
     const percentRoot = path.join(runtimeRoot, '100%demo')

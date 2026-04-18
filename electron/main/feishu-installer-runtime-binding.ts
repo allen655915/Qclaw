@@ -46,6 +46,37 @@ function uniqueWindowsPaths(values: Array<string | null | undefined>): string[] 
   return unique
 }
 
+function dirnameIfPresent(value: string | null | undefined): string {
+  const normalized = trim(value)
+  return normalized ? path.win32.dirname(normalized) : ''
+}
+
+async function resolveWindowsRuntimeCommandPath(
+  commandName: 'npm.cmd' | 'npx.cmd',
+  activeRuntimeSnapshot: WindowsActiveRuntimeSnapshot
+): Promise<string> {
+  const searchDirs = uniqueWindowsPaths([
+    activeRuntimeSnapshot.npmPrefix,
+    dirnameIfPresent(activeRuntimeSnapshot.nodePath),
+    dirnameIfPresent(activeRuntimeSnapshot.openclawPath),
+  ])
+
+  for (const searchDir of searchDirs) {
+    const candidatePath = path.win32.join(searchDir, commandName)
+    try {
+      await fs.promises.access(candidatePath)
+      return candidatePath
+    } catch {
+      // Keep scanning the selected runtime command roots.
+    }
+  }
+
+  const searchedLocations = searchDirs.length > 0 ? searchDirs.join(', ') : '(none)'
+  throw new Error(
+    `Unable to bind Feishu installer to the selected OpenClaw runtime: missing ${commandName} in ${searchedLocations}`
+  )
+}
+
 function resolveWindowsSystemPathEntries(env: NodeJS.ProcessEnv): string[] {
   const systemRoot = trim(env.SystemRoot || env.SYSTEMROOT) || 'C:\\Windows'
   const comSpec = trim(env.ComSpec || env.COMSPEC)
@@ -131,8 +162,8 @@ export async function prepareFeishuInstallerRuntimeBinding(
   const openclawShimPath = path.win32.join(shimDir, 'openclaw.cmd')
   const npmShimPath = path.win32.join(shimDir, 'npm.cmd')
   const npxShimPath = path.win32.join(shimDir, 'npx.cmd')
-  const npmCommandPath = path.win32.join(npmPrefix, 'npm.cmd')
-  const npxCommandPath = path.win32.join(npmPrefix, 'npx.cmd')
+  const npmCommandPath = await resolveWindowsRuntimeCommandPath('npm.cmd', activeRuntimeSnapshot)
+  const npxCommandPath = await resolveWindowsRuntimeCommandPath('npx.cmd', activeRuntimeSnapshot)
   const comSpecPath = resolveWindowsSystemShellPath(baseEnv)
 
   const requiredPaths = [

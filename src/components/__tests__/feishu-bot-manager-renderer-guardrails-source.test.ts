@@ -81,6 +81,32 @@ describe('FeishuBotManagerModal renderer guardrails', () => {
     expect(source).not.toContain("setFeishuInstallerNotice('正在检测飞书安装器状态，请稍候...')")
   })
 
+  it('renders the Feishu create confirmation inline instead of relying on browser confirm dialogs', () => {
+    const source = fs.readFileSync(
+      path.join(process.cwd(), 'src', 'components', 'FeishuBotManagerModal.tsx'),
+      'utf8'
+    )
+
+    expect(source).toContain('const [feishuInstallerPromptDecision, setFeishuInstallerPromptDecision]')
+    expect(source).toContain('handleFeishuCreateBotPromptDecision')
+    expect(source).toContain('shouldStopFeishuInstallerForPendingPromptCleanup(')
+    expect(source).toContain('submitFeishuInstallerPromptDecision({')
+    expect(source).toContain('title="等待确认"')
+    expect(source).toContain('继续新建')
+    expect(source).not.toContain('window.confirm(buildFeishuCreateBotConfirmationMessage')
+  })
+
+  it('shows installer console output whenever the shared Feishu console surface is active', () => {
+    const source = fs.readFileSync(
+      path.join(process.cwd(), 'src', 'components', 'FeishuBotManagerModal.tsx'),
+      'utf8'
+    )
+
+    expect(source).toContain('const visibleFeishuInstallerOutput = showFeishuInstallerConsoleSurface ? feishuInstallerOutput : \'\'')
+    expect(source).toContain('const visibleFeishuInstallerRunning = showFeishuInstallerConsoleSurface && feishuInstallerRunning')
+    expect(source).not.toContain('const visibleFeishuInstallerOutput = showFeishuCreateRuntimeSurface ? feishuInstallerOutput : \'\'')
+  })
+
   it('stops the installer and shows a return-to-channel-config notice when manual credentials are required', () => {
     const source = fs.readFileSync(
       path.join(process.cwd(), 'src', 'components', 'FeishuBotManagerModal.tsx'),
