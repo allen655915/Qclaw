@@ -508,7 +508,7 @@ describe('discoverOpenClawInstallations', () => {
     getBaselineBackupBypassStatusMock.mockResolvedValue(null)
 
     const installFingerprint = createHash('sha256')
-      .update([binaryPath, path.join(installDir, 'lib', 'node_modules', 'openclaw'), '2026.3.12', path.join(stateRoot, 'openclaw.json'), stateRoot].join('\n'))
+      .update([path.join(installDir, 'lib', 'node_modules', 'openclaw'), '2026.3.12', path.join(stateRoot, 'openclaw.json'), stateRoot].join('\n'))
       .digest('hex')
 
     const storeDir = path.join(userDataDir, 'data-guard')
@@ -578,6 +578,190 @@ describe('discoverOpenClawInstallations', () => {
       installSource: 'qclaw-managed',
       ownershipState: 'qclaw-installed',
     })
+  })
+
+  itOnWindows('dedupes sibling Windows openclaw shims that resolve to the same install and state root', async () => {
+    const installDir = makeTempDir()
+    const defaultStateRoot = path.join(installDir, '.openclaw')
+    const externalStateRoot = path.join(makeTempDir(), '.openclaw')
+    const cmdBinaryPath = path.join(installDir, 'AppData', 'Roaming', 'npm', 'openclaw.cmd')
+    const plainBinaryPath = path.join(installDir, 'AppData', 'Roaming', 'npm', 'openclaw')
+    const packageRoot = path.join(installDir, 'AppData', 'Roaming', 'npm', 'node_modules', 'openclaw')
+
+    fs.mkdirSync(path.dirname(cmdBinaryPath), { recursive: true })
+    fs.mkdirSync(defaultStateRoot, { recursive: true })
+    fs.mkdirSync(externalStateRoot, { recursive: true })
+    fs.writeFileSync(cmdBinaryPath, '@echo off\r\n')
+    fs.writeFileSync(plainBinaryPath, '#!/bin/sh\n')
+    fs.writeFileSync(path.join(defaultStateRoot, 'openclaw.json'), '{}')
+    fs.writeFileSync(path.join(externalStateRoot, 'openclaw.json'), '{}')
+
+    getSelectedWindowsActiveRuntimeSnapshotMock.mockReturnValue({
+      configPath: path.join(externalStateRoot, 'openclaw.json'),
+      extensionsDir: path.join(externalStateRoot, 'extensions'),
+      hostPackageRoot: packageRoot,
+      nodePath: path.join(installDir, 'AppData', 'Roaming', 'npm', 'node.exe'),
+      npmPrefix: path.dirname(cmdBinaryPath),
+      openclawPath: cmdBinaryPath,
+      stateDir: externalStateRoot,
+    })
+
+    resolveOpenClawBinaryPathMock.mockResolvedValue(cmdBinaryPath)
+    listExecutablePathCandidatesMock.mockImplementation((target: string) => {
+      if (target === 'node') return []
+      return [cmdBinaryPath, plainBinaryPath]
+    })
+    readOpenClawPackageInfoMock.mockImplementation(async ({ binaryPath }: { binaryPath: string }) => ({
+      name: 'openclaw',
+      version: '2026.4.12',
+      packageRoot,
+      packageJsonPath: path.join(packageRoot, 'package.json'),
+      binaryPath,
+      resolvedBinaryPath: binaryPath,
+    }))
+    resolveRuntimeOpenClawPathsMock.mockResolvedValue({
+      homeDir: defaultStateRoot,
+      configFile: path.join(defaultStateRoot, 'openclaw.json'),
+      envFile: path.join(defaultStateRoot, '.env'),
+      credentialsDir: path.join(defaultStateRoot, 'credentials'),
+      modelCatalogCacheFile: path.join(defaultStateRoot, 'qclaw-model-catalog-cache.json'),
+      displayHomeDir: defaultStateRoot,
+      displayConfigFile: path.join(defaultStateRoot, 'openclaw.json'),
+      displayEnvFile: path.join(defaultStateRoot, '.env'),
+      displayCredentialsDir: path.join(defaultStateRoot, 'credentials'),
+      displayModelCatalogCacheFile: path.join(defaultStateRoot, 'qclaw-model-catalog-cache.json'),
+    })
+    getBaselineBackupStatusMock.mockResolvedValue(null)
+    getBaselineBackupBypassStatusMock.mockResolvedValue(null)
+
+    const { discoverOpenClawInstallations } = await import('../openclaw-install-discovery')
+    const result = await discoverOpenClawInstallations()
+
+    expect(result.candidates).toHaveLength(1)
+    expect(result.hasMultipleCandidates).toBe(false)
+    expect(result.warnings).not.toContain('检测到多个 OpenClaw 安装，请确认要接管的对象。')
+    expect(result.candidates[0]).toMatchObject({
+      binaryPath: cmdBinaryPath,
+      configPath: path.join(externalStateRoot, 'openclaw.json'),
+      stateRoot: externalStateRoot,
+      isPathActive: true,
+      packageRoot,
+    })
+  })
+
+  itOnWindows('reuses legacy sibling-shim fingerprints for backup metadata and upgrades managed markers to the canonical fingerprint', async () => {
+    const installDir = makeTempDir()
+    const userDataDir = makeTempDir()
+    process.env.QCLAW_USER_DATA_DIR = userDataDir
+
+    const defaultStateRoot = path.join(installDir, '.openclaw')
+    const externalStateRoot = path.join(makeTempDir(), '.openclaw')
+    const cmdBinaryPath = path.join(installDir, 'AppData', 'Roaming', 'npm', 'openclaw.cmd')
+    const plainBinaryPath = path.join(installDir, 'AppData', 'Roaming', 'npm', 'openclaw')
+    const packageRoot = path.join(installDir, 'AppData', 'Roaming', 'npm', 'node_modules', 'openclaw')
+    const canonicalFingerprint = createHash('sha256')
+      .update([packageRoot, '2026.4.12', path.join(externalStateRoot, 'openclaw.json'), externalStateRoot].join('\n'))
+      .digest('hex')
+    const legacyPlainFingerprint = createHash('sha256')
+      .update([plainBinaryPath, packageRoot, '2026.4.12', path.join(externalStateRoot, 'openclaw.json'), externalStateRoot].join('\n'))
+      .digest('hex')
+
+    fs.mkdirSync(path.dirname(cmdBinaryPath), { recursive: true })
+    fs.mkdirSync(defaultStateRoot, { recursive: true })
+    fs.mkdirSync(externalStateRoot, { recursive: true })
+    fs.mkdirSync(path.join(userDataDir, 'data-guard'), { recursive: true })
+    fs.writeFileSync(cmdBinaryPath, '@echo off\r\n')
+    fs.writeFileSync(plainBinaryPath, '#!/bin/sh\n')
+    fs.writeFileSync(path.join(defaultStateRoot, 'openclaw.json'), '{}')
+    fs.writeFileSync(path.join(externalStateRoot, 'openclaw.json'), '{}')
+    fs.writeFileSync(
+      path.join(userDataDir, 'data-guard', 'managed-openclaw-installs.json'),
+      JSON.stringify({
+        version: 2,
+        entries: [
+          {
+            installFingerprint: legacyPlainFingerprint,
+            markedAt: '2026-04-18T00:00:00.000Z',
+            verified: true,
+          },
+        ],
+      }, null, 2)
+    )
+
+    getSelectedWindowsActiveRuntimeSnapshotMock.mockReturnValue({
+      configPath: path.join(externalStateRoot, 'openclaw.json'),
+      extensionsDir: path.join(externalStateRoot, 'extensions'),
+      hostPackageRoot: packageRoot,
+      nodePath: path.join(installDir, 'AppData', 'Roaming', 'npm', 'node.exe'),
+      npmPrefix: path.dirname(cmdBinaryPath),
+      openclawPath: cmdBinaryPath,
+      stateDir: externalStateRoot,
+    })
+
+    resolveOpenClawBinaryPathMock.mockResolvedValue(cmdBinaryPath)
+    listExecutablePathCandidatesMock.mockImplementation((target: string) => {
+      if (target === 'node') return []
+      return [cmdBinaryPath, plainBinaryPath]
+    })
+    readOpenClawPackageInfoMock.mockImplementation(async ({ binaryPath }: { binaryPath: string }) => ({
+      name: 'openclaw',
+      version: '2026.4.12',
+      packageRoot,
+      packageJsonPath: path.join(packageRoot, 'package.json'),
+      binaryPath,
+      resolvedBinaryPath: binaryPath,
+    }))
+    resolveRuntimeOpenClawPathsMock.mockResolvedValue({
+      homeDir: defaultStateRoot,
+      configFile: path.join(defaultStateRoot, 'openclaw.json'),
+      envFile: path.join(defaultStateRoot, '.env'),
+      credentialsDir: path.join(defaultStateRoot, 'credentials'),
+      modelCatalogCacheFile: path.join(defaultStateRoot, 'qclaw-model-catalog-cache.json'),
+      displayHomeDir: defaultStateRoot,
+      displayConfigFile: path.join(defaultStateRoot, 'openclaw.json'),
+      displayEnvFile: path.join(defaultStateRoot, '.env'),
+      displayCredentialsDir: path.join(defaultStateRoot, 'credentials'),
+      displayModelCatalogCacheFile: path.join(defaultStateRoot, 'qclaw-model-catalog-cache.json'),
+    })
+    getBaselineBackupStatusMock.mockImplementation(async (installFingerprint: string) =>
+      installFingerprint === legacyPlainFingerprint
+        ? {
+            backupId: 'legacy-backup',
+            createdAt: '2026-04-18T00:00:00.000Z',
+            archivePath: path.join(makeTempDir(), 'legacy-backup'),
+            installFingerprint: legacyPlainFingerprint,
+          }
+        : null
+    )
+    getBaselineBackupBypassStatusMock.mockResolvedValue(null)
+
+    const { discoverOpenClawInstallations } = await import('../openclaw-install-discovery')
+    const result = await discoverOpenClawInstallations()
+    const migratedStore = JSON.parse(
+      fs.readFileSync(path.join(userDataDir, 'data-guard', 'managed-openclaw-installs.json'), 'utf8')
+    )
+
+    expect(result.candidates[0]).toMatchObject({
+      candidateId: canonicalFingerprint.slice(0, 16),
+      installFingerprint: canonicalFingerprint,
+      baselineBackup: expect.objectContaining({
+        backupId: 'legacy-backup',
+        installFingerprint: legacyPlainFingerprint,
+      }),
+    })
+    expect(getBaselineBackupStatusMock).toHaveBeenCalledWith(canonicalFingerprint)
+    expect(getBaselineBackupStatusMock).toHaveBeenCalledWith(legacyPlainFingerprint)
+    expect(migratedStore).toEqual(
+      expect.objectContaining({
+        version: 2,
+        entries: expect.arrayContaining([
+          expect.objectContaining({
+            installFingerprint: canonicalFingerprint,
+            verified: true,
+          }),
+        ]),
+      })
+    )
   })
 
   itOnWindows('keeps reused external state on a Qclaw managed runtime eligible for baseline backup', async () => {
@@ -758,7 +942,7 @@ describe('discoverOpenClawInstallations', () => {
     getBaselineBackupBypassStatusMock.mockResolvedValue(null)
 
     const installFingerprint = createHash('sha256')
-      .update([binaryPath, packageRoot, '2026.4.12', path.join(stateRoot, 'openclaw.json'), stateRoot].join('\n'))
+      .update([packageRoot, '2026.4.12', path.join(stateRoot, 'openclaw.json'), stateRoot].join('\n'))
       .digest('hex')
 
     const { discoverOpenClawInstallations } = await import('../openclaw-install-discovery')

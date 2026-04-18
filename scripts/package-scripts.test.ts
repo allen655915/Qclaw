@@ -9,11 +9,12 @@ function readPackageJson(): Record<string, unknown> {
 }
 
 describe('package scripts', () => {
-  it('keeps unsigned Windows packaging on the no-sign executable-edit path to avoid winCodeSign symlink extraction failures', () => {
+  it('prepares winCodeSign cache and keeps executable editing enabled for unsigned Windows packaging', () => {
     const packageJson = readPackageJson()
     const scripts = (packageJson.scripts ?? {}) as Record<string, unknown>
     const packageWinUnsigned = String(scripts['package:win:unsigned'] ?? '')
 
-    expect(packageWinUnsigned).toContain('--config.win.signAndEditExecutable=false')
+    expect(packageWinUnsigned).toContain('npm run prepare:win:builder-cache')
+    expect(packageWinUnsigned).not.toContain('--config.win.signAndEditExecutable=false')
   })
 })

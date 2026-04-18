@@ -2,12 +2,14 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import type { OpenClawInstallCandidate } from '../../../src/shared/openclaw-phase1'
 import {
   ensureBaselineBackup,
+  getBaselineBackupStatus,
   getBaselineBackupBypassStatus,
   skipBaselineBackup,
 } from '../openclaw-baseline-backup-gate'
 
 const fs = (process.getBuiltinModule('node:fs') as typeof import('node:fs')).promises
 const path = process.getBuiltinModule('node:path') as typeof import('node:path')
+const { createHash } = process.getBuiltinModule('node:crypto') as typeof import('node:crypto')
 
 function createCandidate(overrides: Partial<OpenClawInstallCandidate> = {}): OpenClawInstallCandidate {
   return {
@@ -28,6 +30,29 @@ function createCandidate(overrides: Partial<OpenClawInstallCandidate> = {}): Ope
     baselineBackupBypass: null,
     ...overrides,
   }
+}
+
+function buildLegacyFingerprint(candidate: OpenClawInstallCandidate): string {
+  return createHash('sha256')
+    .update([
+      candidate.resolvedBinaryPath,
+      candidate.packageRoot,
+      candidate.version,
+      candidate.configPath,
+      candidate.stateRoot,
+    ].join('\n'))
+    .digest('hex')
+}
+
+function buildCanonicalFingerprint(candidate: OpenClawInstallCandidate): string {
+  return createHash('sha256')
+    .update([
+      candidate.packageRoot || candidate.resolvedBinaryPath,
+      candidate.version,
+      candidate.configPath,
+      candidate.stateRoot,
+    ].join('\n'))
+    .digest('hex')
 }
 
 describe('openclaw baseline backup gate', () => {
@@ -164,6 +189,209 @@ describe('openclaw baseline backup gate', () => {
     expect(result.created).toBe(true)
     expect(result.backup?.archivePath).toContain(backupDir)
     expect(await getBaselineBackupBypassStatus(candidate.installFingerprint)).toBeNull()
+  })
+
+  it('reuses and migrates a candidate-provided legacy baseline backup record', async () => {
+    const legacyFingerprint = 'legacy-install-fingerprint'
+    const candidate = createCandidate({
+      stateRoot,
+      configPath: path.join(stateRoot, 'openclaw.json'),
+      displayStateRoot: stateRoot,
+      displayConfigPath: path.join(stateRoot, 'openclaw.json'),
+      installFingerprint: 'canonical-install-fingerprint',
+      baselineBackup: {
+        backupId: 'baseline-legacy',
+        createdAt: '2026-04-18T00:00:00.000Z',
+        archivePath: path.join(backupDir, 'baseline-legacy'),
+        installFingerprint: legacyFingerprint,
+      },
+    })
+
+    await fs.mkdir(path.join(backupDir, 'baseline-legacy'), { recursive: true })
+    await fs.mkdir(path.join(userDataDir, 'data-guard'), { recursive: true })
+    await fs.writeFile(
+      path.join(userDataDir, 'data-guard', 'baseline-backups.json'),
+      JSON.stringify({
+        version: 2,
+        entries: [candidate.baselineBackup],
+        bypasses: [],
+      }, null, 2),
+      'utf8'
+    )
+
+    const result = await ensureBaselineBackup(candidate)
+    const persisted = await getBaselineBackupStatus(candidate.installFingerprint)
+
+    expect(result.ok).toBe(true)
+    expect(result.created).toBe(false)
+    expect(result.backup).toMatchObject({
+      backupId: 'baseline-legacy',
+      installFingerprint: candidate.installFingerprint,
+    })
+    expect(persisted).toMatchObject({
+      backupId: 'baseline-legacy',
+      installFingerprint: candidate.installFingerprint,
+    })
+  })
+
+  it('reuses a persisted legacy baseline backup record even without candidate-provided backup metadata', async () => {
+    const candidate = createCandidate({
+      stateRoot,
+      configPath: path.join(stateRoot, 'openclaw.json'),
+      displayStateRoot: stateRoot,
+      displayConfigPath: path.join(stateRoot, 'openclaw.json'),
+      installFingerprint: 'placeholder-install-fingerprint',
+      baselineBackup: null,
+    })
+    candidate.installFingerprint = buildCanonicalFingerprint(candidate)
+    const legacyFingerprint = buildLegacyFingerprint(candidate)
+    const legacyBackup = {
+      backupId: 'baseline-legacy-store',
+      createdAt: '2026-04-18T00:00:00.000Z',
+      archivePath: path.join(backupDir, 'baseline-legacy-store'),
+      installFingerprint: legacyFingerprint,
+    }
+
+    await fs.mkdir(legacyBackup.archivePath, { recursive: true })
+    await fs.writeFile(
+      path.join(legacyBackup.archivePath, 'manifest.json'),
+      JSON.stringify({
+        backupId: legacyBackup.backupId,
+        createdAt: legacyBackup.createdAt,
+        backupType: 'baseline-backup',
+        strategyId: 'takeover-safeguard',
+        homeCaptureMode: 'essential-state',
+        installFingerprint: legacyBackup.installFingerprint,
+        archivePath: legacyBackup.archivePath,
+        candidate: {
+          candidateId: candidate.candidateId,
+          version: candidate.version,
+          binaryPath: candidate.binaryPath,
+          resolvedBinaryPath: candidate.resolvedBinaryPath,
+          packageRoot: candidate.packageRoot,
+          installSource: candidate.installSource,
+          configPath: candidate.configPath,
+          stateRoot: candidate.stateRoot,
+          ownershipState: candidate.ownershipState,
+        },
+      }, null, 2),
+      'utf8'
+    )
+
+    await fs.mkdir(path.join(userDataDir, 'data-guard'), { recursive: true })
+    await fs.writeFile(
+      path.join(userDataDir, 'data-guard', 'baseline-backups.json'),
+      JSON.stringify({
+        version: 2,
+        entries: [legacyBackup],
+        bypasses: [],
+      }, null, 2),
+      'utf8'
+    )
+
+    const directStatus = await getBaselineBackupStatus(candidate.installFingerprint)
+    const result = await ensureBaselineBackup(candidate)
+
+    expect(directStatus).toMatchObject({
+      backupId: legacyBackup.backupId,
+      installFingerprint: candidate.installFingerprint,
+    })
+    expect(result.ok).toBe(true)
+    expect(result.created).toBe(false)
+    expect(result.backup).toMatchObject({
+      backupId: legacyBackup.backupId,
+      installFingerprint: candidate.installFingerprint,
+    })
+  })
+
+  it('reuses and migrates a candidate-provided legacy baseline backup bypass record', async () => {
+    const legacyFingerprint = 'legacy-install-fingerprint'
+    const candidate = createCandidate({
+      stateRoot,
+      configPath: path.join(stateRoot, 'openclaw.json'),
+      displayStateRoot: stateRoot,
+      displayConfigPath: path.join(stateRoot, 'openclaw.json'),
+      installFingerprint: 'canonical-install-fingerprint',
+      baselineBackupBypass: {
+        installFingerprint: legacyFingerprint,
+        skippedAt: '2026-04-18T00:00:00.000Z',
+        reason: 'manual-backup-required',
+        sourcePath: stateRoot,
+        displaySourcePath: stateRoot,
+        suggestedArchivePath: path.join(backupDir, 'manual-backup'),
+        displaySuggestedArchivePath: path.join(backupDir, 'manual-backup'),
+      },
+    })
+
+    await fs.mkdir(path.join(userDataDir, 'data-guard'), { recursive: true })
+    await fs.writeFile(
+      path.join(userDataDir, 'data-guard', 'baseline-backups.json'),
+      JSON.stringify({
+        version: 2,
+        entries: [],
+        bypasses: [candidate.baselineBackupBypass],
+      }, null, 2),
+      'utf8'
+    )
+
+    const result = await skipBaselineBackup(candidate)
+    const persisted = await getBaselineBackupBypassStatus(candidate.installFingerprint)
+
+    expect(result.ok).toBe(true)
+    expect(result.bypass).toMatchObject({
+      installFingerprint: candidate.installFingerprint,
+      sourcePath: stateRoot,
+    })
+    expect(persisted).toMatchObject({
+      installFingerprint: candidate.installFingerprint,
+      sourcePath: stateRoot,
+    })
+  })
+
+  it('reuses a persisted legacy baseline backup bypass even without candidate-provided bypass metadata', async () => {
+    const candidate = createCandidate({
+      stateRoot,
+      configPath: path.join(stateRoot, 'openclaw.json'),
+      displayStateRoot: stateRoot,
+      displayConfigPath: path.join(stateRoot, 'openclaw.json'),
+      installFingerprint: 'placeholder-install-fingerprint',
+      baselineBackupBypass: null,
+    })
+    candidate.installFingerprint = buildCanonicalFingerprint(candidate)
+    const legacyFingerprint = buildLegacyFingerprint(candidate)
+    const legacyBypass = {
+      installFingerprint: legacyFingerprint,
+      skippedAt: '2026-04-18T00:00:00.000Z',
+      reason: 'manual-backup-required' as const,
+      sourcePath: stateRoot,
+      displaySourcePath: stateRoot,
+      suggestedArchivePath: path.join(backupDir, 'manual-backup'),
+      displaySuggestedArchivePath: path.join(backupDir, 'manual-backup'),
+    }
+
+    await fs.mkdir(path.join(userDataDir, 'data-guard'), { recursive: true })
+    await fs.writeFile(
+      path.join(userDataDir, 'data-guard', 'baseline-backups.json'),
+      JSON.stringify({
+        version: 2,
+        entries: [],
+        bypasses: [legacyBypass],
+      }, null, 2),
+      'utf8'
+    )
+
+    const result = await skipBaselineBackup(candidate)
+    const persisted = await getBaselineBackupBypassStatus(candidate.installFingerprint)
+
+    expect(result.ok).toBe(true)
+    expect(result.bypass).toMatchObject({
+      installFingerprint: candidate.installFingerprint,
+      sourcePath: stateRoot,
+    })
+    expect(persisted).toMatchObject({
+      installFingerprint: candidate.installFingerprint,
+      sourcePath: stateRoot,
+    })
   })
 
   it('creates a safeguard baseline backup with config and memory but without extension runtimes', async () => {

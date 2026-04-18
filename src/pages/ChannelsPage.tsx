@@ -21,7 +21,6 @@ import {
   applyAgentPrimaryModelWithGatewayReload,
   extractPrimaryModelFromModelStatusPayload,
 } from '../shared/model-config-gateway'
-import { getFeishuOfficialPluginStateReady } from '../lib/feishu-official-plugin-auto-sync'
 import {
   ensureModelSelectOption,
   loadReadyModelSelectOptions,
@@ -228,13 +227,9 @@ export default function ChannelsPage() {
 
     try {
       setError('')
-      let feishuConfigRepairError = ''
-      const [feishuPluginStateReadyResult, weixinAccountsResult] = await Promise.all([
+      const [feishuPluginStateResult, weixinAccountsResult] = await Promise.all([
         withChannelsPageTimeoutFallback(
-          getFeishuOfficialPluginStateReady(window.api).catch((reason) => {
-            feishuConfigRepairError = reason instanceof Error ? reason.message : String(reason || '')
-            return null
-          }),
+          window.api.getFeishuOfficialPluginState().catch(() => null),
           null,
           CHANNELS_PAGE_ASYNC_TIMEOUT_MS
         ),
@@ -244,11 +239,8 @@ export default function ChannelsPage() {
           CHANNELS_PAGE_ASYNC_TIMEOUT_MS
         ),
       ])
-      const feishuPluginState = feishuPluginStateReadyResult.value?.state || null
+      const feishuPluginState = feishuPluginStateResult.value
       const weixinAccounts = weixinAccountsResult.value
-      if (feishuPluginStateReadyResult.timedOut) {
-        feishuConfigRepairError = feishuConfigRepairError || '读取飞书官方插件状态超时，当前按本地配置继续展示。'
-      }
 
       const configResult = await withChannelsPageTimeoutFallback(
         window.api.readConfig(),
@@ -294,8 +286,8 @@ export default function ChannelsPage() {
       const feishuRuntimeStatus = feishuRuntimeStatusResult.value
 
       const normalizedConfig = feishuPluginState?.normalizedConfig || sanitizeFeishuPluginConfig(config)
-      if (feishuConfigRepairError) {
-        setChannelConfigNotice(`Qclaw 自动修复飞书配置失败：${feishuConfigRepairError}`)
+      if (feishuPluginState?.configChanged && feishuPluginState.configAvailable !== false) {
+        setChannelConfigNotice('检测到飞书官方插件配置需要同步。请打开飞书渠道执行显式修复或重新完成配置；本页不会在后台静默写入 managed channel 配置。')
       } else {
         setChannelConfigNotice('')
       }
@@ -878,7 +870,7 @@ export default function ChannelsPage() {
       )}
 
       {channelConfigNotice && (
-        <Alert color="yellow" title="飞书配置修复失败" onClose={() => setChannelConfigNotice('')}>
+        <Alert color="yellow" title="需要显式同步飞书配置" onClose={() => setChannelConfigNotice('')}>
           {channelConfigNotice}
         </Alert>
       )}

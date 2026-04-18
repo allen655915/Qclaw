@@ -5,6 +5,8 @@ const {
   discoverOpenClawInstallationsMock,
   getBaselineBackupStatusMock,
   getBaselineBackupBypassStatusMock,
+  resolveBaselineBackupForCandidateMock,
+  resolveBaselineBackupBypassForCandidateMock,
   upsertOwnershipCandidateMock,
   getOwnershipEntryMock,
   summarizeOwnershipEntryMock,
@@ -12,6 +14,8 @@ const {
   discoverOpenClawInstallationsMock: vi.fn(),
   getBaselineBackupStatusMock: vi.fn(),
   getBaselineBackupBypassStatusMock: vi.fn(),
+  resolveBaselineBackupForCandidateMock: vi.fn(),
+  resolveBaselineBackupBypassForCandidateMock: vi.fn(),
   upsertOwnershipCandidateMock: vi.fn(),
   getOwnershipEntryMock: vi.fn(),
   summarizeOwnershipEntryMock: vi.fn(),
@@ -34,6 +38,8 @@ vi.mock('../openclaw-baseline-backup-gate', async () => {
     ...(actual as object),
     getBaselineBackupStatus: getBaselineBackupStatusMock,
     getBaselineBackupBypassStatus: getBaselineBackupBypassStatusMock,
+    resolveBaselineBackupForCandidate: resolveBaselineBackupForCandidateMock,
+    resolveBaselineBackupBypassForCandidate: resolveBaselineBackupBypassForCandidateMock,
   }
 })
 
@@ -74,6 +80,8 @@ describe('openclaw config guard', () => {
     discoverOpenClawInstallationsMock.mockReset()
     getBaselineBackupStatusMock.mockReset()
     getBaselineBackupBypassStatusMock.mockReset()
+    resolveBaselineBackupForCandidateMock.mockReset()
+    resolveBaselineBackupBypassForCandidateMock.mockReset()
     upsertOwnershipCandidateMock.mockReset()
     getOwnershipEntryMock.mockReset()
     summarizeOwnershipEntryMock.mockReset()
@@ -96,6 +104,8 @@ describe('openclaw config guard', () => {
     })
     getBaselineBackupStatusMock.mockResolvedValue(null)
     getBaselineBackupBypassStatusMock.mockResolvedValue(bypass)
+    resolveBaselineBackupForCandidateMock.mockResolvedValue(null)
+    resolveBaselineBackupBypassForCandidateMock.mockResolvedValue(bypass)
     upsertOwnershipCandidateMock.mockResolvedValue({
       firstManagedWriteSnapshot: {
         snapshotId: 'config-snapshot-1',
@@ -131,6 +141,8 @@ describe('openclaw config guard', () => {
     })
     getBaselineBackupStatusMock.mockResolvedValue(null)
     getBaselineBackupBypassStatusMock.mockResolvedValue(bypass)
+    resolveBaselineBackupForCandidateMock.mockResolvedValue(null)
+    resolveBaselineBackupBypassForCandidateMock.mockResolvedValue(bypass)
     upsertOwnershipCandidateMock.mockResolvedValue({
       firstManagedWriteSnapshot: null,
     })

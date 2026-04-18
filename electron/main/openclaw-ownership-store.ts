@@ -15,6 +15,7 @@ import { atomicWriteJson } from './atomic-write'
 const fs = process.getBuiltinModule('node:fs') as typeof import('node:fs')
 const os = process.getBuiltinModule('node:os') as typeof import('node:os')
 const path = process.getBuiltinModule('node:path') as typeof import('node:path')
+const { createHash } = process.getBuiltinModule('node:crypto') as typeof import('node:crypto')
 const { readFile } = fs.promises
 const { homedir } = os
 
@@ -126,6 +127,203 @@ function sortShellBlocks(items: OpenClawShellManagedBlockRecord[]): OpenClawShel
   return [...items].sort((left, right) => left.filePath.localeCompare(right.filePath))
 }
 
+function buildLegacyInstallFingerprint(
+  resolvedBinaryPath: string,
+  packageRoot: string,
+  version: string,
+  configPath: string,
+  stateRoot: string
+): string {
+  return createHash('sha256')
+    .update([resolvedBinaryPath, packageRoot, version, configPath, stateRoot].join('\n'))
+    .digest('hex')
+}
+
+function buildCanonicalInstallFingerprint(
+  packageRoot: string,
+  version: string,
+  configPath: string,
+  stateRoot: string,
+  resolvedBinaryPath: string
+): string {
+  return createHash('sha256')
+    .update([String(packageRoot || resolvedBinaryPath || '').trim(), version, configPath, stateRoot].join('\n'))
+    .digest('hex')
+}
+
+type OwnershipFingerprintAliasInput = Pick<
+  OpenClawInstallCandidate,
+  'installFingerprint' | 'binaryPath' | 'resolvedBinaryPath' | 'packageRoot' | 'version' | 'configPath' | 'stateRoot'
+>
+
+function resolveOwnershipFingerprintAliases(
+  candidate: OwnershipFingerprintAliasInput | null | undefined
+): string[] {
+  if (!candidate) return []
+
+  const aliases = new Set<string>([String(candidate.installFingerprint || '').trim()])
+  const packageRoot = String(candidate.packageRoot || '').trim()
+  const version = String(candidate.version || '').trim()
+  const configPath = String(candidate.configPath || '').trim()
+  const stateRoot = String(candidate.stateRoot || '').trim()
+  const resolvedBinaryPath = String(candidate.resolvedBinaryPath || '').trim()
+
+  if (!packageRoot || !version || !configPath || !stateRoot) {
+    return Array.from(aliases).filter(Boolean)
+  }
+
+  aliases.add(
+    buildCanonicalInstallFingerprint(packageRoot, version, configPath, stateRoot, resolvedBinaryPath)
+  )
+
+  const legacyExecutablePaths = new Set<string>(
+    [resolvedBinaryPath]
+      .map((value) => String(value || '').trim())
+      .filter(Boolean)
+  )
+
+  if (process.platform === 'win32') {
+    const binaryDirs = new Set(
+      [candidate.binaryPath, candidate.resolvedBinaryPath]
+        .map((value) => String(value || '').trim())
+        .filter(Boolean)
+        .map((value) => path.win32.dirname(value))
+    )
+
+    for (const binaryDir of binaryDirs) {
+      for (const shimName of ['openclaw', 'openclaw.cmd', 'openclaw.exe', 'openclaw.ps1']) {
+        legacyExecutablePaths.add(path.win32.join(binaryDir, shimName))
+      }
+    }
+  }
+
+  for (const legacyExecutablePath of legacyExecutablePaths) {
+    aliases.add(
+      buildLegacyInstallFingerprint(legacyExecutablePath, packageRoot, version, configPath, stateRoot)
+    )
+  }
+
+  return Array.from(aliases).filter(Boolean)
+}
+
+function pickEarlierTimestamp(left: string, right: string): string {
+  if (!left) return right
+  if (!right) return left
+  return left <= right ? left : right
+}
+
+function pickLaterTimestamp(left: string, right: string): string {
+  if (!left) return right
+  if (!right) return left
+  return left >= right ? left : right
+}
+
+function mergeManagedFileRecords(entries: OpenClawOwnershipEntry[]): OpenClawManagedFileRecord[] {
+  const records = new Map<string, OpenClawManagedFileRecord>()
+  for (const entry of entries) {
+    for (const record of entry.files) {
+      const key = `${record.filePath}\n${record.kind}`
+      const existing = records.get(key)
+      if (!existing) {
+        records.set(key, { ...record })
+        continue
+      }
+
+      records.set(key, {
+        ...existing,
+        source: existing.source || record.source,
+        firstManagedAt: pickEarlierTimestamp(existing.firstManagedAt, record.firstManagedAt),
+        lastManagedAt: pickLaterTimestamp(existing.lastManagedAt, record.lastManagedAt),
+      })
+    }
+  }
+  return sortByPath(Array.from(records.values()))
+}
+
+function mergeJsonPathRecords(entries: OpenClawOwnershipEntry[]): OpenClawJsonPathOwnershipRecord[] {
+  const records = new Map<string, OpenClawJsonPathOwnershipRecord>()
+  for (const entry of entries) {
+    for (const record of entry.jsonPaths) {
+      const key = `${record.filePath}\n${record.jsonPath}`
+      const existing = records.get(key)
+      if (!existing) {
+        records.set(key, { ...record })
+        continue
+      }
+
+      records.set(key, {
+        ...existing,
+        source: existing.source || record.source,
+        firstManagedAt: pickEarlierTimestamp(existing.firstManagedAt, record.firstManagedAt),
+        lastManagedAt: pickLaterTimestamp(existing.lastManagedAt, record.lastManagedAt),
+      })
+    }
+  }
+  return sortJsonPathRecords(Array.from(records.values()))
+}
+
+function mergeShellBlockRecords(entries: OpenClawOwnershipEntry[]): OpenClawShellManagedBlockRecord[] {
+  const records = new Map<string, OpenClawShellManagedBlockRecord>()
+  for (const entry of entries) {
+    for (const record of entry.shellBlocks) {
+      const key = `${record.filePath}\n${record.blockId}`
+      const existing = records.get(key)
+      if (!existing) {
+        records.set(key, { ...record })
+        continue
+      }
+
+      records.set(key, {
+        ...existing,
+        source: existing.source || record.source,
+        firstManagedAt: pickEarlierTimestamp(existing.firstManagedAt, record.firstManagedAt),
+        lastManagedAt: pickLaterTimestamp(existing.lastManagedAt, record.lastManagedAt),
+      })
+    }
+  }
+  return sortShellBlocks(Array.from(records.values()))
+}
+
+function mergeFirstManagedWriteSnapshot(
+  entries: OpenClawOwnershipEntry[],
+  installFingerprint: string
+): OpenClawConfigSnapshotRecord | null {
+  const snapshots = entries
+    .map((entry) => entry.firstManagedWriteSnapshot)
+    .filter((snapshot): snapshot is OpenClawConfigSnapshotRecord => Boolean(snapshot))
+
+  if (snapshots.length === 0) return null
+
+  const earliestSnapshot = snapshots.reduce((selected, snapshot) =>
+    snapshot.createdAt < selected.createdAt ? snapshot : selected
+  )
+
+  return {
+    ...earliestSnapshot,
+    installFingerprint,
+  }
+}
+
+function mergeOwnershipEntries(
+  entries: OpenClawOwnershipEntry[],
+  candidate: OpenClawInstallCandidate,
+  now: string,
+  installFingerprint: string
+): OpenClawOwnershipEntry | null {
+  if (entries.length === 0) return null
+
+  return {
+    installFingerprint,
+    createdAt: entries.reduce((earliest, entry) => pickEarlierTimestamp(earliest, entry.createdAt), now),
+    updatedAt: entries.reduce((latest, entry) => pickLaterTimestamp(latest, entry.updatedAt), now),
+    candidate: toCandidateSnapshot(candidate),
+    firstManagedWriteSnapshot: mergeFirstManagedWriteSnapshot(entries, installFingerprint),
+    files: mergeManagedFileRecords(entries),
+    jsonPaths: mergeJsonPathRecords(entries),
+    shellBlocks: mergeShellBlockRecords(entries),
+  }
+}
+
 function touchManagedFileRecord(
   records: OpenClawManagedFileRecord[],
   filePath: string,
@@ -218,31 +416,30 @@ async function mutateOwnershipEntry(
 
   const now = new Date().toISOString()
   const store = await loadOwnershipStore()
-  const existing =
-    store.installs.find((entry) => entry.installFingerprint === normalizedFingerprint) || null
+  const ownershipFingerprints = resolveOwnershipFingerprintAliases(candidate)
+  const existingEntries = store.installs.filter((entry) =>
+    ownershipFingerprints.includes(entry.installFingerprint)
+  )
 
-  const nextEntry: OpenClawOwnershipEntry = existing
-    ? {
-        ...existing,
-        candidate: toCandidateSnapshot(candidate),
-      }
-    : {
-        installFingerprint: normalizedFingerprint,
-        createdAt: now,
-        updatedAt: now,
-        candidate: toCandidateSnapshot(candidate),
-        firstManagedWriteSnapshot: null,
-        files: [],
-        jsonPaths: [],
-        shellBlocks: [],
-      }
+  const nextEntry: OpenClawOwnershipEntry =
+    mergeOwnershipEntries(existingEntries, candidate, now, normalizedFingerprint) ||
+    {
+      installFingerprint: normalizedFingerprint,
+      createdAt: now,
+      updatedAt: now,
+      candidate: toCandidateSnapshot(candidate),
+      firstManagedWriteSnapshot: null,
+      files: [],
+      jsonPaths: [],
+      shellBlocks: [],
+    }
 
   mutator(nextEntry, now)
   nextEntry.updatedAt = now
 
   store.installs = [
     nextEntry,
-    ...store.installs.filter((entry) => entry.installFingerprint !== normalizedFingerprint),
+    ...store.installs.filter((entry) => !ownershipFingerprints.includes(entry.installFingerprint)),
   ]
   await saveOwnershipStore(store)
   return nextEntry
@@ -254,7 +451,34 @@ export async function getOwnershipEntry(
   const normalizedFingerprint = String(installFingerprint || '').trim()
   if (!normalizedFingerprint) return null
   const store = await loadOwnershipStore()
-  return store.installs.find((entry) => entry.installFingerprint === normalizedFingerprint) || null
+  const exactEntry = store.installs.find((entry) => entry.installFingerprint === normalizedFingerprint)
+  if (exactEntry) return exactEntry
+
+  const aliasedEntry =
+    store.installs.find((entry) =>
+      resolveOwnershipFingerprintAliases({
+        installFingerprint: entry.installFingerprint,
+        binaryPath: entry.candidate.binaryPath,
+        resolvedBinaryPath: entry.candidate.resolvedBinaryPath,
+        packageRoot: entry.candidate.packageRoot,
+        version: entry.candidate.version,
+        configPath: entry.candidate.configPath,
+        stateRoot: entry.candidate.stateRoot,
+      }).includes(normalizedFingerprint)
+    ) || null
+
+  return aliasedEntry
+    ? {
+        ...aliasedEntry,
+        installFingerprint: normalizedFingerprint,
+        firstManagedWriteSnapshot: aliasedEntry.firstManagedWriteSnapshot
+          ? {
+              ...aliasedEntry.firstManagedWriteSnapshot,
+              installFingerprint: normalizedFingerprint,
+            }
+          : null,
+      }
+    : null
 }
 
 export async function upsertOwnershipCandidate(

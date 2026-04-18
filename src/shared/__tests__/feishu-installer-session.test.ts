@@ -2,9 +2,11 @@ import { describe, expect, it } from 'vitest'
 
 import {
   buildFeishuCreateBotConfirmationMessage,
+  hasFeishuInstallerManualCredentialRequirement,
   isFeishuCreateBotConfirmationPrompt,
   shouldDisableFeishuCreateInstallerButton,
   shouldDisableFeishuInstallerManualInput,
+  type FeishuInstallerManualCredentialRequirement,
   type FeishuInstallerPendingPrompt,
 } from '../feishu-installer-session'
 
@@ -15,6 +17,15 @@ function buildPrompt(overrides?: Partial<FeishuInstallerPendingPrompt>): FeishuI
     action: 'confirm-create-bot',
     promptType: 'confirm',
     defaultValue: true,
+    ...overrides,
+  }
+}
+
+function buildManualRequirement(
+  overrides?: Partial<FeishuInstallerManualCredentialRequirement>
+): FeishuInstallerManualCredentialRequirement {
+  return {
+    kind: 'app-id-secret',
     ...overrides,
   }
 }
@@ -36,7 +47,14 @@ describe('feishu installer prompt helpers', () => {
 
   it('blocks manual stdin input whenever a structured prompt is pending', () => {
     expect(shouldDisableFeishuInstallerManualInput(buildPrompt())).toBe(true)
+    expect(shouldDisableFeishuInstallerManualInput(null, buildManualRequirement())).toBe(true)
     expect(shouldDisableFeishuInstallerManualInput(null)).toBe(false)
+  })
+
+  it('recognizes the narrow structured manual credential fallback state', () => {
+    expect(hasFeishuInstallerManualCredentialRequirement(buildManualRequirement())).toBe(true)
+    expect(hasFeishuInstallerManualCredentialRequirement(buildManualRequirement({ kind: 'secret-only' }))).toBe(true)
+    expect(hasFeishuInstallerManualCredentialRequirement(null)).toBe(false)
   })
 
   it('blocks create-bot action while an installer operation is already active', () => {

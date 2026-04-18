@@ -71,11 +71,27 @@ describe('FeishuBotManagerModal renderer guardrails', () => {
     expect(source).toContain('feishuInstallerActivationWaitSeqRef')
     expect(source).toContain('feishuCreateRequestTokenRef')
     expect(source).toContain("setFeishuInstallerNotice('正在启动飞书官方安装器并等待二维码，请稍候...')")
-    expect(source).toContain("setFeishuInstallerNotice(\n            '检测到已有飞书安装器正在运行。为避免误接管其他新建流程，请等待原流程完成，或先停止后重新开始。'")
+    expect(source).toContain("await window.api.startFeishuInstaller(")
     expect(source).toContain('shouldWaitForFeishuInstallerActivation')
     expect(source).toContain('resolveFeishuInstallerStartFailureMessage')
     expect(source).toContain("setBotError(toUserFacingUnknownErrorMessage(e, '启动飞书官方安装器失败'))")
+    expect(source).not.toContain('检测到旧的飞书安装器会话，Qclaw 已先将其终止。重新点击“新建机器人”会启动新的官方安装流程。')
+    expect(source).not.toContain('检测到已有飞书安装器正在运行。为避免误接管其他新建流程，请等待原流程完成，或先停止后重新开始。')
     expect(source).not.toContain("setFeishuInstallerNotice('飞书安装器正在启动，Qclaw 正在继续等待二维码。')")
     expect(source).not.toContain("setFeishuInstallerNotice('正在检测飞书安装器状态，请稍候...')")
+  })
+
+  it('stops the installer and shows a return-to-channel-config notice when manual credentials are required', () => {
+    const source = fs.readFileSync(
+      path.join(process.cwd(), 'src', 'components', 'FeishuBotManagerModal.tsx'),
+      'utf8'
+    )
+
+    expect(source).toContain("payload.type === 'manual-credentials-required'")
+    expect(source).toContain('setFeishuInstallerManualCredentialRequirement(payload.manualCredentialRequirement || null)')
+    expect(source).toContain('waitForFeishuInstallerToStop')
+    expect(source).toContain('await window.api.stopFeishuInstaller().catch(() => {')
+    expect(source).toContain('请关闭当前设置弹窗，回到飞书渠道配置页继续“关联已有机器人”')
+    expect(source).not.toContain('PasswordInput')
   })
 })

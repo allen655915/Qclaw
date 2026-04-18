@@ -16,6 +16,7 @@ import type {
   FeishuBotDiagnosticSendResult,
 } from '../shared/feishu-diagnostics'
 import type {
+  FeishuInstallerManualCredentialRequirement,
   FeishuInstallerPendingPrompt,
   FeishuInstallerPromptResolution,
 } from '../shared/feishu-installer-session'
@@ -230,6 +231,7 @@ interface FeishuInstallerSessionSnapshot {
   command: string[]
   guardrail?: ChannelInstallerGuardrailStatus
   pendingPrompt: FeishuInstallerPendingPrompt | null
+  manualCredentialRequirement: FeishuInstallerManualCredentialRequirement | null
   qrUrl: string
   authResults: FeishuInstallerAuthResult[]
 }
@@ -237,7 +239,7 @@ interface FeishuInstallerSessionSnapshot {
 interface FeishuInstallerSessionEvent {
   sessionId: string
   requestToken?: string
-  type: 'started' | 'output' | 'prompt' | 'qr-ready' | 'exit'
+  type: 'started' | 'output' | 'prompt' | 'qr-ready' | 'manual-credentials-required' | 'exit'
   stream?: 'stdout' | 'stderr'
   chunk?: string
   phase?: FeishuInstallerSessionSnapshot['phase']
@@ -247,6 +249,7 @@ interface FeishuInstallerSessionEvent {
   command?: string[]
   guardrail?: ChannelInstallerGuardrailStatus
   pendingPrompt?: FeishuInstallerPendingPrompt | null
+  manualCredentialRequirement?: FeishuInstallerManualCredentialRequirement | null
   qrUrl?: string
 }
 

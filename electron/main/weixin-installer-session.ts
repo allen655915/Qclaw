@@ -1,5 +1,7 @@
 import type { ChildProcess } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { app } from 'electron'
 import {
@@ -38,10 +40,152 @@ const WEIXIN_MANAGED_CHANNEL_LOCK_KEY = 'managed-channel-plugin:openclaw-weixin'
 const WEIXIN_INSTALLER_CONTROL_DOMAIN = 'weixin-installer'
 const WEIXIN_INSTALLER_PACKAGE = '@tencent-weixin/openclaw-weixin-cli@latest'
 const WEIXIN_INSTALLER_COMMAND = ['npx', '-y', WEIXIN_INSTALLER_PACKAGE, 'install'] as const
+const WEIXIN_PLUGIN_PACKAGE = '@tencent-weixin/openclaw-weixin'
 const WEIXIN_MANAGED_CHANNEL_BUSY_MESSAGE = '个人微信官方插件正在执行安装、修复或配置同步，请稍后重试。'
 
 function resolveWeixinInstallerNpmCacheDir(): string {
   return path.join(app.getPath('userData'), 'npm-cache')
+}
+
+function prependWeixinInstallerPath(env: NodeJS.ProcessEnv, extraPath: string): NodeJS.ProcessEnv {
+  const nextPath = [extraPath, String(env.Path || env.PATH || '').trim()].filter(Boolean).join(path.delimiter)
+  return {
+    ...env,
+    PATH: nextPath,
+    ...(process.platform === 'win32' ? { Path: nextPath } : {}),
+  }
+}
+
+function buildWeixinOpenClawWrapperScript(realOpenClawPath: string): string {
+  return `const { spawnSync } = require('node:child_process')
+const fs = require('node:fs')
+const os = require('node:os')
+const path = require('node:path')
+
+const realOpenClawPath = ${JSON.stringify(realOpenClawPath)}
+const pluginId = ${JSON.stringify(WEIXIN_MANAGED_CHANNEL_ID)}
+const pluginPackage = ${JSON.stringify(WEIXIN_PLUGIN_PACKAGE)}
+
+function exitWithSpawnResult(result) {
+  if (result.error) {
+    console.error(result.error.message)
+    process.exit(1)
+  }
+  process.exit(typeof result.status === 'number' ? result.status : 1)
+}
+
+function runOpenClaw(args) {
+  return spawnSync(realOpenClawPath, args, {
+    shell: process.platform === 'win32',
+    stdio: 'inherit',
+    env: process.env,
+  })
+}
+
+function findFirstNonEmptyLine(value) {
+  return String(value || '')
+    .split(/\\r?\\n/u)
+    .map((line) => line.trim())
+    .find(Boolean) || ''
+}
+
+function persistInstalledSpec(spec) {
+  const stateDir = String(process.env.OPENCLAW_STATE_DIR || process.env.OPENCLAW_HOME || '').trim()
+  if (!stateDir) return
+  const statePath = path.join(stateDir, 'openclaw.json')
+  try {
+    const state = JSON.parse(fs.readFileSync(statePath, 'utf8'))
+    if (!state || typeof state !== 'object') return
+    if (!state.plugins || typeof state.plugins !== 'object') state.plugins = {}
+    if (!state.plugins.installs || typeof state.plugins.installs !== 'object') state.plugins.installs = {}
+    const installs = state.plugins.installs
+    if (!installs[pluginId] || typeof installs[pluginId] !== 'object') installs[pluginId] = {}
+    installs[pluginId].spec = spec
+    fs.writeFileSync(statePath, JSON.stringify(state, null, 2))
+  } catch {
+    // Best effort only.
+  }
+}
+
+function installPackedPlugin(spec) {
+  const packDir = fs.mkdtempSync(path.join(os.tmpdir(), 'qclaw-weixin-pack-'))
+  try {
+    const npmCommand = process.platform === 'win32' ? 'npm.cmd' : 'npm'
+    const packResult = spawnSync(npmCommand, ['pack', spec, '--silent'], {
+      cwd: packDir,
+      encoding: 'utf8',
+      shell: process.platform === 'win32',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: process.env,
+    })
+    if (packResult.error) {
+      console.error(packResult.error.message)
+      return 1
+    }
+    if (packResult.status !== 0) {
+      if (packResult.stdout) process.stdout.write(packResult.stdout)
+      if (packResult.stderr) process.stderr.write(packResult.stderr)
+      return typeof packResult.status === 'number' ? packResult.status : 1
+    }
+    const archiveName = findFirstNonEmptyLine(packResult.stdout)
+    if (!archiveName) {
+      console.error('Failed to resolve packed personal Weixin plugin archive.')
+      return 1
+    }
+    const archivePath = path.join(packDir, archiveName)
+    const installResult = runOpenClaw(['plugins', 'install', archivePath])
+    if (!installResult.error && installResult.status === 0) {
+      persistInstalledSpec(spec)
+    }
+    return typeof installResult.status === 'number' ? installResult.status : 1
+  } finally {
+    fs.rmSync(packDir, { recursive: true, force: true })
+  }
+}
+
+const args = process.argv.slice(2)
+const requestedSpec = typeof args[2] === 'string' ? args[2].trim() : ''
+if (args[0] === 'plugins' && args[1] === 'install' && requestedSpec.startsWith(pluginPackage + '@')) {
+  process.exit(installPackedPlugin(requestedSpec))
+}
+
+exitWithSpawnResult(runOpenClaw(args))
+`
+}
+
+async function cleanupWeixinOpenClawWrapper(wrapperDir: string | null | undefined): Promise<void> {
+  const normalizedWrapperDir = String(wrapperDir || '').trim()
+  if (!normalizedWrapperDir) return
+  await rm(normalizedWrapperDir, { recursive: true, force: true }).catch(() => undefined)
+}
+
+async function createWeixinOpenClawWrapper(options: {
+  realOpenClawPath?: string | null
+  nodePath?: string | null
+}): Promise<string | null> {
+  if (process.platform !== 'win32') return null
+
+  const realOpenClawPath = String(options.realOpenClawPath || '').trim()
+  const nodePath = String(options.nodePath || process.execPath || '').trim()
+  if (!realOpenClawPath || !nodePath) return null
+
+  const wrapperDir = await mkdtemp(path.join(tmpdir(), 'qclaw-weixin-openclaw-'))
+  try {
+    await writeFile(
+      path.join(wrapperDir, 'openclaw-weixin-install-wrapper.cjs'),
+      buildWeixinOpenClawWrapperScript(realOpenClawPath),
+      'utf8'
+    )
+    await writeFile(
+      path.join(wrapperDir, 'openclaw.cmd'),
+      `@echo off\r\n"${nodePath}" "%~dp0openclaw-weixin-install-wrapper.cjs" %*\r\n`,
+      'utf8'
+    )
+    return wrapperDir
+  } catch (error) {
+    await cleanupWeixinOpenClawWrapper(wrapperDir)
+    throw error
+  }
 }
 
 export interface WeixinInstallerSessionSnapshot {
@@ -89,6 +233,7 @@ interface ActiveWeixinInstallerSession {
   afterAccountIds: string[]
   newAccountIds: string[]
   npmCacheDir: string
+  wrapperDir: string | null
   managedOperationLease: ManagedOperationLease
 }
 
@@ -173,9 +318,7 @@ async function resolveWeixinInstallerRuntimeSnapshotPureFailure(): Promise<{
     }
   }
 
-  const snapshot = await resolveWindowsActiveRuntimeSnapshotForRead({
-    platform: process.platform,
-  })
+  const snapshot = await resolveWeixinInstallerRuntimeSnapshotForRead()
   if (!snapshot) {
     return {
       message: 'Windows OpenClaw 运行时尚未就绪，无法安全启动个人微信安装器。',
@@ -201,6 +344,20 @@ async function resolveWeixinInstallerRuntimeSnapshotPureFailure(): Promise<{
     message: null,
     snapshot,
   }
+}
+
+async function resolveWeixinInstallerRuntimeSnapshotForRead(): Promise<WindowsActiveRuntimeSnapshot | null> {
+  let snapshot = await resolveWindowsActiveRuntimeSnapshotForRead({
+    platform: process.platform,
+  })
+  if (snapshot || process.platform !== 'win32') return snapshot
+
+  const { getOpenClawPaths } = await import('./cli')
+  await getOpenClawPaths().catch(() => null)
+  snapshot = await resolveWindowsActiveRuntimeSnapshotForRead({
+    platform: process.platform,
+  })
+  return snapshot
 }
 
 async function resolveWeixinInstallerPreflightRuntimeContext(
@@ -430,6 +587,7 @@ async function finalizeSession(
   if (activeSession.phase === 'exited') return
   const session = activeSession
   const npmCacheDirForCleanup = session.npmCacheDir
+  const wrapperDirForCleanup = session.wrapperDir
 
   if (params.extraOutput) {
     session.output += params.extraOutput
@@ -461,7 +619,10 @@ async function finalizeSession(
     })
   } finally {
     session.managedOperationLease.release()
-    await cleanupIsolatedNpmCacheEnv(npmCacheDirForCleanup)
+    await Promise.allSettled([
+      cleanupIsolatedNpmCacheEnv(npmCacheDirForCleanup),
+      cleanupWeixinOpenClawWrapper(wrapperDirForCleanup),
+    ])
   }
 }
 
@@ -568,22 +729,34 @@ export async function startWeixinInstallerSession(
     const beforeAccountIds = await collectAccountIds().catch(() => [])
     const sessionId = randomUUID()
     let isolatedNpmCache: Awaited<ReturnType<typeof createIsolatedNpmCacheEnv>> | null = null
+    let wrapperDir: string | null = null
     let proc: ChildProcess
 
     try {
       const npmCacheDir = resolveWeixinInstallerNpmCacheDir()
       isolatedNpmCache = await createIsolatedNpmCacheEnv(npmCacheDir)
+      wrapperDir = await createWeixinOpenClawWrapper({
+        realOpenClawPath: runtimeSnapshotCheck.snapshot?.openclawPath,
+        nodePath: runtimeSnapshotCheck.snapshot?.nodePath,
+      })
       proc = spawn(WEIXIN_INSTALLER_COMMAND[0], WEIXIN_INSTALLER_COMMAND.slice(1), {
         cwd: resolveSafeWorkingDirectory({
           env: process.env,
           platform: process.platform,
         }),
-        env: {
-          ...commandEnv,
-          NO_COLOR: '1',
-          FORCE_COLOR: '0',
-          ...isolatedNpmCache.env,
-        },
+        env: wrapperDir
+          ? prependWeixinInstallerPath({
+              ...commandEnv,
+              NO_COLOR: '1',
+              FORCE_COLOR: '0',
+              ...isolatedNpmCache.env,
+            }, wrapperDir)
+          : {
+              ...commandEnv,
+              NO_COLOR: '1',
+              FORCE_COLOR: '0',
+              ...isolatedNpmCache.env,
+            },
         detached: process.platform !== 'win32',
         shell: process.platform === 'win32',
         stdio: ['ignore', 'pipe', 'pipe'],
@@ -591,6 +764,9 @@ export async function startWeixinInstallerSession(
     } catch (error) {
       if (isolatedNpmCache) {
         void cleanupIsolatedNpmCacheEnv(isolatedNpmCache.cacheDir)
+      }
+      if (wrapperDir) {
+        void cleanupWeixinOpenClawWrapper(wrapperDir)
       }
       const message = error instanceof Error ? error.message : String(error)
       return buildExitedSnapshot({
@@ -631,6 +807,7 @@ export async function startWeixinInstallerSession(
       afterAccountIds: [],
       newAccountIds: [],
       npmCacheDir: isolatedNpmCache.cacheDir,
+      wrapperDir,
       managedOperationLease: operationLease,
     }
     keepOperationLease = true

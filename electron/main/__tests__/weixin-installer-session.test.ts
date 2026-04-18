@@ -24,6 +24,7 @@ describe('weixin installer session', () => {
     const lockIndex = findInStartSession('tryAcquireManagedOperationLease(WEIXIN_MANAGED_CHANNEL_LOCK_KEY)')
     const preflightIndex = findInStartSession('const preflightResult = await runWeixinInstallerPreflight({')
     const cacheIndex = findInStartSession('createIsolatedNpmCacheEnv(npmCacheDir)')
+    const wrapperIndex = findInStartSession('createWeixinOpenClawWrapper({')
     const spawnIndex = findInStartSession('spawn(WEIXIN_INSTALLER_COMMAND[0]')
     const activeSessionIndex = findInStartSession('activeSession = {')
 
@@ -35,6 +36,7 @@ describe('weixin installer session', () => {
     expect(lockIndex).toBeGreaterThan(-1)
     expect(preflightIndex).toBeGreaterThan(-1)
     expect(cacheIndex).toBeGreaterThan(-1)
+    expect(wrapperIndex).toBeGreaterThan(-1)
     expect(spawnIndex).toBeGreaterThan(-1)
     expect(activeSessionIndex).toBeGreaterThan(-1)
     expect(busyIndex).toBeLessThan(runtimeSnapshotIndex)
@@ -45,8 +47,17 @@ describe('weixin installer session', () => {
     expect(runtimeSnapshotIndex).toBeLessThan(lockIndex)
     expect(lockIndex).toBeLessThan(preflightIndex)
     expect(preflightIndex).toBeLessThan(cacheIndex)
+    expect(cacheIndex).toBeLessThan(wrapperIndex)
+    expect(wrapperIndex).toBeLessThan(spawnIndex)
     expect(cacheIndex).toBeLessThan(spawnIndex)
     expect(preflightIndex).toBeLessThan(activeSessionIndex)
+  })
+
+  it('bootstraps the selected Windows runtime before failing personal Weixin startup', () => {
+    expect(source).toContain('async function resolveWeixinInstallerRuntimeSnapshotForRead()')
+    expect(source).toContain("const { getOpenClawPaths } = await import('./cli')")
+    expect(source).toContain('await getOpenClawPaths().catch(() => null)')
+    expect(source).toContain('const snapshot = await resolveWeixinInstallerRuntimeSnapshotForRead()')
   })
 
   it('uses the Windows channel-preflight context for personal Weixin prepare', () => {
@@ -63,8 +74,21 @@ describe('weixin installer session', () => {
 
   it('cleans isolated npm cache when setup fails before an active process is registered', () => {
     expect(source).toContain('let isolatedNpmCache')
+    expect(source).toContain('let wrapperDir: string | null = null')
     expect(source).toContain('void cleanupIsolatedNpmCacheEnv(isolatedNpmCache.cacheDir)')
+    expect(source).toContain('void cleanupWeixinOpenClawWrapper(wrapperDir)')
+    expect(source).toContain('cleanupWeixinOpenClawWrapper(wrapperDirForCleanup)')
     expect(source).toContain('return buildExitedSnapshot({')
+  })
+
+  it('wraps the personal Weixin plugin install through an npm pack shim and restores the npm spec', () => {
+    expect(source).toContain('function buildWeixinOpenClawWrapperScript(realOpenClawPath: string): string')
+    expect(source).toContain("const WEIXIN_PLUGIN_PACKAGE = '@tencent-weixin/openclaw-weixin'")
+    expect(source).toContain("spawnSync(npmCommand, ['pack', spec, '--silent']")
+    expect(source).toContain("const installResult = runOpenClaw(['plugins', 'install', archivePath])")
+    expect(source).toContain('persistInstalledSpec(spec)')
+    expect(source).toContain("requestedSpec.startsWith(pluginPackage + '@')")
+    expect(source).toContain('prependWeixinInstallerPath({')
   })
 
   it('surfaces structured guardrail state in snapshots and events', () => {

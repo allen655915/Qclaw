@@ -11,6 +11,10 @@ interface BuildInstallerCommandEnvOptions {
   platform?: NodeJS.Platform
 }
 
+function resolveEnvPathValue(env: NodeJS.ProcessEnv): string {
+  return String(env.PATH || env.Path || '')
+}
+
 const OPENCLAW_INSTALLER_ENV_KEYS_TO_CLEAR = [
   'OPENCLAW_HOME',
   'OPENCLAW_STATE_DIR',
@@ -70,15 +74,20 @@ export function buildInstallerCommandEnv(
     activeRuntimeSnapshot || null,
     platform
   )
+  const resolvedPath = buildCliPathWithCandidates({
+    activeRuntimeSnapshot: activeRuntimeSnapshot || undefined,
+    detectedNodeBinDir: detectedNodeBinDir || undefined,
+    platform,
+    currentPath: resolveEnvPathValue(installerEnv),
+    env: installerEnv,
+  })
 
-  return {
+  const nextEnv: NodeJS.ProcessEnv = {
     ...installerEnv,
-    PATH: buildCliPathWithCandidates({
-      activeRuntimeSnapshot: activeRuntimeSnapshot || undefined,
-      detectedNodeBinDir: detectedNodeBinDir || undefined,
-      platform,
-      currentPath: String(installerEnv.PATH || ''),
-      env: installerEnv,
-    }),
+    PATH: resolvedPath,
   }
+  if (platform === 'win32') {
+    nextEnv.Path = resolvedPath
+  }
+  return nextEnv
 }

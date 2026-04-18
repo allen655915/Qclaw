@@ -19,6 +19,7 @@ import {
   mergeFeishuPairingAllowFromUsersIntoConfig,
   resolveFeishuInstallerAutoPairOpenId,
   shouldAdoptPendingFeishuCreateSession,
+  shouldShowFeishuInstallerConsoleSurface,
   shouldShowFeishuCreateRuntimeSurface,
   shouldShowOwnedFeishuCreateSurface,
   type FeishuInstallerSessionIdentity,
@@ -32,6 +33,7 @@ import {
 } from '../lib/feishu-installer'
 import {
   buildFeishuCreateBotConfirmationMessage,
+  hasFeishuInstallerManualCredentialRequirement,
   isFeishuCreateBotConfirmationPrompt,
   shouldDisableFeishuCreateInstallerButton,
   shouldDisableFeishuInstallerManualInput,
@@ -193,6 +195,8 @@ export default function FeishuBotManagerModal({
   const [feishuInstallerRunning, setFeishuInstallerRunning] = useState(false)
   const [feishuInstallerOutput, setFeishuInstallerOutput] = useState('')
   const [feishuInstallerQrUrl, setFeishuInstallerQrUrl] = useState('')
+  const [feishuInstallerManualCredentialRequirement, setFeishuInstallerManualCredentialRequirement] =
+    useState<Awaited<ReturnType<typeof window.api.getFeishuInstallerState>>['manualCredentialRequirement']>(null)
   const [feishuInstallerExitCode, setFeishuInstallerExitCode] = useState<number | null>(null)
   const [feishuInstallerCanceled, setFeishuInstallerCanceled] = useState(false)
   const [feishuInstallerBusy, setFeishuInstallerBusy] = useState(false)
@@ -216,6 +220,7 @@ export default function FeishuBotManagerModal({
   const feishuCreateRequestTokenRef = useRef('')
   const feishuInstallerActivationWaitSeqRef = useRef(0)
   const handledOwnedFeishuCreateSessionIdRef = useRef('')
+  const handledManualCredentialRequirementKeyRef = useRef('')
   const finalizeFeishuCreateInFlightRef = useRef(false)
 
   const feishuBotsOrdered = useMemo(
@@ -272,7 +277,19 @@ export default function FeishuBotManagerModal({
     createRuntimeSessionId: feishuCreateRuntimeSessionId,
     session: feishuInstallerSessionIdentity,
   })
-  const feishuInstallerManualInputBlocked = shouldDisableFeishuInstallerManualInput(feishuInstallerPendingPrompt)
+  const showFeishuInstallerConsoleSurface = shouldShowFeishuInstallerConsoleSurface({
+    selectedChannelId: 'feishu',
+    setupMode: feishuBotSetupMode,
+    ownership: {
+      sessionId: ownedFeishuCreateSessionId,
+      source: ownedFeishuCreateSessionSource,
+    },
+    session: feishuInstallerSessionIdentity,
+  })
+  const feishuInstallerManualInputBlocked = shouldDisableFeishuInstallerManualInput(
+    feishuInstallerPendingPrompt,
+    feishuInstallerManualCredentialRequirement
+  )
   const feishuCreateInstallerButtonDisabled = shouldDisableFeishuCreateInstallerButton({
     installerRunning: feishuInstallerRunning,
     installerBusy: feishuInstallerBusy,
@@ -288,12 +305,43 @@ export default function FeishuBotManagerModal({
       setFeishuInstallerRunning(snapshot.active)
       setFeishuInstallerOutput(snapshot.output || '')
       setFeishuInstallerQrUrl(snapshot.qrUrl || '')
+      setFeishuInstallerManualCredentialRequirement(snapshot.manualCredentialRequirement || null)
       setFeishuInstallerExitCode(snapshot.code ?? null)
       setFeishuInstallerCanceled(Boolean(snapshot.canceled))
       setFeishuInstallerPendingPrompt(snapshot.pendingPrompt || null)
       setFeishuInstallerGuardrail(snapshot.guardrail || null)
     },
     []
+  )
+
+  const waitForFeishuInstallerToStop = useCallback(
+    async (expectedSessionId?: string | null, timeoutMs = 8000): Promise<boolean> => {
+      const normalizedExpectedSessionId = normalizeFeishuManagerSessionId(expectedSessionId)
+      const deadline = Date.now() + timeoutMs
+
+      while (Date.now() < deadline) {
+        const snapshot = await window.api.getFeishuInstallerState().catch(() => null)
+        if (snapshot) {
+          applyFeishuInstallerSnapshot(snapshot)
+          const snapshotSessionId = normalizeFeishuManagerSessionId(snapshot.sessionId)
+          if (
+            normalizedExpectedSessionId
+            && snapshot.active
+            && snapshotSessionId
+            && snapshotSessionId !== normalizedExpectedSessionId
+          ) {
+            return false
+          }
+          if (!snapshot.active) {
+            return true
+          }
+        }
+        await new Promise((resolve) => setTimeout(resolve, 250))
+      }
+
+      return false
+    },
+    [applyFeishuInstallerSnapshot]
   )
 
   const clearFeishuCreateStartConfigSnapshot = useCallback(() => {
@@ -389,9 +437,6 @@ export default function FeishuBotManagerModal({
             rememberFeishuCreateRuntimeSession(snapshot.sessionId)
             return true
           }
-          setFeishuInstallerNotice(
-            '检测到已有飞书安装器正在运行。为避免误接管其他新建流程，请等待原流程完成，或先停止后重新开始。'
-          )
           return false
         },
         () => feishuInstallerActivationWaitSeqRef.current === waitSeq
@@ -612,6 +657,7 @@ export default function FeishuBotManagerModal({
         setFeishuInstallerCanceled(false)
         setFeishuInstallerPendingPrompt(payload.pendingPrompt || null)
         setFeishuInstallerGuardrail(payload.guardrail || null)
+        setFeishuInstallerManualCredentialRequirement(null)
         setFeishuInstallerQrUrl(payload.qrUrl || '')
         return
       }
@@ -634,12 +680,18 @@ export default function FeishuBotManagerModal({
         return
       }
 
+      if (payload.type === 'manual-credentials-required') {
+        setFeishuInstallerManualCredentialRequirement(payload.manualCredentialRequirement || null)
+        return
+      }
+
       if (payload.type === 'exit') {
         setFeishuInstallerRunning(false)
         setFeishuInstallerExitCode(payload.code ?? null)
         setFeishuInstallerCanceled(Boolean(payload.canceled))
         setFeishuInstallerPendingPrompt(null)
         setFeishuInstallerGuardrail(payload.guardrail || null)
+        setFeishuInstallerManualCredentialRequirement(payload.manualCredentialRequirement || null)
         if (typeof payload.qrUrl === 'string') {
           setFeishuInstallerQrUrl(payload.qrUrl)
         }
@@ -763,6 +815,62 @@ export default function FeishuBotManagerModal({
     })
   }, [opened, feishuInstallerPendingPrompt, feishuInstallerSessionId])
 
+  useEffect(() => {
+    if (!opened || feishuBotSetupMode !== 'create') return
+    if (!hasFeishuInstallerManualCredentialRequirement(feishuInstallerManualCredentialRequirement)) {
+      handledManualCredentialRequirementKeyRef.current = ''
+      return
+    }
+
+    const requirementKey = [
+      normalizeFeishuManagerSessionId(feishuInstallerSessionId),
+      feishuInstallerManualCredentialRequirement.kind,
+      String(feishuInstallerManualCredentialRequirement.defaultAppId || '').trim(),
+    ].join(':')
+    if (
+      requirementKey
+      && handledManualCredentialRequirementKeyRef.current === requirementKey
+    ) {
+      return
+    }
+
+    handledManualCredentialRequirementKeyRef.current = requirementKey
+    void (async () => {
+      const sessionId = normalizeFeishuManagerSessionId(feishuInstallerSessionId)
+      setBotError('')
+      setFeishuInstallerNotice('本次扫码创建未完成，Qclaw 正在停止当前安装流程，并切换到手动接续提示。')
+
+      if (sessionId) {
+        await window.api.stopFeishuInstaller().catch(() => {
+          // Best effort only; we still verify the actual session state below.
+        })
+        const stopped = await waitForFeishuInstallerToStop(sessionId)
+        if (!stopped) {
+          setFeishuInstallerNotice(
+            '本次扫码创建已经进入手动凭证模式，但当前安装器还没有完全退出。请稍等片刻后关闭此弹窗，再回到飞书渠道配置页继续“关联已有机器人”。'
+          )
+          return
+        }
+      }
+
+      setFeishuInstallerManualCredentialRequirement(null)
+          setFeishuInstallerNotice(
+            feishuInstallerManualCredentialRequirement.defaultAppId
+              ? `扫码创建未完成。请关闭当前设置弹窗，回到飞书渠道配置页继续“关联已有机器人”；并使用 App ID ${feishuInstallerManualCredentialRequirement.defaultAppId} 补全后续凭证。`
+              : '扫码创建未完成。请关闭当前设置弹窗，回到飞书渠道配置页继续“关联已有机器人”，并在那边补全 App ID 和 App Secret。'
+          )
+    })().catch((e: any) => {
+      handledManualCredentialRequirementKeyRef.current = ''
+      setBotError(e?.message || '处理飞书手动接续提示失败')
+    })
+  }, [
+    feishuBotSetupMode,
+    feishuInstallerManualCredentialRequirement,
+    feishuInstallerSessionId,
+    opened,
+    waitForFeishuInstallerToStop,
+  ])
+
   const sendFeishuInstallerInput = async (input: string) => {
     const sessionId = String(feishuInstallerSessionId || '').trim()
     if (!sessionId) {
@@ -782,6 +890,7 @@ export default function FeishuBotManagerModal({
 
   const startFeishuInstallerFlow = async (mode: 'create' | 'link') => {
     cancelFeishuInstallerActivationWait()
+    handledManualCredentialRequirementKeyRef.current = ''
     const waitSeq = feishuInstallerActivationWaitSeqRef.current
     setFeishuBotSetupMode(mode)
     if (mode !== 'create') {
@@ -793,6 +902,7 @@ export default function FeishuBotManagerModal({
     setFeishuInstallerGuardrail(null)
     setFeishuInstallerOutput('')
     setFeishuInstallerQrUrl('')
+    setFeishuInstallerManualCredentialRequirement(null)
     setFeishuInstallerExitCode(null)
     setFeishuInstallerCanceled(false)
     setFeishuInstallerPendingPrompt(null)
@@ -805,18 +915,6 @@ export default function FeishuBotManagerModal({
         feishuCreateRequestTokenRef.current = createFeishuInstallerRequestToken()
       }
 
-      const current = await window.api.getFeishuInstallerState()
-      if (current.active) {
-        applyFeishuInstallerSnapshot(current)
-        if (mode === 'create' && shouldAdoptFeishuCreateSession(current.sessionId, current.active, current.requestToken, mode)) {
-          rememberFeishuCreateSessionOwnership(current.sessionId, 'resumed-running')
-          rememberFeishuCreateRuntimeSession(current.sessionId)
-        } else if (mode === 'create') {
-          setFeishuInstallerNotice('检测到已有飞书安装器正在运行。为避免误接管其他新建流程，请等待原流程完成，或先停止后重新开始。')
-        }
-        return
-      }
-
       const snapshot = await window.api.startFeishuInstaller(
         mode === 'create' ? feishuCreateRequestTokenRef.current : undefined
       )
@@ -824,8 +922,6 @@ export default function FeishuBotManagerModal({
       if (mode === 'create' && shouldAdoptFeishuCreateSession(snapshot.sessionId, Boolean(snapshot.active), snapshot.requestToken, mode)) {
         rememberFeishuCreateSessionOwnership(snapshot.sessionId, 'started-here')
         rememberFeishuCreateRuntimeSession(snapshot.sessionId)
-      } else if (mode === 'create' && snapshot.sessionId && snapshot.active) {
-        setFeishuInstallerNotice('飞书安装器已启动，但当前页面未接管到本次新建会话。请重新发起，或先结束当前安装流程后再试。')
       }
       if (!snapshot.active && !shouldWaitForFeishuInstallerActivation(snapshot)) {
         setBotError(resolveFeishuInstallerStartFailureMessage(snapshot))
@@ -858,10 +954,6 @@ export default function FeishuBotManagerModal({
             )) {
               rememberFeishuCreateSessionOwnership(recoverySnapshot.sessionId, 'resumed-running')
               rememberFeishuCreateRuntimeSession(recoverySnapshot.sessionId)
-            } else {
-              setFeishuInstallerNotice(
-                '检测到已有飞书安装器正在运行。为避免误接管其他新建流程，请等待原流程完成，或先停止后重新开始。'
-              )
             }
           }
           return
@@ -880,7 +972,25 @@ export default function FeishuBotManagerModal({
   const stopFeishuInstallerFlow = async () => {
     setFeishuInstallerBusy(true)
     try {
-      await window.api.stopFeishuInstaller()
+      const sessionId = normalizeFeishuManagerSessionId(feishuInstallerSessionId)
+      const result = await window.api.stopFeishuInstaller()
+      if (!result?.ok) {
+        setBotError('中止飞书安装器失败，请稍后重试。')
+        return
+      }
+
+      setFeishuInstallerOutput((current) =>
+        current.trimEnd()
+          ? `${current.replace(/\s*$/, '')}\n\n[Qclaw] 已请求中止飞书安装器，正在停止...\n`
+          : '[Qclaw] 已请求中止飞书安装器，正在停止...\n'
+      )
+
+      if (sessionId) {
+        const stopped = await waitForFeishuInstallerToStop(sessionId)
+        if (!stopped) {
+          setFeishuInstallerNotice('已发送中止请求，但安装器还没有完全退出，请稍后刷新列表再确认一次。')
+        }
+      }
     } finally {
       setFeishuInstallerBusy(false)
     }
@@ -946,6 +1056,8 @@ export default function FeishuBotManagerModal({
     setFeishuConfigNotice('')
     setFeishuInstallerGuardrail(null)
     setFeishuInstallerInput('')
+    setFeishuInstallerManualCredentialRequirement(null)
+    handledManualCredentialRequirementKeyRef.current = ''
     onClose()
   }
 
@@ -1207,6 +1319,7 @@ export default function FeishuBotManagerModal({
         )}
 
         {/* 安装器控制台 */}
+        {showFeishuInstallerConsoleSurface && (
         <div className="border app-border rounded-lg p-3 space-y-2">
           <Group justify="space-between">
             <div>
@@ -1228,44 +1341,52 @@ export default function FeishuBotManagerModal({
             </Badge>
           </Group>
 
-          <Group gap={4}>
-            <Button variant="light" size="compact-xs" onClick={() => void sendFeishuInstallerInput('\u001b[A')} disabled={!visibleFeishuInstallerRunning || feishuInstallerManualInputBlocked}>上移</Button>
-            <Button variant="light" size="compact-xs" onClick={() => void sendFeishuInstallerInput('\u001b[B')} disabled={!visibleFeishuInstallerRunning || feishuInstallerManualInputBlocked}>下移</Button>
-            <Button variant="light" size="compact-xs" onClick={() => void sendFeishuInstallerInput('\r')} disabled={!visibleFeishuInstallerRunning || feishuInstallerManualInputBlocked}>确认</Button>
-            <Button variant="subtle" size="compact-xs" color="red" onClick={() => void sendFeishuInstallerInput('\u0003')} disabled={!visibleFeishuInstallerRunning || feishuInstallerManualInputBlocked}>Ctrl+C</Button>
-          </Group>
+          {showOwnedFeishuCreateSessionSurface && (
+            <Group gap={4}>
+              <Button variant="light" size="compact-xs" onClick={() => void sendFeishuInstallerInput('\u001b[A')} disabled={!visibleFeishuInstallerRunning || feishuInstallerManualInputBlocked}>上移</Button>
+              <Button variant="light" size="compact-xs" onClick={() => void sendFeishuInstallerInput('\u001b[B')} disabled={!visibleFeishuInstallerRunning || feishuInstallerManualInputBlocked}>下移</Button>
+              <Button variant="light" size="compact-xs" onClick={() => void sendFeishuInstallerInput('\r')} disabled={!visibleFeishuInstallerRunning || feishuInstallerManualInputBlocked}>确认</Button>
+              <Button variant="subtle" size="compact-xs" color="red" onClick={() => void sendFeishuInstallerInput('\u0003')} disabled={!visibleFeishuInstallerRunning || feishuInstallerManualInputBlocked}>Ctrl+C</Button>
+            </Group>
+          )}
 
           <ScrollArea.Autosize mah={180} className="rounded-md" style={{ backgroundColor: 'var(--app-bg-inset)' }}>
             <pre className="whitespace-pre-wrap break-words font-mono text-[11px] leading-5 app-text-secondary px-3 py-2">
-              {visibleFeishuInstallerOutput || '安装器输出会显示在这里。'}
+              {visibleFeishuInstallerOutput
+                || (visibleFeishuInstallerRunning
+                  ? '已检测到飞书安装器运行中，正在等待输出...'
+                  : '安装器输出会显示在这里。')}
             </pre>
           </ScrollArea.Autosize>
 
-          <Group gap="xs">
-            <TextInput
-              size="xs"
-              style={{ flex: 1 }}
-              value={feishuInstallerInput}
-              onChange={(e) => setFeishuInstallerInput(e.currentTarget.value)}
-              placeholder="向安装器发送自定义输入"
-              disabled={!visibleFeishuInstallerRunning || feishuInstallerManualInputBlocked}
-            />
-            <Button
-              variant="light"
-              size="xs"
-              onClick={() => {
-                const raw = feishuInstallerInput
-                if (!raw) return
-                void sendFeishuInstallerInput(raw.endsWith('\n') ? raw : `${raw}\n`).then((ok) => {
-                  if (ok) setFeishuInstallerInput('')
-                })
-              }}
-              disabled={!visibleFeishuInstallerRunning || feishuInstallerManualInputBlocked || !feishuInstallerInput.trim()}
-            >
-              发送
-            </Button>
-          </Group>
+          {showOwnedFeishuCreateSessionSurface && (
+            <Group gap="xs">
+              <TextInput
+                size="xs"
+                style={{ flex: 1 }}
+                value={feishuInstallerInput}
+                onChange={(e) => setFeishuInstallerInput(e.currentTarget.value)}
+                placeholder="向安装器发送自定义输入"
+                disabled={!visibleFeishuInstallerRunning || feishuInstallerManualInputBlocked}
+              />
+              <Button
+                variant="light"
+                size="xs"
+                onClick={() => {
+                  const raw = feishuInstallerInput
+                  if (!raw) return
+                  void sendFeishuInstallerInput(raw.endsWith('\n') ? raw : `${raw}\n`).then((ok) => {
+                    if (ok) setFeishuInstallerInput('')
+                  })
+                }}
+                disabled={!visibleFeishuInstallerRunning || feishuInstallerManualInputBlocked || !feishuInstallerInput.trim()}
+              >
+                发送
+              </Button>
+            </Group>
+          )}
         </div>
+        )}
 
         {feishuConfigNotice && (
           <Alert color="yellow" variant="light" styles={{ title: { fontSize: 'var(--mantine-font-size-xs)' } }} title="飞书配置修复失败">

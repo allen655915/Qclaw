@@ -44,6 +44,83 @@ function resolveStorePath(): string {
   return path.join(resolveUserDataDirectory(), STORE_RELATIVE_PATH)
 }
 
+function buildCanonicalInstallFingerprint(
+  packageRoot: string,
+  version: string,
+  configPath: string,
+  stateRoot: string,
+  resolvedBinaryPath: string
+): string {
+  return createHash('sha256')
+    .update([String(packageRoot || resolvedBinaryPath || '').trim(), version, configPath, stateRoot].join('\n'))
+    .digest('hex')
+}
+
+function buildLegacyInstallFingerprint(
+  resolvedBinaryPath: string,
+  packageRoot: string,
+  version: string,
+  configPath: string,
+  stateRoot: string
+): string {
+  return createHash('sha256')
+    .update([resolvedBinaryPath, packageRoot, version, configPath, stateRoot].join('\n'))
+    .digest('hex')
+}
+
+type BackupFingerprintAliasInput = Pick<
+  OpenClawInstallCandidate,
+  'installFingerprint' | 'binaryPath' | 'resolvedBinaryPath' | 'packageRoot' | 'version' | 'configPath' | 'stateRoot'
+>
+
+function resolveBackupFingerprintAliases(candidate: BackupFingerprintAliasInput | null | undefined): string[] {
+  if (!candidate) return []
+
+  const aliases = new Set<string>([String(candidate.installFingerprint || '').trim()])
+  const packageRoot = String(candidate.packageRoot || '').trim()
+  const version = String(candidate.version || '').trim()
+  const configPath = String(candidate.configPath || '').trim()
+  const stateRoot = String(candidate.stateRoot || '').trim()
+  const resolvedBinaryPath = String(candidate.resolvedBinaryPath || '').trim()
+
+  if (!packageRoot || !version || !configPath || !stateRoot) {
+    return Array.from(aliases).filter(Boolean)
+  }
+
+  aliases.add(
+    buildCanonicalInstallFingerprint(packageRoot, version, configPath, stateRoot, resolvedBinaryPath)
+  )
+
+  const legacyExecutablePaths = new Set<string>(
+    [resolvedBinaryPath]
+      .map((value) => String(value || '').trim())
+      .filter(Boolean)
+  )
+
+  if (process.platform === 'win32') {
+    const binaryDirs = new Set(
+      [candidate.binaryPath, candidate.resolvedBinaryPath]
+        .map((value) => String(value || '').trim())
+        .filter(Boolean)
+        .map((value) => path.win32.dirname(value))
+    )
+
+    for (const binaryDir of binaryDirs) {
+      for (const shimName of ['openclaw', 'openclaw.cmd', 'openclaw.exe', 'openclaw.ps1']) {
+        legacyExecutablePaths.add(path.win32.join(binaryDir, shimName))
+      }
+    }
+  }
+
+  for (const legacyExecutablePath of legacyExecutablePaths) {
+    aliases.add(
+      buildLegacyInstallFingerprint(legacyExecutablePath, packageRoot, version, configPath, stateRoot)
+    )
+  }
+
+  return Array.from(aliases).filter(Boolean)
+}
+
 async function loadStore(): Promise<BaselineBackupStore> {
   const storePath = resolveStorePath()
   try {
@@ -92,14 +169,70 @@ async function pathExists(targetPath: string): Promise<boolean> {
   }
 }
 
-async function resolveValidBackupRecord(
+async function resolveValidBackupRecordFromStore(
+  store: BaselineBackupStore,
   installFingerprint: string
 ): Promise<OpenClawBaselineBackupRecord | null> {
-  const store = await loadStore()
   const matched = store.entries.find((entry) => entry.installFingerprint === installFingerprint) || null
   if (!matched) return null
   if (!(await pathExists(matched.archivePath))) return null
   return matched
+}
+
+async function resolveValidBackupRecord(
+  installFingerprint: string
+): Promise<OpenClawBaselineBackupRecord | null> {
+  const store = await loadStore()
+  return resolveValidBackupRecordFromStore(store, installFingerprint)
+}
+
+async function resolveBackupAliasInputFromRecord(
+  record: OpenClawBaselineBackupRecord
+): Promise<BackupFingerprintAliasInput | null> {
+  try {
+    const manifestPath = path.join(record.archivePath, 'manifest.json')
+    const raw = await readFile(manifestPath, 'utf8')
+    const parsed = JSON.parse(raw) as {
+      candidate?: Partial<BackupFingerprintAliasInput>
+    }
+    const candidate = parsed.candidate
+    if (!candidate || typeof candidate !== 'object') {
+      return null
+    }
+
+    return {
+      installFingerprint: record.installFingerprint,
+      binaryPath: String(candidate.binaryPath || '').trim(),
+      resolvedBinaryPath: String(candidate.resolvedBinaryPath || '').trim(),
+      packageRoot: String(candidate.packageRoot || '').trim(),
+      version: String(candidate.version || '').trim(),
+      configPath: String(candidate.configPath || '').trim(),
+      stateRoot: String(candidate.stateRoot || '').trim(),
+    }
+  } catch {
+    return null
+  }
+}
+
+async function resolveValidBackupRecordByAlias(
+  installFingerprint: string
+): Promise<OpenClawBaselineBackupRecord | null> {
+  const normalizedFingerprint = String(installFingerprint || '').trim()
+  if (!normalizedFingerprint) return null
+
+  const store = await loadStore()
+  const exactMatch = await resolveValidBackupRecordFromStore(store, normalizedFingerprint)
+  if (exactMatch) return exactMatch
+
+  for (const entry of store.entries) {
+    if (!(await pathExists(entry.archivePath))) continue
+    const aliasInput = await resolveBackupAliasInputFromRecord(entry)
+    if (!aliasInput) continue
+    if (!resolveBackupFingerprintAliases(aliasInput).includes(normalizedFingerprint)) continue
+    return migrateBackupRecordFingerprint(entry, normalizedFingerprint)
+  }
+
+  return null
 }
 
 async function resolveBackupBypassRecord(
@@ -109,11 +242,107 @@ async function resolveBackupBypassRecord(
   return store.bypasses.find((entry) => entry.installFingerprint === installFingerprint) || null
 }
 
+async function migrateBackupRecordFingerprint(
+  record: OpenClawBaselineBackupRecord,
+  installFingerprint: string
+): Promise<OpenClawBaselineBackupRecord> {
+  const normalizedFingerprint = String(installFingerprint || '').trim()
+  if (!normalizedFingerprint || record.installFingerprint === normalizedFingerprint) {
+    return record
+  }
+
+  const migratedRecord = {
+    ...record,
+    installFingerprint: normalizedFingerprint,
+  }
+  const store = await loadStore()
+  store.entries = [
+    migratedRecord,
+    ...store.entries.filter(
+      (entry) => entry.installFingerprint !== normalizedFingerprint && entry.installFingerprint !== record.installFingerprint
+    ),
+  ]
+  await saveStore(store)
+  return migratedRecord
+}
+
+async function migrateBackupBypassFingerprint(
+  bypass: OpenClawBaselineBackupBypassRecord,
+  installFingerprint: string
+): Promise<OpenClawBaselineBackupBypassRecord> {
+  const normalizedFingerprint = String(installFingerprint || '').trim()
+  if (!normalizedFingerprint || bypass.installFingerprint === normalizedFingerprint) {
+    return bypass
+  }
+
+  const migratedBypass = {
+    ...bypass,
+    installFingerprint: normalizedFingerprint,
+  }
+  const store = await loadStore()
+  store.bypasses = [
+    migratedBypass,
+    ...store.bypasses.filter(
+      (entry) => entry.installFingerprint !== normalizedFingerprint && entry.installFingerprint !== bypass.installFingerprint
+    ),
+  ]
+  await saveStore(store)
+  return migratedBypass
+}
+
+async function resolveCandidateBaselineBackup(
+  candidate: OpenClawInstallCandidate
+): Promise<OpenClawBaselineBackupRecord | null> {
+  if (candidate.baselineBackup && (await pathExists(candidate.baselineBackup.archivePath))) {
+    return migrateBackupRecordFingerprint(candidate.baselineBackup, candidate.installFingerprint)
+  }
+
+  for (const fingerprint of resolveBackupFingerprintAliases(candidate)) {
+    const matched = await resolveValidBackupRecord(fingerprint)
+    if (matched) {
+      return migrateBackupRecordFingerprint(matched, candidate.installFingerprint)
+    }
+  }
+
+  return null
+}
+
+async function resolveCandidateBaselineBackupBypass(
+  candidate: OpenClawInstallCandidate
+): Promise<OpenClawBaselineBackupBypassRecord | null> {
+  if (candidate.baselineBackupBypass) {
+    return migrateBackupBypassFingerprint(candidate.baselineBackupBypass, candidate.installFingerprint)
+  }
+
+  for (const fingerprint of resolveBackupFingerprintAliases(candidate)) {
+    const matched = await resolveBackupBypassRecord(fingerprint)
+    if (matched) {
+      return migrateBackupBypassFingerprint(matched, candidate.installFingerprint)
+    }
+  }
+
+  return null
+}
+
+export async function resolveBaselineBackupForCandidate(
+  candidate: OpenClawInstallCandidate | null | undefined
+): Promise<OpenClawBaselineBackupRecord | null> {
+  if (!candidate) return null
+  return resolveCandidateBaselineBackup(candidate)
+}
+
+export async function resolveBaselineBackupBypassForCandidate(
+  candidate: OpenClawInstallCandidate | null | undefined
+): Promise<OpenClawBaselineBackupBypassRecord | null> {
+  if (!candidate) return null
+  return resolveCandidateBaselineBackupBypass(candidate)
+}
+
 export async function getBaselineBackupStatus(
   installFingerprint: string
 ): Promise<OpenClawBaselineBackupRecord | null> {
   if (!String(installFingerprint || '').trim()) return null
-  return resolveValidBackupRecord(String(installFingerprint).trim())
+  return resolveValidBackupRecordByAlias(String(installFingerprint).trim())
 }
 
 export async function getBaselineBackupBypassStatus(
@@ -230,17 +459,21 @@ export async function ensureBaselineBackup(
     }
   }
 
+  const candidateBaselineBackup = candidate.baselineBackup
+    ? await resolveCandidateBaselineBackup(candidate)
+    : candidate.baselineBackup
+
   if (!shouldEnsureBaselineBackup(candidate)) {
     return {
       ok: true,
       created: false,
-      backup: candidate.baselineBackup,
+      backup: candidateBaselineBackup,
       errorCode: 'not_required',
       message: '当前安装不需要执行首次基线备份。',
     }
   }
 
-  const existing = await resolveValidBackupRecord(candidate.installFingerprint)
+  const existing = candidateBaselineBackup || (await resolveCandidateBaselineBackup(candidate))
   if (existing) {
     return {
       ok: true,
@@ -270,8 +503,17 @@ export async function ensureBaselineBackup(
     })
 
     const store = await loadStore()
-    store.entries = [backupRecord, ...store.entries.filter((entry) => entry.installFingerprint !== candidate.installFingerprint)]
-    store.bypasses = store.bypasses.filter((entry) => entry.installFingerprint !== candidate.installFingerprint)
+    const obsoleteFingerprints = new Set(
+      [
+        candidate.installFingerprint,
+        candidate.baselineBackup?.installFingerprint,
+        candidate.baselineBackupBypass?.installFingerprint,
+      ]
+        .map((value) => String(value || '').trim())
+        .filter(Boolean)
+    )
+    store.entries = [backupRecord, ...store.entries.filter((entry) => !obsoleteFingerprints.has(entry.installFingerprint))]
+    store.bypasses = store.bypasses.filter((entry) => !obsoleteFingerprints.has(entry.installFingerprint))
     await saveStore(store)
 
     return {
@@ -304,12 +546,24 @@ export async function skipBaselineBackup(
     }
   }
 
+  const candidateBaselineBackupBypass = candidate.baselineBackupBypass
+    ? await resolveCandidateBaselineBackupBypass(candidate)
+    : candidate.baselineBackupBypass
+
   if (!shouldEnsureBaselineBackup(candidate)) {
     return {
       ok: true,
-      bypass: candidate.baselineBackupBypass,
+      bypass: candidateBaselineBackupBypass,
       errorCode: 'not_required',
       message: '当前安装不需要跳过首次基线备份。',
+    }
+  }
+
+  const existingBypass = candidateBaselineBackupBypass || (await resolveCandidateBaselineBackupBypass(candidate))
+  if (existingBypass) {
+    return {
+      ok: true,
+      bypass: existingBypass,
     }
   }
 
@@ -322,7 +576,15 @@ export async function skipBaselineBackup(
       ...manualBackupAction,
     }
     const store = await loadStore()
-    store.bypasses = [bypassRecord, ...store.bypasses.filter((entry) => entry.installFingerprint !== candidate.installFingerprint)]
+    const obsoleteFingerprints = new Set(
+      [
+        candidate.installFingerprint,
+        candidate.baselineBackupBypass?.installFingerprint,
+      ]
+        .map((value) => String(value || '').trim())
+        .filter(Boolean)
+    )
+    store.bypasses = [bypassRecord, ...store.bypasses.filter((entry) => !obsoleteFingerprints.has(entry.installFingerprint))]
     await saveStore(store)
     return {
       ok: true,

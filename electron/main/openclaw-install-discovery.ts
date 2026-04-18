@@ -85,6 +85,19 @@ function normalizeForCompare(value: string): string {
   return process.platform === 'win32' ? String(value || '').toLowerCase() : String(value || '')
 }
 
+function buildDiscoveredCandidateIdentity(
+  candidate: Pick<WindowsInstallSnapshotCandidate, 'installSource' | 'packageRoot' | 'configPath' | 'stateRoot'>
+): string {
+  return [
+    candidate.installSource,
+    candidate.packageRoot,
+    candidate.configPath,
+    candidate.stateRoot,
+  ]
+    .map((value) => normalizeForCompare(String(value || '').trim()))
+    .join('\n')
+}
+
 function resolveManagedInstallStorePath(): string {
   return path.join(String(process.env.QCLAW_USER_DATA_DIR || path.join(homedir(), '.qclaw-lite')).trim(), MANAGED_INSTALL_STORE_PATH)
 }
@@ -167,6 +180,18 @@ export async function markManagedOpenClawInstall(installFingerprint: string): Pr
 }
 
 function buildFingerprint(
+  packageRoot: string,
+  version: string,
+  configPath: string,
+  stateRoot: string,
+  resolvedBinaryPath = ''
+): string {
+  return createHash('sha256')
+    .update([String(packageRoot || resolvedBinaryPath || '').trim(), version, configPath, stateRoot].join('\n'))
+    .digest('hex')
+}
+
+function buildLegacyFingerprint(
   resolvedBinaryPath: string,
   packageRoot: string,
   version: string,
@@ -176,6 +201,103 @@ function buildFingerprint(
   return createHash('sha256')
     .update([resolvedBinaryPath, packageRoot, version, configPath, stateRoot].join('\n'))
     .digest('hex')
+}
+
+function resolveInstallFingerprints(input: {
+  binaryPath: string
+  resolvedBinaryPath: string
+  packageRoot: string
+  version: string
+  configPath: string
+  stateRoot: string
+}): {
+  installFingerprint: string
+  legacyInstallFingerprints: string[]
+} {
+  const installFingerprint = buildFingerprint(
+    input.packageRoot,
+    input.version,
+    input.configPath,
+    input.stateRoot,
+    input.resolvedBinaryPath
+  )
+  const legacyInstallFingerprint = buildLegacyFingerprint(
+    input.resolvedBinaryPath,
+    input.packageRoot,
+    input.version,
+    input.configPath,
+    input.stateRoot
+  )
+  const legacyExecutablePaths = new Set<string>([String(input.resolvedBinaryPath || '').trim()])
+
+  if (process.platform === 'win32') {
+    const binaryDirs = new Set(
+      [input.binaryPath, input.resolvedBinaryPath]
+        .map((candidatePath) => String(candidatePath || '').trim())
+        .filter(Boolean)
+        .map((candidatePath) => path.win32.dirname(candidatePath))
+    )
+
+    for (const binaryDir of binaryDirs) {
+      for (const shimName of ['openclaw', 'openclaw.cmd', 'openclaw.exe', 'openclaw.ps1']) {
+        legacyExecutablePaths.add(path.win32.join(binaryDir, shimName))
+      }
+    }
+  }
+
+  return {
+    installFingerprint,
+    legacyInstallFingerprints: Array.from(
+      new Set([
+        legacyInstallFingerprint,
+        ...Array.from(legacyExecutablePaths).map((candidatePath) =>
+          buildLegacyFingerprint(
+            candidatePath,
+            input.packageRoot,
+            input.version,
+            input.configPath,
+            input.stateRoot
+          )
+        ),
+      ])
+    ).filter((fingerprint) => fingerprint && fingerprint !== installFingerprint),
+  }
+}
+
+async function resolveFingerprintAliasValue<T>(
+  installFingerprint: string,
+  legacyInstallFingerprints: string[],
+  resolver: (fingerprint: string) => Promise<T | null>
+): Promise<T | null> {
+  const fingerprints = [installFingerprint, ...legacyInstallFingerprints]
+  for (const fingerprint of fingerprints) {
+    const normalizedFingerprint = String(fingerprint || '').trim()
+    if (!normalizedFingerprint) continue
+    const resolved = await resolver(normalizedFingerprint)
+    if (resolved) return resolved
+  }
+  return null
+}
+
+async function resolveManagedInstallFingerprintState(input: {
+  installSource: OpenClawInstallSource
+  installFingerprint: string
+  legacyInstallFingerprints: string[]
+}): Promise<boolean> {
+  if (await isManagedInstallFingerprint(input.installFingerprint)) {
+    return true
+  }
+
+  for (const legacyInstallFingerprint of input.legacyInstallFingerprints) {
+    if (!(await isManagedInstallFingerprint(legacyInstallFingerprint))) {
+      continue
+    }
+
+    await markManagedOpenClawInstall(input.installFingerprint).catch(() => false)
+    return true
+  }
+
+  return persistManagedInstallFingerprintForSource(input.installSource, input.installFingerprint)
 }
 
 function isQclawOwnedInstallSource(source: OpenClawInstallSource): boolean {
@@ -353,15 +475,19 @@ function resolveCandidateRuntimeStateSnapshot(input: {
   const selectedRuntimeSnapshot =
     process.platform === 'win32' ? getSelectedWindowsActiveRuntimeSnapshot() : null
   const normalizedSelectedBinaryPath = normalizePathForCompare(selectedRuntimeSnapshot?.openclawPath || '')
+  const normalizedSelectedPackageRoot = normalizePathForCompare(selectedRuntimeSnapshot?.hostPackageRoot || '')
   const normalizedBinaryCandidates = [
     input.binaryPath,
     input.resolvedBinaryPath,
   ].map((value) => normalizePathForCompare(value))
+  const normalizedPackageRoot = normalizePathForCompare(input.packageRoot)
 
   if (
     selectedRuntimeSnapshot &&
-    normalizedSelectedBinaryPath &&
-    normalizedBinaryCandidates.includes(normalizedSelectedBinaryPath)
+    (
+      (normalizedSelectedBinaryPath && normalizedBinaryCandidates.includes(normalizedSelectedBinaryPath)) ||
+      (normalizedSelectedPackageRoot && normalizedSelectedPackageRoot === normalizedPackageRoot)
+    )
   ) {
     return {
       activeRuntimeSnapshot: { ...selectedRuntimeSnapshot },
@@ -513,15 +639,24 @@ async function buildCandidateFromBinary(
       resolvedBinaryPath: packageInfo.resolvedBinaryPath,
       runtimePaths: openClawPaths,
     })
-    const installFingerprint = buildFingerprint(
-      packageInfo.resolvedBinaryPath,
-      packageInfo.packageRoot,
-      packageInfo.version,
-      candidateRuntimeState.configPath,
-      candidateRuntimeState.stateRoot
+    const fingerprintSet = resolveInstallFingerprints({
+      binaryPath: packageInfo.binaryPath,
+      resolvedBinaryPath: packageInfo.resolvedBinaryPath,
+      packageRoot: packageInfo.packageRoot,
+      version: packageInfo.version,
+      configPath: candidateRuntimeState.configPath,
+      stateRoot: candidateRuntimeState.stateRoot,
+    })
+    const baselineBackup = await resolveFingerprintAliasValue(
+      fingerprintSet.installFingerprint,
+      fingerprintSet.legacyInstallFingerprints,
+      getBaselineBackupStatus
     )
-    const baselineBackup = await getBaselineBackupStatus(installFingerprint)
-    const baselineBackupBypass = await getBaselineBackupBypassStatus(installFingerprint)
+    const baselineBackupBypass = await resolveFingerprintAliasValue(
+      fingerprintSet.installFingerprint,
+      fingerprintSet.legacyInstallFingerprints,
+      getBaselineBackupBypassStatus
+    )
     const rawInstallSource = inferOpenClawInstallSource(packageInfo)
     const installSource = await resolveVerifiedInstallSource({
       installSource: rawInstallSource,
@@ -530,13 +665,15 @@ async function buildCandidateFromBinary(
       packageRoot: packageInfo.packageRoot,
       env: process.env,
     })
-    const managedInstall =
-      (await isManagedInstallFingerprint(installFingerprint)) ||
-      (await persistManagedInstallFingerprintForSource(installSource, installFingerprint))
+    const managedInstall = await resolveManagedInstallFingerprintState({
+      installSource,
+      installFingerprint: fingerprintSet.installFingerprint,
+      legacyInstallFingerprints: fingerprintSet.legacyInstallFingerprints,
+    })
 
     return {
       activeRuntimeSnapshot: candidateRuntimeState.activeRuntimeSnapshot,
-      candidateId: installFingerprint.slice(0, 16),
+      candidateId: fingerprintSet.installFingerprint.slice(0, 16),
       binaryPath: packageInfo.binaryPath,
       resolvedBinaryPath: packageInfo.resolvedBinaryPath,
       packageRoot: packageInfo.packageRoot,
@@ -558,7 +695,7 @@ async function buildCandidateFromBinary(
         env: process.env,
         fallbackOwnership: 'external-preexisting',
       }),
-      installFingerprint,
+      installFingerprint: fingerprintSet.installFingerprint,
       baselineBackup,
       baselineBackupBypass,
     }
@@ -575,15 +712,24 @@ async function buildCandidateFromBinary(
       resolvedBinaryPath,
       runtimePaths: openClawPaths,
     })
-    const installFingerprint = buildFingerprint(
+    const fingerprintSet = resolveInstallFingerprints({
+      binaryPath,
       resolvedBinaryPath,
       packageRoot,
       version,
-      candidateRuntimeState.configPath,
-      candidateRuntimeState.stateRoot
+      configPath: candidateRuntimeState.configPath,
+      stateRoot: candidateRuntimeState.stateRoot,
+    })
+    const baselineBackup = await resolveFingerprintAliasValue(
+      fingerprintSet.installFingerprint,
+      fingerprintSet.legacyInstallFingerprints,
+      getBaselineBackupStatus
     )
-    const baselineBackup = await getBaselineBackupStatus(installFingerprint)
-    const baselineBackupBypass = await getBaselineBackupBypassStatus(installFingerprint)
+    const baselineBackupBypass = await resolveFingerprintAliasValue(
+      fingerprintSet.installFingerprint,
+      fingerprintSet.legacyInstallFingerprints,
+      getBaselineBackupBypassStatus
+    )
     const rawInstallSource = inferOpenClawInstallSource({ binaryPath, resolvedBinaryPath, packageRoot })
     const installSource = await resolveVerifiedInstallSource({
       installSource: rawInstallSource,
@@ -592,13 +738,15 @@ async function buildCandidateFromBinary(
       packageRoot,
       env: process.env,
     })
-    const managedInstall =
-      (await isManagedInstallFingerprint(installFingerprint)) ||
-      (await persistManagedInstallFingerprintForSource(installSource, installFingerprint))
+    const managedInstall = await resolveManagedInstallFingerprintState({
+      installSource,
+      installFingerprint: fingerprintSet.installFingerprint,
+      legacyInstallFingerprints: fingerprintSet.legacyInstallFingerprints,
+    })
 
     return {
       activeRuntimeSnapshot: candidateRuntimeState.activeRuntimeSnapshot,
-      candidateId: installFingerprint.slice(0, 16),
+      candidateId: fingerprintSet.installFingerprint.slice(0, 16),
       binaryPath,
       resolvedBinaryPath,
       packageRoot,
@@ -620,7 +768,7 @@ async function buildCandidateFromBinary(
         env: process.env,
         fallbackOwnership: 'unknown-external',
       }),
-      installFingerprint,
+      installFingerprint: fingerprintSet.installFingerprint,
       baselineBackup,
       baselineBackupBypass,
     }
@@ -793,7 +941,7 @@ export async function discoverOpenClawInstallationsFromKnownPaths(input: {
     uniquePaths.push(candidatePath)
   }
 
-  const candidates: WindowsInstallSnapshotCandidate[] = []
+  const candidatesByIdentity = new Map<string, WindowsInstallSnapshotCandidate>()
   const seenFingerprints = new Set<string>()
   for (const candidatePath of uniquePaths) {
     if (!(await pathExists(candidatePath))) continue
@@ -801,8 +949,13 @@ export async function discoverOpenClawInstallationsFromKnownPaths(input: {
     if (!candidate) continue
     if (seenFingerprints.has(candidate.installFingerprint)) continue
     seenFingerprints.add(candidate.installFingerprint)
-    candidates.push(candidate)
+    const candidateIdentity = buildDiscoveredCandidateIdentity(candidate)
+    const existingCandidate = candidatesByIdentity.get(candidateIdentity)
+    if (!existingCandidate || (candidate.isPathActive && !existingCandidate.isPathActive)) {
+      candidatesByIdentity.set(candidateIdentity, candidate)
+    }
   }
+  const candidates = Array.from(candidatesByIdentity.values())
 
   candidates.sort((left, right) => {
     if (left.isPathActive && !right.isPathActive) return -1

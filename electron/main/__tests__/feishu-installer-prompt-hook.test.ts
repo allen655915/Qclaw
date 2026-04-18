@@ -8,6 +8,11 @@ describe('buildFeishuInstallerPromptHookScript', () => {
 
     expect(script).toContain("question.name === 'useExisting'")
     expect(script).toContain("promptType: 'confirm'")
+    expect(script).toContain("normalizeQuestionName(question) === 'appId'")
+    expect(script).toContain("normalizeQuestionName(question) === 'appSecret'")
+    expect(script).toContain("normalizeQuestionName(question) === 'inputSecret'")
+    expect(script).toContain("type: 'manual-credentials-required'")
+    expect(script).toContain("'manual-credentials-required'")
     expect(script).toContain("message.type === 'prompt-answer'")
     expect(script).toContain("message.type === 'prompt-abort'")
     expect(script).toContain("type: 'auth-result'")

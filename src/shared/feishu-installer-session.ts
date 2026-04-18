@@ -1,5 +1,6 @@
 export type FeishuInstallerPendingPromptKind = 'useExisting'
 export type FeishuInstallerPendingPromptAction = 'confirm-create-bot'
+export type FeishuInstallerManualCredentialKind = 'app-id-secret' | 'secret-only'
 
 export interface FeishuInstallerPendingPrompt {
   promptId: string
@@ -8,6 +9,11 @@ export interface FeishuInstallerPendingPrompt {
   promptType: 'confirm'
   appId?: string
   defaultValue?: boolean | null
+}
+
+export interface FeishuInstallerManualCredentialRequirement {
+  kind: FeishuInstallerManualCredentialKind
+  defaultAppId?: string
 }
 
 export type FeishuInstallerPromptResolution = 'confirm' | 'cancel'
@@ -24,9 +30,19 @@ export function isFeishuCreateBotConfirmationPrompt(
 }
 
 export function shouldDisableFeishuInstallerManualInput(
-  prompt: FeishuInstallerPendingPrompt | null | undefined
+  prompt: FeishuInstallerPendingPrompt | null | undefined,
+  requirement?: FeishuInstallerManualCredentialRequirement | null | undefined
 ): boolean {
-  return Boolean(prompt)
+  return Boolean(prompt || requirement)
+}
+
+export function hasFeishuInstallerManualCredentialRequirement(
+  requirement: FeishuInstallerManualCredentialRequirement | null | undefined
+): requirement is FeishuInstallerManualCredentialRequirement {
+  return Boolean(
+    requirement
+    && (requirement.kind === 'app-id-secret' || requirement.kind === 'secret-only')
+  )
 }
 
 export function shouldDisableFeishuCreateInstallerButton(params: {

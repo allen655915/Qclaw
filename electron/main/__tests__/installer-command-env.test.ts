@@ -18,6 +18,21 @@ describe('buildInstallerCommandEnv', () => {
     expect(entries).toContain('C:\\Windows\\System32')
   })
 
+  it('preserves the original Windows Path entries when PATH is absent', () => {
+    const env = buildInstallerCommandEnv({
+      platform: 'win32',
+      env: buildTestEnv({
+        LOCALAPPDATA: 'C:\\Users\\alice\\AppData\\Local',
+        Path: 'C:\\Windows\\System32;C:\\Windows',
+      }),
+    })
+
+    const entries = String(env.PATH || '').split(';')
+    expect(entries).toContain('C:\\Windows\\System32')
+    expect(entries).toContain('C:\\Windows')
+    expect(env.Path).toBe(env.PATH)
+  })
+
   it('preserves unrelated environment variables while augmenting PATH', () => {
     const env = buildInstallerCommandEnv({
       platform: 'darwin',

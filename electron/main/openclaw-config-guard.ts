@@ -18,6 +18,8 @@ import {
   getBaselineBackupBypassStatus,
   getBaselineBackupStatus,
   resolveDefaultBackupDirectory,
+  resolveBaselineBackupBypassForCandidate,
+  resolveBaselineBackupForCandidate,
 } from './openclaw-baseline-backup-gate'
 import { discoverOpenClawInstallations } from './openclaw-install-discovery'
 import { describeManagedShellBlockScopes } from './openclaw-managed-blocks'
@@ -243,9 +245,11 @@ async function ensureManagedWritePreparation(
   }
 
   const baselineBackup =
-    candidate.baselineBackup || (await getBaselineBackupStatus(candidate.installFingerprint))
+    candidate.baselineBackup || (await resolveBaselineBackupForCandidate(candidate)) || (await getBaselineBackupStatus(candidate.installFingerprint))
   const baselineBackupBypass =
-    candidate.baselineBackupBypass || (await getBaselineBackupBypassStatus(candidate.installFingerprint))
+    candidate.baselineBackupBypass ||
+    (await resolveBaselineBackupBypassForCandidate(candidate)) ||
+    (await getBaselineBackupBypassStatus(candidate.installFingerprint))
   const normalizedCandidate = {
     ...candidate,
     baselineBackup,
@@ -533,9 +537,11 @@ export async function getDataGuardSummary(
   }
 
   const baselineBackup =
-    candidate.baselineBackup || (await getBaselineBackupStatus(candidate.installFingerprint))
+    candidate.baselineBackup || (await resolveBaselineBackupForCandidate(candidate)) || (await getBaselineBackupStatus(candidate.installFingerprint))
   const baselineBackupBypass =
-    candidate.baselineBackupBypass || (await getBaselineBackupBypassStatus(candidate.installFingerprint))
+    candidate.baselineBackupBypass ||
+    (await resolveBaselineBackupBypassForCandidate(candidate)) ||
+    (await getBaselineBackupBypassStatus(candidate.installFingerprint))
   const ownershipEntry = await upsertOwnershipCandidate({
     ...candidate,
     baselineBackup,

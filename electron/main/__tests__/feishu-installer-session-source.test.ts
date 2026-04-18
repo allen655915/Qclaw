@@ -12,6 +12,11 @@ describe('feishu installer session source', () => {
     const startSessionIndex = source.indexOf('export async function startFeishuInstallerSession')
     const findInStartSession = (needle: string) => source.indexOf(needle, startSessionIndex)
     expect(startSessionIndex).toBeGreaterThan(-1)
+    expect(findInStartSession('runSerializedFeishuInstallerStart(async () => {')).toBeGreaterThan(-1)
+    expect(findInStartSession('const existingRunningSession = activeSession?.phase === \'running\' ? activeSession : null')).toBeGreaterThan(-1)
+    expect(findInStartSession("await stopFeishuInstallerSession({ recoverGateway: false })")).toBeGreaterThan(-1)
+    expect(findInStartSession('waitForFeishuInstallerSessionTerminalCleanup(existingRunningSession)')).toBeGreaterThan(-1)
+    expect(findInStartSession("'restart-replacing-running-session'")).toBeGreaterThan(-1)
     expect(findInStartSession("const preferImmediateLaunch = normalizedRequestToken !== ''")).toBeGreaterThan(-1)
     expect(findInStartSession('createBypassManagedOperationLease(FEISHU_MANAGED_CHANNEL_LOCK_KEY)')).toBeGreaterThan(-1)
     expect(findInStartSession("message: '已跳过启动前预检，收到新建请求后立即启动飞书官方安装器。'")).toBeGreaterThan(-1)
@@ -54,6 +59,7 @@ describe('feishu installer session source', () => {
     expect(source).toContain('stopGatewayResult.snapshot')
     expect(source).toContain("'feishu-installer-start-failed'")
     expect(source).toContain("recoverGatewayForSession(session, 'feishu-installer-stop'")
+    expect(source).toContain("message: '旧飞书安装器会话正在被替换，本次退出已跳过网关恢复。'")
   })
 
   it('surfaces structured guardrail state in snapshots and events', () => {
@@ -64,6 +70,8 @@ describe('feishu installer session source', () => {
     expect(source).toContain('guardrail: activeSession.guardrail')
     expect(source).toContain('managedOperationLease: operationLease')
     expect(source).toContain('releaseSessionManagedOperationLease(session)')
+    expect(source).toContain('terminalCleanupDone: terminalCleanup.promise')
+    expect(source).toContain('resolveTerminalCleanup: terminalCleanup.resolve')
     expect(source).toMatch(
       /lock: \{\r?\n\s+state: 'running',\r?\n\s+key: FEISHU_MANAGED_CHANNEL_LOCK_KEY/
     )
@@ -81,6 +89,14 @@ describe('feishu installer session source', () => {
     expect(source).toContain("type: 'qr-ready'")
     expect(source).toContain('recordFeishuInstallerQrReady(activeSession, payload)')
     expect(source).toContain('qrUrl: activeSession.qrUrl')
+  })
+
+  it('captures manual credential fallback as a narrow structured Feishu event', () => {
+    expect(source).toContain("type: 'manual-credentials-required'")
+    expect(source).toContain('FeishuPromptBridgeManualCredentialsRequiredRequest')
+    expect(source).toContain('manualCredentialRequirement: FeishuInstallerManualCredentialRequirement | null')
+    expect(source).toContain('recordFeishuInstallerManualCredentialRequirement(activeSession, payload)')
+    expect(source).toContain("'manual-credentials-required-received'")
   })
 
   it('does not attach a fixed timeout to the interactive installer process', () => {
